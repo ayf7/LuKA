@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 from typing import List, Optional
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
@@ -73,7 +74,8 @@ def plot_attention_layers(out: CausalLMOutputWithPast,
                           model_name: str,
                           layer_indices: List[int],
                           head_indices: List[int]):
-    os.makedirs("attn_simple", exist_ok=True)
+    directory = Path(f"profile__{model_name.replace("/","-")}")
+    os.makedirs(directory, exist_ok=True)
 
     for L in layer_indices:
         attn_layer = out.attentions[L][0]  # (H, Tq, Tk)
@@ -118,7 +120,7 @@ def plot_attention_layers(out: CausalLMOutputWithPast,
 
         fig.suptitle(f"{model_name} — Layer {L}", fontsize=11)
         fig.tight_layout()
-        out_path = os.path.join("attn_simple", f"layer{L}.png")
+        out_path = os.path.join(directory, f"layer{L}.png")
         fig.savefig(out_path, dpi=160)
         plt.close(fig)
         print(f"Saved {out_path}")

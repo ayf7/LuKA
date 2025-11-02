@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "LuKA: Learned Unimportant Key Aggregation"
 readme = "README.md"
 requires-python = ">=3.10.12"
-authors = [{ name = "Anthony Fei", email = "ayf7@example.com" }]
+authors = [{ name = "Anthony Fei", email = "ayf7@cornell.edu" }]
 
 dependencies = [
   "torch>=2.1",
