@@ -1,0 +1,26 @@
+[project]
+name = "luka"
+version = "0.1.0"
+description = "LuKA: Learned Unimportant Key Aggregation"
+readme = "README.md"
+requires-python = ">=3.10.12"
+authors = [{ name = "Anthony Fei", email = "ayf7@example.com" }]
+
+dependencies = [
+  "torch>=2.1",
+  "transformers>=4.40",
+  "matplotlib",
+  "tqdm",
+  "numpy",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["exploration_scripts*", "models*", "src*", "utils*"]
