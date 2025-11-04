@@ -23,15 +23,25 @@ from exploration_scripts.rules import (
   Rule,
   SimpleThresholdRule,
   MedianThresholdRule,
-  PercentileDecileRule
+  PercentileDecileRule,
+  MaxPoolThresholdRule,
+  MaxPoolEmaThresholdRule,
 )
 import matplotlib.colors as mcolors
 
-TEXT = "In a future scenario where artificial general intelligence (AGI) systems are integrated into the global economy, education, and governance, how should policymakers design adaptive legal frameworks that balance innovation with ethical responsibility? Specifically, discuss how dynamic regulation could be structured to respond to rapidly evolving AI capabilities without stifling creativity, while also ensuring transparency, fairness, and accountability across international jurisdictions. Additionally, consider the potential socioeconomic consequences of AGI-driven automation on employment and inequality, and propose policy interventions that could mitigate these effects while maintaining long-term economic stability and public trust in technological institutions."
-MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-RULE: Rule = SimpleThresholdRule(tau=0.0005)
-RULE: Rule = MedianThresholdRule()
-RULE: Rule = PercentileDecileRule()
+
+PROMPT_PATH = "prompts/paragraphs_2.md"
+MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+SIMPLE_THRESHOLD: Rule = SimpleThresholdRule(tau=0.0005)
+MEDIAN_THRESHOLD: Rule = MedianThresholdRule()
+PERCENTILE: Rule = PercentileDecileRule()
+MAXPOOL_THRESHOLD: Rule = MaxPoolThresholdRule(tau=0.0005, kernel_size=30, stride=10)
+MAXPOOL_EMA_THRESHOLD: Rule = MaxPoolEmaThresholdRule(tau=0.00002, kernel_size=7, stride=5, alpha=0.3)
+
+with open(PROMPT_PATH, "r", encoding="utf-8") as f:
+    TEXT = f.read()
+
+RULE = MAXPOOL_EMA_THRESHOLD
 
 MESSAGES = [
   {"role": "system",    "content": "You are a helpful assistant."},
@@ -74,7 +84,7 @@ def plot_attention_layers(out: CausalLMOutputWithPast,
                           model_name: str,
                           layer_indices: List[int],
                           head_indices: List[int]):
-    directory = Path(f"profile__{model_name.replace("/","-")}")
+    directory = Path(f"profile__{model_name.replace("/","-")}") / rule.name()
     os.makedirs(directory, exist_ok=True)
 
     for L in layer_indices:
@@ -125,4 +135,22 @@ def plot_attention_layers(out: CausalLMOutputWithPast,
         plt.close(fig)
         print(f"Saved {out_path}")
 
-plot_attention_layers(out, RULE, MODEL, layer_indices=[0, 3, 6, 9, 12, 15], head_indices=[0, 1, 2, 3, 4])
+
+def plot_attention_layers_multiple_rules(out: CausalLMOutputWithPast,
+                          rules: List[Rule],
+                          model_name: str,
+                          layer_indices: List[int],
+                          head_indices: List[int]):
+    for rule in rules:
+        plot_attention_layers(out, rule, model_name, layer_indices, head_indices)
+
+
+plot_attention_layers_multiple_rules(
+    out,
+    [
+        MAXPOOL_EMA_THRESHOLD
+    ],
+    MODEL,
+    layer_indices=[k for k in range(36)],
+    head_indices=[k for k in range(16)]
+)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC
 import torch
+import torch.nn.functional as F
 
 class Rule(ABC):
     """
@@ -21,11 +22,14 @@ class Rule(ABC):
     def process(self, attention_score: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Unimplemented rule")
 
+    def name(self) -> str:
+        raise NotImplementedError("Unimplemented rule")
+
 class SimpleThresholdRule(Rule):
     """
     Marks keys with attention below a scalar threshold as LOW-importance (1).
 
-    mask[b,h,t,k] = 1  if attention_score[b,h,t,k] < tau
+    mask[b,h,t,k] = 1  if attention_score[b,h,t,k] > tau
                     0  otherwise
     """
 
@@ -33,15 +37,106 @@ class SimpleThresholdRule(Rule):
         self.tau = float(tau)
 
     def process(self, attention_score: torch.Tensor) -> torch.Tensor:
-        mask = (attention_score < self.tau).to(attention_score.dtype)
+        mask = (attention_score > self.tau).to(attention_score.dtype)
         return mask
+
+    def name(self):
+        return f"threshold_{self.tau}"
+
+class MaxPoolThresholdRule(Rule):
+    """
+    Applies 1D max pooling over the key dimension followed by a scalar threshold.
+
+    Each query row is smoothed independently by taking the maximum value within a
+    sliding window across the key axis. The pooled attention map is then converted
+    into a binary mask using the same scalar threshold as SimpleThresholdRule.
+    """
+
+    def __init__(
+        self,
+        tau: float = 1e-3,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int | None = None,
+    ):
+        self.tau = float(tau)
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        if padding is None:
+            # emulate "same" padding for odd-sized kernels
+            self.padding = self.kernel_size // 2
+        else:
+            self.padding = int(padding)
+
+    def process(self, attention_score: torch.Tensor) -> torch.Tensor:
+        pooled = F.max_pool1d(
+            attention_score.unsqueeze(1),
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+        ).squeeze(1)
+        mask = (pooled > self.tau).to(attention_score.dtype)
+        return mask
+
+    def name(self) -> str:
+        return f"maxpool1d{self.kernel_size}_stride{self.stride}_tau{self.tau}"
+
+class MaxPoolEmaThresholdRule(Rule):
+    """
+    Applies 1D max pooling followed by an exponential moving average and
+    thresholds the smoothed activations.
+    """
+
+    def __init__(
+        self,
+        tau: float = 1e-3,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int | None = None,
+        alpha: float = 0.3,
+    ):
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("alpha must be in (0, 1]")
+
+        self.tau = float(tau)
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride)
+        if padding is None:
+            self.padding = self.kernel_size // 2
+        else:
+            self.padding = int(padding)
+        self.alpha = float(alpha)
+
+    def process(self, attention_score: torch.Tensor) -> torch.Tensor:
+        pooled = F.max_pool1d(
+            attention_score.unsqueeze(1),
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+        ).squeeze(1)
+
+        ema = pooled.clone()
+        alpha = self.alpha
+        one_minus_alpha = 1.0 - alpha
+
+        for t in range(1, ema.size(-1)):
+            ema[:, t] = alpha * pooled[:, t] + one_minus_alpha * ema[:, t - 1]
+
+        mask = (ema > self.tau).to(attention_score.dtype)
+        return mask
+
+    def name(self) -> str:
+        return (
+            f"maxpool1d{self.kernel_size}_stride{self.stride}_"
+            f"ema{self.alpha}_tau{self.tau}"
+        )
 
 class MedianThresholdRule(Rule):
     """
     Marks keys with attention below the median as LOW-importance (1).
 
     For each attention map:
-        mask[q, k] = 1  if attention_score[q, k] < median(attention_score)
+        mask[q, k] = 1  if attention_score[q, k] > median(attention_score)
                         0  otherwise
     """
 
@@ -52,8 +147,11 @@ class MedianThresholdRule(Rule):
         vals = attention_score[tril]
         median_val = vals.median()
 
-        mask = (attention_score < median_val).to(attention_score.dtype)
+        mask = (attention_score > median_val).to(attention_score.dtype)
         return mask
+
+    def name(self):
+        return "binary_median"
     
 class PercentileDecileRule(Rule):
     """
@@ -103,3 +201,6 @@ class PercentileDecileRule(Rule):
         # Uncomment to mark upper-triangular region explicitly:
         # out[~tril_mask] = torch.nan
         return out
+    
+    def name(self):
+        return "10_percentiles"
