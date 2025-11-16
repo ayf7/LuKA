@@ -25,7 +25,8 @@ from exploration_scripts.rules import (
   MedianThresholdRule,
   PercentileDecileRule,
   MaxPoolThresholdRule,
-  MaxPoolEmaThresholdRule,
+  MagnitudeOrderRule,
+  LaggedKLDivergenceRule
 )
 import matplotlib.colors as mcolors
 
@@ -36,17 +37,27 @@ SIMPLE_THRESHOLD: Rule = SimpleThresholdRule(tau=0.0005)
 MEDIAN_THRESHOLD: Rule = MedianThresholdRule()
 PERCENTILE: Rule = PercentileDecileRule()
 MAXPOOL_THRESHOLD: Rule = MaxPoolThresholdRule(tau=0.0005, kernel_size=30, stride=10)
-MAXPOOL_EMA_THRESHOLD: Rule = MaxPoolEmaThresholdRule(tau=0.00002, kernel_size=7, stride=5, alpha=0.3)
+MAGNITUDE_RULE: Rule = MagnitudeOrderRule()
+DIVERGENCE_RULE: Rule = LaggedKLDivergenceRule(lag=6, threshold=10)
 
 with open(PROMPT_PATH, "r", encoding="utf-8") as f:
     TEXT = f.read()
 
-RULE = MAXPOOL_EMA_THRESHOLD
+RULES = [
+        LaggedKLDivergenceRule(lag=5),
+        # LaggedKLDivergenceRule(lag=10),
+        # LaggedKLDivergenceRule(lag=20)
+        # CausalCrossMaxPool2DWindowRule(tau=0.005, up_radius=4, lr_radius=4, include_center=True),
+        # CausalCrossMaxPool2DWindowRule(tau=0.01, up_radius=4, lr_radius=4, include_center=True)
+    ]
 
 MESSAGES = [
   {"role": "system",    "content": "You are a helpful assistant."},
   {"role": "user",      "content": f"{TEXT}"}
 ]
+
+# Only recommended for a single rule
+OVERWRITE_DIR = None
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -83,8 +94,12 @@ def plot_attention_layers(out: CausalLMOutputWithPast,
                           rule: Rule,
                           model_name: str,
                           layer_indices: List[int],
-                          head_indices: List[int]):
-    directory = Path(f"profile__{model_name.replace("/","-")}") / rule.name()
+                          head_indices: List[int],
+                          overwrite_dir: Optional[str] = None):
+    if overwrite_dir is not None:
+        directory = Path(f"profile__{model_name.replace("/","-")}") / overwrite_dir
+    else:
+        directory = Path(f"profile__{model_name.replace("/","-")}") / rule.name()
     os.makedirs(directory, exist_ok=True)
 
     for L in layer_indices:
@@ -109,13 +124,18 @@ def plot_attention_layers(out: CausalLMOutputWithPast,
                 norm=norm,
                 cmap="viridis"
             )
+            mask_cmap = rule.color()
+            mask_max = float(mask_h.max()) if mask_h.numel() > 0 else 0.0
+            if mask_max == 0.0:
+                mask_max = 1.0
+
             im1 = axes[i][1].imshow(
                 mask_h.numpy(),
                 aspect="auto",
                 interpolation="nearest",
-                vmin=0.0,
-                vmax=1.0,
-                cmap="gray"
+                # vmin=0.0,
+                # vmax=mask_max,
+                cmap=mask_cmap
             )
 
             axes[i][0].set_title(f"Layer {L}, Head {H} Attention (log scale)")
@@ -140,17 +160,25 @@ def plot_attention_layers_multiple_rules(out: CausalLMOutputWithPast,
                           rules: List[Rule],
                           model_name: str,
                           layer_indices: List[int],
-                          head_indices: List[int]):
+                          head_indices: List[int],
+                          overwrite_dir: Optional[str] = None):
     for rule in rules:
-        plot_attention_layers(out, rule, model_name, layer_indices, head_indices)
+        plot_attention_layers(
+            out,
+            rule,
+            model_name,
+            layer_indices,
+            head_indices,
+            overwrite_dir=overwrite_dir
+        )
 
 
-plot_attention_layers_multiple_rules(
-    out,
-    [
-        MAXPOOL_EMA_THRESHOLD
-    ],
-    MODEL,
-    layer_indices=[k for k in range(36)],
-    head_indices=[k for k in range(16)]
-)
+if __name__ == "__main__":
+    plot_attention_layers_multiple_rules(
+        out,
+        RULES,
+        MODEL,
+        layer_indices=[0, 17, 35],
+        head_indices=[k for k in range(16)],
+        overwrite_dir=OVERWRITE_DIR
+    )

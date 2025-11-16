@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC
 import torch
 import torch.nn.functional as F
+import matplotlib.colors as mcolors
 
 class Rule(ABC):
     """
@@ -24,6 +25,11 @@ class Rule(ABC):
 
     def name(self) -> str:
         raise NotImplementedError("Unimplemented rule")
+
+    def color(self):
+        """Default grayscale color map for binary masks."""
+
+        return "gray"
 
 class SimpleThresholdRule(Rule):
     """
@@ -81,55 +87,6 @@ class MaxPoolThresholdRule(Rule):
     def name(self) -> str:
         return f"maxpool1d{self.kernel_size}_stride{self.stride}_tau{self.tau}"
 
-class MaxPoolEmaThresholdRule(Rule):
-    """
-    Applies 1D max pooling followed by an exponential moving average and
-    thresholds the smoothed activations.
-    """
-
-    def __init__(
-        self,
-        tau: float = 1e-3,
-        kernel_size: int = 3,
-        stride: int = 1,
-        padding: int | None = None,
-        alpha: float = 0.3,
-    ):
-        if not (0.0 < alpha <= 1.0):
-            raise ValueError("alpha must be in (0, 1]")
-
-        self.tau = float(tau)
-        self.kernel_size = int(kernel_size)
-        self.stride = int(stride)
-        if padding is None:
-            self.padding = self.kernel_size // 2
-        else:
-            self.padding = int(padding)
-        self.alpha = float(alpha)
-
-    def process(self, attention_score: torch.Tensor) -> torch.Tensor:
-        pooled = F.max_pool1d(
-            attention_score.unsqueeze(1),
-            kernel_size=self.kernel_size,
-            stride=self.stride,
-            padding=self.padding,
-        ).squeeze(1)
-
-        ema = pooled.clone()
-        alpha = self.alpha
-        one_minus_alpha = 1.0 - alpha
-
-        for t in range(1, ema.size(-1)):
-            ema[:, t] = alpha * pooled[:, t] + one_minus_alpha * ema[:, t - 1]
-
-        mask = (ema > self.tau).to(attention_score.dtype)
-        return mask
-
-    def name(self) -> str:
-        return (
-            f"maxpool1d{self.kernel_size}_stride{self.stride}_"
-            f"ema{self.alpha}_tau{self.tau}"
-        )
 
 class MedianThresholdRule(Rule):
     """
@@ -152,55 +109,113 @@ class MedianThresholdRule(Rule):
 
     def name(self):
         return "binary_median"
-    
-class PercentileDecileRule(Rule):
-    """
-    Assigns each attention score a decile indicator in {0.00, 0.10, ..., 0.90}
-    computed from the *lower-triangular* distribution (including the diagonal).
 
-    Semantics:
-      - 0.00 -> among the highest scores
-      - 0.90 -> among the lowest scores
+class MagnitudeOrderRule(Rule):
+    """Maps each attention score to its base-10 order-of-magnitude bucket."""
 
-    Upper-triangular entries are left as 0.00 by default (can be changed to NaN).
-    """
+    _colormap = None
 
     def process(self, attention_score: torch.Tensor) -> torch.Tensor:
+        x = attention_score
+        # Only compute log10 on positive entries; mark zeros as NaN so they render distinctly.
+        pos = x > 0
+        out = torch.full_like(x, float('nan'))  # NaNs will show as gaps or a special color if you set one.
+        out[pos] = torch.floor(torch.log10(x[pos]))
+        # If you prefer to keep everything numeric, comment the two lines above and use this instead:
+        # out = torch.where(pos, torch.floor(torch.log10(x)), torch.tensor(float('-inf'), device=x.device, dtype=x.dtype))
+        return out  # returns buckets like ..., -5, -4, ..., 0, 1, ...
+
+    def name(self) -> str:
+        return "order_of_magnitude"
+
+    def color(self):
+        if self.__class__._colormap is None:
+            self.__class__._colormap = mcolors.LinearSegmentedColormap.from_list(
+                "purple_to_yellow",
+                ["#5b2c83", "#f9f871"],
+            )
+        return self.__class__._colormap
+
+
+class LaggedKLDivergenceRule(Rule):
+    """
+    Detects boundaries by comparing a row with averaged context windows before and after it.
+
+    For each candidate boundary row r (with at least L rows before and after), we compute the mean
+    attention distribution over the previous L rows and the next L rows. We then measure two KL
+    divergences:
+      - KL(current row || average of next L rows)
+      - KL(current row || average of previous L rows)
+    The final score is the average of these two divergences, written onto the causal portion of row r.
+    First/last L rows remain zero because there is insufficient context. High scores highlight rows
+    whose immediate past and future contexts differ substantially.
+    """
+
+    def __init__(
+        self,
+        lag: int = 32,
+        eps: float = 1e-8,
+        threshold: float | None = None,
+    ):
+        if lag <= 0:
+            raise ValueError("lag must be positive")
+        self.lag = int(lag)
+        self.eps = float(eps)
+        self.threshold = float(threshold) if threshold is not None else None
+
+    def process(self, attention_score: torch.Tensor) -> torch.Tensor:
+        if attention_score.ndim != 2:
+            raise ValueError("LaggedKLDivergenceRule expects a 2D attention matrix")
+
         Tq, Tk = attention_score.shape
-        device = attention_score.device
-        dtype = attention_score.dtype
+        output = torch.zeros_like(attention_score)
+        if self.lag == 0 or Tq < 2 * self.lag:
+            return output
 
-        # Lower-triangular mask (including diagonal)
-        tril_mask = torch.tril(torch.ones((Tq, Tk), dtype=torch.bool, device=device))
+        def kl_div(p_raw: torch.Tensor, q_raw: torch.Tensor) -> torch.Tensor:
+            n = min(p_raw.shape[-1], q_raw.shape[-1])
+            if n <= 0:
+                return torch.tensor(0.0, device=attention_score.device, dtype=attention_score.dtype)
+            p = p_raw[..., :n] + self.eps
+            q = q_raw[..., :n] + self.eps
+            p = p / p.sum()
+            q = q / q.sum()
+            return torch.sum(p * (torch.log(p) - torch.log(q)))
 
-        # Extract lower-triangular values
-        vals = attention_score[tril_mask]
-        M = vals.numel()
+        start_idx = self.lag
+        end_idx = Tq - self.lag
+        for center_idx in range(start_idx, end_idx):
+            current_len = min(Tk, center_idx + 1)
+            if current_len <= 0:
+                continue
 
-        if M == 0:
-            return torch.zeros_like(attention_score)
+            ahead_rows = attention_score[
+                center_idx + 1 : center_idx + 1 + self.lag, :current_len
+            ]
+            behind_len = min(current_len, center_idx - self.lag + 1)
+            if behind_len <= 0:
+                continue
+            behind_rows = attention_score[
+                center_idx - self.lag : center_idx, :behind_len
+            ]
 
-        # Rank ascending
-        order = torch.argsort(vals, dim=0, stable=True)
-        ranks = torch.empty_like(order, dtype=torch.long)
-        ranks[order] = torch.arange(M, device=device)
+            ahead_mean = ahead_rows.mean(dim=0)
+            behind_mean = behind_rows.mean(dim=0)
 
-        # Convert to [0,1] percentile (ascending)
-        p = (ranks + 1).to(torch.float32) / float(M)
+            current_row = attention_score[center_idx]
+            kl_ahead = kl_div(current_row[:current_len], ahead_mean)
+            kl_behind = kl_div(current_row[:behind_len], behind_mean)
 
-        # Map directly to deciles (0.00 for lowest, 0.90 for highest)
-        decile_index = torch.floor(p * 10.0).to(torch.long)
-        decile_index = torch.clamp(decile_index, 0, 9)
+            score = kl_ahead / kl_behind
+            score = torch.clamp(score, max=20.0)
+            if self.threshold is not None:
+                fill_value = 1.0 if score > self.threshold else 0.0
+                output[center_idx, :current_len] = fill_value
+            else:
+                output[center_idx, :current_len] = score
 
-        decile_values = decile_index.to(dtype) / 10.0  # 0.00, 0.10, ..., 0.90
+        return output
 
-        # Scatter back into full matrix
-        out = torch.zeros_like(attention_score, dtype=dtype)
-        out[tril_mask] = decile_values
-
-        # Uncomment to mark upper-triangular region explicitly:
-        # out[~tril_mask] = torch.nan
-        return out
-    
-    def name(self):
-        return "10_percentiles"
+    def name(self) -> str:
+        suffix = "bin" if self.threshold is not None else "avg"
+        return f"lagged_kl_l{self.lag}_{suffix}"
