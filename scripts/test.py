@@ -1,5 +1,6 @@
 from vllm import LLM, SamplingParams
 from modeling.qwen.luka_qwen3 import LukaQwenForCausalLM, initialize_luka_hook
+from artifacts.prompts.prompt_loader import load_prompt
 
 initialize_luka_hook() # any Qwen3Model we use will now use our backend.
 
@@ -19,18 +20,14 @@ sampling_params = SamplingParams(
 )
 
 
-prompts = [
-    "You are LuKA, a model with a custom attention pattern. "
-    "In 2 sentences, describe what makes your attention different.",
-]
-
+prompts = load_prompt("paragraphs_2")
 
 outputs = llm.generate(prompts, sampling_params=sampling_params)
 
 
 for i, request_output in enumerate(outputs):
     print("=" * 80)
-    print(f"Prompt {i}: {prompts[i]}")
+    print(f"[Prompt {i}]\n {prompts[i] if isinstance(prompts, list) else prompts}")
     for j, candidate in enumerate(request_output.outputs):
         print(f"\n[Candidate {j}]")
         print(candidate.text)
