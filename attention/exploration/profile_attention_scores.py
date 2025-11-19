@@ -19,11 +19,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from exploration_scripts.rules import (
+from attention.exploration.rules import (
   Rule,
   SimpleThresholdRule,
   MedianThresholdRule,
-  PercentileDecileRule,
   MaxPoolThresholdRule,
   MagnitudeOrderRule,
   LaggedKLDivergenceRule
@@ -32,10 +31,9 @@ import matplotlib.colors as mcolors
 
 
 PROMPT_PATH = "prompts/paragraphs_2.md"
-MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+MODEL = "Qwen/Qwen3-1.7B-Base"
 SIMPLE_THRESHOLD: Rule = SimpleThresholdRule(tau=0.0005)
 MEDIAN_THRESHOLD: Rule = MedianThresholdRule()
-PERCENTILE: Rule = PercentileDecileRule()
 MAXPOOL_THRESHOLD: Rule = MaxPoolThresholdRule(tau=0.0005, kernel_size=30, stride=10)
 MAGNITUDE_RULE: Rule = MagnitudeOrderRule()
 DIVERGENCE_RULE: Rule = LaggedKLDivergenceRule(lag=6, threshold=10)
@@ -178,7 +176,7 @@ if __name__ == "__main__":
         out,
         RULES,
         MODEL,
-        layer_indices=[0, 17, 35],
+        layer_indices=[0, 13, 27],
         head_indices=[k for k in range(16)],
         overwrite_dir=OVERWRITE_DIR
     )

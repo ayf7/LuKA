@@ -12,6 +12,8 @@ dependencies = [
   "matplotlib",
   "tqdm",
   "numpy",
+  "vllm",
+  "accelerate",
 ]
 
 [build-system]
