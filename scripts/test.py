@@ -1,10 +1,10 @@
 from vllm import LLM, SamplingParams
-from models.qwen.luka_qwen3 import LukaQwenForCausalLM, initialize_luka_hook
+from modeling.qwen.luka_qwen3 import LukaQwenForCausalLM, initialize_luka_hook
 
-initialize_luka_hook()
+initialize_luka_hook() # any Qwen3Model we use will now use our backend.
 
 llm = LLM(
-    model="/home/ayf7/LuKA/models/qwen/model__qwen_luka",
+    model="Qwen/Qwen3-1.7B-Base",
     max_model_len=4096,
     enforce_eager=True
 )
