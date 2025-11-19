@@ -20,7 +20,7 @@ sampling_params = SamplingParams(
 )
 
 
-prompts = load_prompt("paragraphs_2")
+prompts = [load_prompt("paragraphs_2")]
 
 outputs = llm.generate(prompts, sampling_params=sampling_params)
 

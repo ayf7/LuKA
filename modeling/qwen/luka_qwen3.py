@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from typing import Iterable, Tuple
 
 from modeling.kv_cache import LukaKVCache
+from modeling.segmenter import SimpleLaggedKLDivergenceRule
 
 # Keep a handle to the original attention for inheritance.
 BaseQwen3Attention = qwen3_mod.Qwen3Attention
@@ -74,8 +75,14 @@ class LukaQwenAttention(BaseQwen3Attention):
             attn_type=attn_type,
         )
 
+        boundary_rule = SimpleLaggedKLDivergenceRule(
+            lag=32,
+            eps=1e-8,
+            threshold=2.0,  # example; adjust after you see prints
+        )
+
         base_attn = self.attn
-        self.attn = LukaKVCache(base_attn) # overwrites this attribute
+        self.attn = LukaKVCache(base_attn, boundary_rule) # overwrites this attribute
 
     # def forward(
     #     self,
