@@ -9,7 +9,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from typing import Iterable, Tuple
 
-from modeling.luka_cache import LukaKVCache
+from modeling.kv_cache import LukaKVCache
 
 # Keep a handle to the original attention for inheritance.
 BaseQwen3Attention = qwen3_mod.Qwen3Attention
