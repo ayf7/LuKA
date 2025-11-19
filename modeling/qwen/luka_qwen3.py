@@ -1,157 +1,148 @@
+"""
+LuKA integration for HuggingFace Transformers Qwen3 models.
+
+This module provides a monkey-patch approach to integrate LuKA's KV cache
+compression into HuggingFace's transformers library.
+"""
+
 import torch
 import torch.nn as nn
-from torch.types import Tensor
+from typing import Optional, Tuple
 
-import vllm.model_executor.models.qwen3 as qwen3_mod
-from vllm.attention import Attention, AttentionType
-from vllm.config import CacheConfig, VllmConfig
-from vllm.model_executor.layers.quantization import QuantizationConfig
 
-from typing import Iterable, Tuple
+import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
+QwenAttention = modeling_qwen3.Qwen3Attention
 
+from modeling.segmenter import Rule, SimpleLaggedKLDivergenceRule
 from modeling.kv_cache import LukaKVCache
-from modeling.segmenter import SimpleLaggedKLDivergenceRule
 
-# Keep a handle to the original attention for inheritance.
-BaseQwen3Attention = qwen3_mod.Qwen3Attention
-BaseQwen3ForCausalLM = qwen3_mod.Qwen3ForCausalLM
-
-
-class LukaQwenAttention(BaseQwen3Attention):
+class LukaQwenAttention(QwenAttention):
     """
-    Drop-in replacement for vLLM's Qwen3Attention.
+    Drop-in replacement for HuggingFace's Qwen3Attention (or Qwen2Attention) that integrates LuKA.
 
-    - Reuses the original __init__ via super().__init__(...).
-    - Adds one extra Attention instance (summary_attn) with its own KV cache.
-    - Overrides forward() to combine outputs from both caches.
+    This wraps the standard attention mechanism and adds:
+    1. Boundary detection during forward passes
+    2. Optional KV cache compression (to be implemented)
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        max_position: int = 4096 * 32,
-        head_dim: int | None = None,
-        rms_norm_eps: float = 1e-6,
-        qkv_bias: bool = False,
-        rope_theta: float = 10000,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
-        rope_scaling: tuple | None = None,
-        prefix: str = "",
-        attn_type: str = AttentionType.DECODER,
-        dual_chunk_attention_config: dict[str, object] | None = None,
-    ) -> None:
+    def __init__(self, config, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
 
-        # Build the original attention stack (qkv_proj, self.attn, etc.)
-        super().__init__(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            max_position=max_position,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            qkv_bias=qkv_bias,
-            rope_theta=rope_theta,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            rope_scaling=rope_scaling,
-            prefix=prefix,
-            attn_type=attn_type,
-            dual_chunk_attention_config=dual_chunk_attention_config,
-        )
-
-        # Add an additional KV cache group for LuKA summaries.
-        # Different prefix => different layer_name => different kv_cache & block table.
-        self.summary_attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.summary_attn",
-            attn_type=attn_type,
-        )
-
+        # Initialize LuKA KV cache manager
         boundary_rule = SimpleLaggedKLDivergenceRule(
             lag=32,
             eps=1e-8,
-            threshold=2.0,  # example; adjust after you see prints
+            threshold=2.0,
+        )
+        self.luka_cache = LukaKVCache(boundary_rule=boundary_rule)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass with LuKA boundary detection.
+
+        When using eager attention mode, this enables output_attentions to extract
+        attention weights for boundary detection.
+        """
+        # Get outputs from parent
+        return super().forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
         )
 
-        base_attn = self.attn
-        self.attn = LukaKVCache(base_attn, boundary_rule) # overwrites this attribute
 
-    # def forward(
-    #     self,
-    #     positions: torch.Tensor,
-    #     hidden_states: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     # ---- 1. Same QKV / norms / RoPE as base class ----
-    #     qkv, _ = self.qkv_proj(hidden_states)
-    #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-    #     # reshape to per-head for qk norm
-    #     q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-    #     q_by_head = self.q_norm(q_by_head)
-    #     q = q_by_head.view(q.shape)
-
-    #     k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-    #     k_by_head = self.k_norm(k_by_head)
-    #     k = k_by_head.view(k.shape)
-
-    #     q, k = self.rotary_emb(positions, q, k)
-
-    #     # ---- 2. Main KV cache: full Qwen3 self-attention ----
-    #     main_out = self.attn(q, k, v)
-
-    #     # ---- 3. LuKA summary KV cache: second Attention instance ----
-    #     # Design idea:
-    #     #   - During prefill, you can decide which tokens become "summary" pages
-    #     #     and call summary_attn with their K/V to populate its KV cache.
-    #     #   - During decode, you can call summary_attn with (q, None, None)
-    #     #     to read from that summary cache only.
-    #     #
-    #     # For now, as a sketch:
-    #     summary_out = self.summary_attn(q, None, None)
-
-    #     # ---- 4. Combine both views of memory ----
-    #     combined = main_out + self.summary_alpha * summary_out
-
-    #     output, _ = self.o_proj(combined)
-    #     return output
-
-
-class LukaQwenForCausalLM(BaseQwen3ForCausalLM):
+class LukaQwen3ForCausalLM(modeling_qwen3.Qwen3ForCausalLM):
     """
-    Identical to vLLM's Qwen3ForCausalLM, but uses LukaQwenAttention because
-    we monkey-patched Qwen3Attention above.
+    Qwen3ForCausalLM with LuKA-specific parameter handling.
+
+    This allows loading pretrained checkpoints while ignoring LuKA-specific
+    parameters that don't exist in the base model.
     """
-    def load_weights(
+
+    def _load_from_state_dict(
         self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        # Let the base class do its normal mapping / loading.
-        loaded = super().load_weights(weights)
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """
+        Override to mark LuKA-only parameters as loaded, even though they
+        don't exist in the checkpoint.
 
-        # Mark LuKA-only parameters as logically 'loaded', even though no
-        # checkpoint entries exist for them.
-        for name, _ in self.named_parameters():
-            if "summary_alpha" in name:
-                loaded.add(name)
+        Keeps strict loading enabled for all other parameters, only exempting
+        LuKA-specific additions.
+        """
+        # Call parent's load with strict mode
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
-        print(self.model)
-        return loaded
+        # Only remove LuKA-specific parameters from missing_keys
+        # Keep strict checking for everything else
+        missing_keys[:] = [
+            k for k in missing_keys
+            if not ("luka_cache" in k)
+        ]
 
-# Global hooks: replace Qwen3Attention before any Qwen3Model is created.
 
 def initialize_luka_hook():
-    qwen3_mod.Qwen3Attention = LukaQwenAttention
-    qwen3_mod.Qwen3ForCausalLM = LukaQwenForCausalLM
+    """
+    Monkey-patch HuggingFace's Qwen3 model to use LuKA attention.
 
-    from vllm.model_executor.models.registry import ModelRegistry
-    ModelRegistry.register_model("LukaQwenForCausalLM", LukaQwenForCausalLM)
+    Call this before loading any Qwen3 models if you want the LuKA effects.
+    """
+    modeling_qwen3.Qwen3Attention = LukaQwenAttention
+    modeling_qwen3.Qwen3ForCausalLM = LukaQwen3ForCausalLM
 
-# Saves the path.
+
+def load_luka_model(model_name: str, use_eager_attention: bool = True, **kwargs):
+    """
+    Load a Qwen3 model with LuKA integration.
+
+    Args:
+        model_name: HuggingFace model identifier
+        use_eager_attention: If True, force eager attention mode to enable output_attentions.
+                           Required for boundary detection. Default: True
+        **kwargs: Additional arguments to pass to AutoModelForCausalLM.from_pretrained
+
+    Returns:
+        Model with LuKA-enabled attention
+    """
+    from transformers import AutoModelForCausalLM
+
+    # Initialize the hook before loading
+    initialize_luka_hook()
+
+    # Force eager attention if requested (needed for output_attentions=True)
+    if use_eager_attention:
+        kwargs['attn_implementation'] = 'eager'
+
+    # Load the model
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+
+    return model

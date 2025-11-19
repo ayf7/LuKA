@@ -1,33 +1,51 @@
-from vllm import LLM, SamplingParams
-from modeling.qwen.luka_qwen3 import LukaQwenForCausalLM, initialize_luka_hook
+"""
+Test script for LuKA with HuggingFace Transformers.
+Simple script to test boundary detection during generation.
+"""
+
+import torch
+from transformers import AutoTokenizer
+from modeling.qwen.luka_qwen3 import load_luka_model
 from artifacts.prompts.prompt_loader import load_prompt
 
-initialize_luka_hook() # any Qwen3Model we use will now use our backend.
+# Configuration
+model_name = "Qwen/Qwen3-1.7B-Base"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-llm = LLM(
-    model="Qwen/Qwen3-1.7B-Base",
-    max_model_len=4096,
-    enforce_eager=True
+# Load model and tokenizer
+model = load_luka_model(
+    model_name,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    device_map="auto" if device == "cuda" else None,
 )
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+# Load prompt
+prompt = load_prompt("paragraphs_2")
 
-sampling_params = SamplingParams(
+# Tokenize
+inputs = tokenizer(prompt, return_tensors="pt")
+if device == "cuda":
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+outputs = model.generate(
+    **inputs,
+    max_new_tokens=128,
     temperature=0.7,
     top_p=0.9,
-    max_tokens=128,
-    n=1,          # number of completions per prompt
-    seed=42,      # deterministic sampling for debugging
+    do_sample=True,
 )
 
+# Decode and print
+generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+new_text = generated_text[len(prompt):]
 
-prompts = [load_prompt("paragraphs_2")]
+print("\n" + "=" * 80)
+print("Prompt:")
+print("=" * 80)
+print(prompt)
+print("=" * 80 + "\n")
 
-outputs = llm.generate(prompts, sampling_params=sampling_params)
-
-
-for i, request_output in enumerate(outputs):
-    print("=" * 80)
-    print(f"[Prompt {i}]\n {prompts[i] if isinstance(prompts, list) else prompts}")
-    for j, candidate in enumerate(request_output.outputs):
-        print(f"\n[Candidate {j}]")
-        print(candidate.text)
+print("Generated output:")
+print(new_text)
+print("\n" + "=" * 80)

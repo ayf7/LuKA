@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from artifacts.prompts.prompt_loader import load_prompt
 
-from attention.exploration.rules import (
+from exploration.rules import (
   Rule,
   SimpleThresholdRule,
   MedianThresholdRule,
