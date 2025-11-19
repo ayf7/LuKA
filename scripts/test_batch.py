@@ -20,8 +20,11 @@ model = load_luka_model(
 )
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# Load prompts (single)
-prompts = load_prompt("paragraphs_1")
+# Load prompts (batch)
+prompts = [
+    load_prompt("paragraphs_2"),
+    load_prompt("paragraphs_1"),
+]
 
 # Tokenize with padding for batching
 tokenizer.pad_token = tokenizer.eos_token

@@ -38,9 +38,9 @@ class LukaQwenAttention(QwenAttention):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        hidden_states: torch.Tensor, # [B, L, D]
+        attention_mask: Optional[torch.Tensor] = None, # [B, 1, L, L]
+        position_ids: Optional[torch.LongTensor] = None, # [B, L, D]
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -49,12 +49,11 @@ class LukaQwenAttention(QwenAttention):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
         Forward pass with LuKA boundary detection.
-
         When using eager attention mode, this enables output_attentions to extract
         attention weights for boundary detection.
         """
-        # Get outputs from parent
-        return super().forward(
+
+        attn_output, attn_weights = super().forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -64,6 +63,19 @@ class LukaQwenAttention(QwenAttention):
             cache_position=cache_position,
             **kwargs,
         )
+
+        # Get outputs from parent
+        # def maybe_print(obj):
+        #     print(obj.shape if obj is not None else None)
+        # maybe_print(hidden_states)
+        # maybe_print(attention_mask)
+        # maybe_print(position_ids)
+        # maybe_print(attn_output)
+        # maybe_print(attn_weights)
+        # print("\n")
+
+        # [B, L, D],    [B, H, L, L]
+        return attn_output, attn_weights
 
 
 class LukaQwen3ForCausalLM(modeling_qwen3.Qwen3ForCausalLM):
