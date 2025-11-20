@@ -45,6 +45,12 @@ class LukaKVCaches:
         self.num_layers = num_layers
         self.initialized = [False] * num_layers
         self.starts = None
+        # Simple refinement statistics per layer
+        self.refine_stats = [
+            {"refine": 0, "skip": 0} for _ in range(num_layers)
+        ]
+        # Cached cover per layer to avoid rebuilding when unchanged
+        self.cover_cache: List[Optional[dict[str, torch.Tensor]]] = [None for _ in range(num_layers)]
         pass
 
     def update_original(
@@ -218,6 +224,8 @@ class LukaKVCaches:
 
         # Update summary lengths (how many valid pages exist for each batch item)
         self.summary_len[layer_idx] = valid_counts
+        # Invalidate cover cache for this layer since summaries changed
+        self.cover_cache[layer_idx] = None
     
     def get_covering_kv(
         self,
@@ -245,6 +253,19 @@ class LukaKVCaches:
         summary_k = self.summary_keys[layer_idx]          # [B,H,P_max,D]
         summary_v = self.summary_values[layer_idx]        # [B,H,P_max,D]
         summary_len = self.summary_len[layer_idx]         # [B]
+
+        # ---- 2.1 Check cache ----
+        cached = self.cover_cache[layer_idx]
+        if cached is not None:
+            cached_raw_len = cached["raw_len"]
+            cached_sum_len = cached["summary_len"]
+            if cached_raw_len == T_raw and torch.equal(cached_sum_len, summary_len):
+                return (
+                    cached["keys"],
+                    cached["values"],
+                    cached["is_summary"],
+                    cached["indices"],
+                )
 
         # These lists will contain variable-length per-batch tensors
         batched_k = []
@@ -319,6 +340,15 @@ class LukaKVCaches:
             cover_is_summary[b, :T_b] = batched_flags[b]
             cover_indices[b, :T_b] = batched_indices[b]
 
+        # ---- 7. Cache and return ----
+        self.cover_cache[layer_idx] = {
+            "keys": cover_keys,
+            "values": cover_values,
+            "is_summary": cover_is_summary,
+            "indices": cover_indices,
+            "raw_len": T_raw,
+            "summary_len": summary_len.clone(),
+        }
         return cover_keys, cover_values, cover_is_summary, cover_indices
     
     def top_down_attention(
@@ -363,6 +393,14 @@ class LukaKVCaches:
 
         # Build the cover (summary pages + raw tail)
         cover_k, cover_v, cover_is_summary, cover_indices = self.get_covering_kv(layer_idx)
+        # Cache invalidation: cover depends on raw length/summary lengths. At decode time,
+        # the lengths only change when raw cache grows or new summaries appear; we clear
+        # the cache here if raw cache has grown since last use for this layer.
+        cached = self.cover_cache[layer_idx]
+        current_raw_len = self.raw_cache.layers[layer_idx].keys.shape[2]
+        if cached is not None and cached["raw_len"] != current_raw_len:
+            self.cover_cache[layer_idx] = None
+            cover_k, cover_v, cover_is_summary, cover_indices = self.get_covering_kv(layer_idx)
         B, H_k, T_cover, D = cover_k.shape
         _, H_q, L_q, _ = query_states.shape
 
@@ -381,12 +419,12 @@ class LukaKVCaches:
 
         # Attention over the cover
         attn_logits = torch.matmul(query_states, cover_k.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_cover]
+        mask_value = torch.finfo(attn_logits.dtype).min
         if attention_mask is not None:
             # Gather the precomputed causal/sliding mask for the chosen cover positions
             cover_raw_indices_clamped = cover_raw_indices.clamp(min=0)
             idx_expanded = cover_raw_indices_clamped[:, None, None, :].expand(-1, 1, L_q, -1)
             cover_mask = attention_mask.gather(3, idx_expanded)
-            mask_value = torch.finfo(attn_logits.dtype).min
             cover_mask = cover_mask.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value)
             attn_logits = attn_logits + cover_mask
 
@@ -394,29 +432,63 @@ class LukaKVCaches:
         # probability mass matches the true raw probabilities that will be split during refinement.
         if summary_mask.any():
             k_raw_full = self.raw_cache.layers[layer_idx].keys     # [B, H_k, T_raw, D]
-            for b in range(B):
-                sum_positions = torch.nonzero(summary_mask[b], as_tuple=False).flatten()
-                if sum_positions.numel() == 0:
-                    continue
-                for pos in sum_positions.tolist():
-                    page_idx = cover_indices[b, pos].item()
-                    if page_idx < 0:
-                        continue
-                    start = self.page_start[layer_idx][b, page_idx].item()
-                    end = page_ends[b, page_idx].item()
-                    if end < start or end < 0:
-                        attn_logits[b, :, :, pos] = torch.finfo(attn_logits.dtype).min
+            k_full_raw = repeat_kv(k_raw_full, num_kv_groups)      # [B, H_q, T_raw, D]
+            page_starts = self.page_start[layer_idx]               # [B, P_max]
+
+            b_idx, pos_idx = summary_mask.nonzero(as_tuple=True)
+            if b_idx.numel() > 0:
+                for b in b_idx.unique().tolist():
+                    mask_b = (b_idx == b)
+                    pos_tensor = pos_idx[mask_b]
+                    if pos_tensor.numel() == 0:
                         continue
 
-                    k_slice = k_raw_full[b:b+1, :, start:end + 1, :]    # [1, H_k, L_p, D]
-                    k_slice = repeat_kv(k_slice, num_kv_groups)         # [1, H_q, L_p, D]
-                    page_logits = torch.matmul(query_states[b:b+1], k_slice.transpose(2, 3)) * scaling  # [1,H_q,L_q,L_p]
+                    page_ids = cover_indices[b, pos_tensor]                 # [S]
+                    starts_b = page_starts[b, page_ids]                     # [S]
+                    ends_b = page_ends[b, page_ids]                         # [S]
+
+                    valid = (page_ids >= 0) & (ends_b >= starts_b)
+                    invalid_pos = pos_tensor[~valid]
+                    if invalid_pos.numel() > 0:
+                        attn_logits[b, :, :, invalid_pos] = mask_value
+                    if not valid.any():
+                        continue
+
+                    pos_tensor = pos_tensor[valid]
+                    starts_b = starts_b[valid]
+                    ends_b = ends_b[valid]
+
+                    lengths = ends_b - starts_b + 1                         # [S_valid]
+                    max_len = lengths.max().item()
+                    arange = torch.arange(max_len, device=attn_logits.device)
+
+                    raw_idx = starts_b.unsqueeze(1) + arange.unsqueeze(0)    # [S_valid, max_len]
+                    pad_mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+                    raw_idx = raw_idx.masked_fill(pad_mask, -1)
+
+                    idx_clamped = raw_idx.clamp(min=0)
+                    # Gather keys for all pages at once: [1, H_q, S_valid, max_len, D]
+                    k_flat = torch.index_select(k_full_raw[b], 1, idx_clamped.view(-1))
+                    k_pages = k_flat.view(k_full_raw.shape[1], raw_idx.shape[0], max_len, D).unsqueeze(0)
+
+                    # Queries for this batch
+                    q_b = query_states[b:b+1]                               # [1, H_q, L_q, D]
+                    page_logits = torch.einsum('bhld,bhsmd->bhslm', q_b, k_pages) * scaling  # [1, H_q, S_valid, L_q, max_len]
+
                     if attention_mask is not None:
-                        mask_slice = attention_mask[b:b+1, :, :, start:end + 1]  # [1,1,L_q,L_p]
-                        page_logits = page_logits + mask_slice
+                        mask_b_full = attention_mask[b:b+1]                 # [1, 1, L_q, T_raw]
+                        mask_flat = torch.index_select(mask_b_full, 3, idx_clamped.view(-1))  # [1,1,L_q,S_valid*max_len]
+                        mask_pages = mask_flat.view(1, 1, L_q, raw_idx.shape[0], max_len)     # [1,1,L_q,S_valid,max_len]
+                        mask_pages = mask_pages.permute(0, 1, 3, 2, 4)                         # [1,1,S_valid,L_q,max_len]
+                        page_logits = page_logits + mask_pages
 
-                    # log-sum-exp over the page tokens to get the summary logit
-                    attn_logits[b:b+1, :, :, pos] = torch.logsumexp(page_logits, dim=-1)
+                    # Mask out padded positions
+                    bad_mask = pad_mask.view(1, 1, raw_idx.shape[0], 1, max_len)
+                    page_logits = page_logits.masked_fill(bad_mask, mask_value)
+
+                    summary_logits = torch.logsumexp(page_logits, dim=-1)[0]   # [H_q, S_valid, L_q]
+                    summary_logits = summary_logits.permute(0, 2, 1)           # [H_q, L_q, S_valid]
+                    attn_logits[b, :, :, pos_tensor] = summary_logits
 
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_probs, cover_v)  # [B, H_q, L_q, D]
@@ -424,48 +496,74 @@ class LukaKVCaches:
         # Optional refinement: descend into pages whose summary tokens dominate attention.
         if threshold is not None and threshold >= 0:
             refine_mask = (attn_probs > threshold) & summary_mask[:, None, None, :]
+            # Track how many summary tokens were refined vs. skipped
+            refine_positions = refine_mask.any(dim=(1, 2))    # [B, T_cover]
+            stats = self.refine_stats[layer_idx]
+            refined_count = refine_positions.sum().item()
+            summary_count = summary_mask.sum().item()
+            stats["refine"] += refined_count
+            stats["skip"] += max(summary_count - refined_count, 0)
+
             if refine_mask.any():
                 k_raw = self.raw_cache.layers[layer_idx].keys     # [B, H_k, T_raw, D]
                 v_raw = self.raw_cache.layers[layer_idx].values   # [B, H_k, T_raw, D]
                 page_starts = self.page_start[layer_idx]          # [B, P_max]
 
-                for b in range(B):
-                    # Find cover positions (summary tokens) that need refinement for this batch item
-                    need_positions = torch.nonzero(refine_mask[b].any(dim=(0, 1)), as_tuple=False).flatten()
-                    if need_positions.numel() == 0:
-                        continue
+                # Identify cover positions needing refinement (any head/query over threshold)
+                b_idx, pos_idx = refine_positions.nonzero(as_tuple=True)
+                if b_idx.numel() > 0:
+                    page_ids = cover_indices[b_idx, pos_idx]          # [N]
+                    starts = page_starts[b_idx, page_ids]             # [N]
+                    ends = page_ends[b_idx, page_ids]                 # [N]
+                    lengths = ends - starts + 1                       # [N]
 
-                    for pos in need_positions.tolist():
-                        page_idx = cover_indices[b, pos].item()
-                        if page_idx < 0:
-                            continue
+                    valid = (page_ids >= 0) & (ends >= starts)
+                    if valid.any():
+                        b_idx = b_idx[valid]
+                        pos_idx = pos_idx[valid]
+                        starts = starts[valid]
+                        lengths = lengths[valid]
 
-                        start = page_starts[b, page_idx].item()
-                        end = page_ends[b, page_idx].item()
-                        if end < start or end < 0:
-                            continue
+                        unique_lengths = lengths.unique()
+                        for L in unique_lengths.tolist():
+                            bucket_mask = lengths == L
+                            if not bucket_mask.any():
+                                continue
 
-                        # Raw slice for this page
-                        k_slice = k_raw[b:b+1, :, start:end + 1, :]    # [1, H_k, L_p, D]
-                        v_slice = v_raw[b:b+1, :, start:end + 1, :]    # [1, H_k, L_p, D]
+                            b_bucket = b_idx[bucket_mask]             # [M]
+                            pos_bucket = pos_idx[bucket_mask]         # [M]
+                            start_bucket = starts[bucket_mask]        # [M]
 
-                        raw_k = repeat_kv(k_slice, num_kv_groups)      # [1, H_q, L_p, D]
-                        raw_v = repeat_kv(v_slice, num_kv_groups)      # [1, H_q, L_p, D]
+                            L_int = int(L)
+                            arange = torch.arange(L_int, device=query_states.device)
+                            raw_idx = start_bucket.unsqueeze(1) + arange.unsqueeze(0)  # [M, L_int]
 
-                        raw_logits = torch.matmul(query_states[b:b+1], raw_k.transpose(2, 3)) * scaling
-                        if attention_mask is not None:
-                            raw_mask = attention_mask[b:b+1, :, :, start:end + 1]
-                            raw_logits = raw_logits + raw_mask
+                            # Gather raw KV slices for this bucket
+                            k_batch = k_raw[b_bucket]                 # [M, H_k, T_raw, D]
+                            v_batch = v_raw[b_bucket]                 # [M, H_k, T_raw, D]
+                            idx_expanded = raw_idx[:, None, :, None].expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
+                            k_slice = torch.gather(k_batch, 2, idx_expanded)          # [M, H_k, L_int, D]
+                            v_slice = torch.gather(v_batch, 2, idx_expanded)
 
-                        raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                        raw_out = torch.matmul(raw_probs, raw_v)[0]    # [H_q, L_q, D]
+                            raw_k = repeat_kv(k_slice, num_kv_groups)                 # [M, H_q, L_int, D]
+                            raw_v = repeat_kv(v_slice, num_kv_groups)                 # [M, H_q, L_int, D]
 
-                        # Reallocate the summary mass across the raw tokens, leaving other cover tokens untouched
-                        attn_mass = attn_probs[b, :, :, pos]           # [H_q, L_q]
-                        base_value = cover_v[b, :, pos, :].unsqueeze(1)  # [H_q, 1, D]
-                        delta = (raw_out - base_value) * attn_mass.unsqueeze(-1)
+                            q_bucket = query_states[b_bucket]                         # [M, H_q, L_q, D]
+                            raw_logits = torch.matmul(q_bucket, raw_k.transpose(2, 3)) * scaling
+                            if attention_mask is not None:
+                                mask_bucket = attention_mask[b_bucket]               # [M, 1, L_q, T_raw]
+                                mask_slice = torch.gather(mask_bucket, 3, raw_idx[:, None, None, :])
+                                raw_logits = raw_logits + mask_slice
 
-                        active_mask = refine_mask[b, :, :, pos].unsqueeze(-1)  # [H_q, L_q, 1]
-                        attn_output[b] = attn_output[b] + delta * active_mask
+                            raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                            raw_out = torch.matmul(raw_probs, raw_v)                  # [M, H_q, L_q, D]
+
+                            base_value = cover_v[b_bucket, :, pos_bucket, :].unsqueeze(2)   # [M, H_q, 1, D]
+                            attn_mass = attn_probs[b_bucket, :, :, pos_bucket]              # [M, H_q, L_q]
+                            delta = (raw_out - base_value) * attn_mass.unsqueeze(-1)        # [M, H_q, L_q, D]
+
+                            active_mask = refine_mask[b_bucket, :, :, pos_bucket].unsqueeze(-1)  # [M, H_q, L_q, 1]
+                            update = delta * active_mask
+                            attn_output.index_add_(0, b_bucket, update)
 
         return attn_output, attn_probs

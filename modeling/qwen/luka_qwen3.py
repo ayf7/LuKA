@@ -127,11 +127,11 @@ class LukaQwenAttention(nn.Module):
                 num_kv_groups=self.num_key_value_groups,
                 attention_mask=attention_mask,
                 sliding_window=self.sliding_window,
-                threshold=0.0,
+                threshold=0.08,
             )
             attn_output = attn_output.transpose(1, 2)
             if self.layer_idx == 0:
-                pass
+                print(self.luka_kv_caches.refine_stats[0])
                 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
