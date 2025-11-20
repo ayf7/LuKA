@@ -21,7 +21,8 @@ class LukaKVCaches:
             num_layers: int,
             default_tail_len: int = 16,
             min_compress_chunk: int = 32,
-            batch_size: int = 0
+            batch_size: int = 0,
+            max_pages: int = 15,
     ):
         # Original K/V cache, built by default from transformers package
         self.raw_cache = raw_cache
@@ -45,6 +46,7 @@ class LukaKVCaches:
         self.num_layers = num_layers
         self.initialized = [False] * num_layers
         self.starts = None
+        self.max_pages = max_pages
         # Simple refinement statistics per layer
         self.refine_stats = [
             {"refine": 0, "skip": 0} for _ in range(num_layers)
@@ -134,36 +136,17 @@ class LukaKVCaches:
             self.attn_weight_buffer = self.attn_weight_buffer[:,:,-10:,:]
     
     def populate_pages(self) -> Optional[torch.LongTensor]:
-        B = self.starts.shape[0]
-        MAX_NUM_PAGES = 15
-
-        page_size = self.min_compress_chunk
-        last_valid = self.attn_weight_buffer.shape[-1] - self.default_tail_len - 1  # last usable raw index
-
-        # starts[b] is raw absolute position where this sequence begins in attention
-        # We generate start positions first:
-        offsets = torch.arange(MAX_NUM_PAGES, device=self.starts.device).unsqueeze(0)  # [1, MAX_NUM_PAGES]
-        page_starts = self.starts.unsqueeze(1) + offsets * page_size                  # [B, MAX_NUM_PAGES]
-
-        # Convert to page *end* positions
-        page_ends = page_starts + (page_size - 1)
-
-        # Clip to maximum allowed index
-        page_ends = torch.minimum(page_ends, torch.tensor(last_valid, device=page_ends.device))
-
-        # Determine where pages exceed last_valid *before* clipping
-        exceed = page_starts > last_valid
-        first_hit = torch.where(
-            exceed.any(dim=1),
-            exceed.float().argmax(dim=1),
-            torch.full((B,), MAX_NUM_PAGES, device=page_ends.device, dtype=torch.long)
+        if self.attn_weight_buffer is None or self.starts is None:
+            return None
+        out = self.segmenter.process(
+            attention_scores=self.attn_weight_buffer,
+            seq_starts=self.starts,
+            min_chunk=self.min_compress_chunk,
+            tail_len=self.default_tail_len,
+            max_pages=self.max_pages,
         )
-
-        col_ids = torch.arange(MAX_NUM_PAGES, device=page_ends.device).unsqueeze(0) # [1, MAX_NUM_PAGES]
-        mask_after = col_ids > first_hit.unsqueeze(1) # [B, MAX_NUM_PAGES]
-
-        page_ends[mask_after] = -1
-        return page_ends
+        print(out)
+        return out
 
     def finalize_pages_and_build_summaries(
         self,

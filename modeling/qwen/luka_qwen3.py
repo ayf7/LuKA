@@ -51,7 +51,7 @@ class LukaQwenAttention(nn.Module):
         self.q_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        self.luka_kv_caches = LukaKVCaches(None, DummySegmenter(), config.num_hidden_layers)
+        self.luka_kv_caches = LukaKVCaches(None, DummySegmenter(), config.num_hidden_layers) # TODO: make this configurable.
 
     def forward(
         self,
