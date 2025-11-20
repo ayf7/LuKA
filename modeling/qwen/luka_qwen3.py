@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Callable
 
-
 import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
 from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
@@ -21,9 +20,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.cache_utils import Cache, DynamicCache
 
-from modeling.segmenter import Rule, SimpleLaggedKLDivergenceRule
-from modeling.kv_cache import LukaKVCache
-
+from modeling.segmenter import DummySegmenter
+from modeling.kv_cache import LukaKVCaches
 
 class LukaQwenAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -53,6 +51,7 @@ class LukaQwenAttention(nn.Module):
         self.q_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.luka_kv_caches = LukaKVCaches(None, DummySegmenter(), config.num_hidden_layers)
 
     def forward(
         self,
@@ -89,19 +88,51 @@ class LukaQwenAttention(nn.Module):
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         # attn_output: [B, L, H_q, D]
-        # attn_weights: [B, H, L, L + L_past]
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states, # [B, H_q, L, D]
-            key_states, # [B, H_k, L, D]
-            value_states, # [B, H_k, L + L_past, D]
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+        # attn_weights: [B, H, L, L+L_past]
 
+        if self.layer_idx == 0:
+            print("tick:", cache_position)
+
+        if not self.luka_kv_caches.initialized[self.layer_idx]:
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states, # [B, H_q, L, D]
+                key_states, # [B, H_k, L + L_past, D]
+                value_states, # [B, H_k, L + L_past, D]
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
+            if self.luka_kv_caches.raw_cache is None:
+                self.luka_kv_caches.raw_cache = past_key_value
+            self.luka_kv_caches.buffer_weights(attn_weights, attention_mask)
+            page_indices = self.luka_kv_caches.populate_pages()
+            k, v = past_key_value.layers[self.layer_idx].keys, past_key_value.layers[self.layer_idx].values
+            self.luka_kv_caches.finalize_pages_and_build_summaries(self.layer_idx, k, v, page_indices)
+            self.luka_kv_caches.initialized[self.layer_idx] = True
+
+        else:
+            # Decode-time: run LuKA top-down attention using the summary pages
+            # For now we assume query_states heads already match KV heads (HF has
+            # already handled repeat_kv inside attention_interface in prefill).
+            # query_states: [B, H_q, L, D], with L typically 1 in decoding.
+
+            attn_output, attn_weights = self.luka_kv_caches.top_down_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
+                scaling=self.scaling,
+                num_kv_groups=self.num_key_value_groups,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                threshold=0.0,
+            )
+            attn_output = attn_output.transpose(1, 2)
+            if self.layer_idx == 0:
+                pass
+                
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
