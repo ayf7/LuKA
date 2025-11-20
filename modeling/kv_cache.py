@@ -20,7 +20,7 @@ class LukaKVCaches:
             segmenter: Segmenter,
             num_layers: int,
             default_tail_len: int = 16,
-            min_compress_chunk: int = 32,
+            min_compress_chunk: int = 16,
             batch_size: int = 0,
             max_pages: int = 15,
     ):
@@ -145,7 +145,6 @@ class LukaKVCaches:
             tail_len=self.default_tail_len,
             max_pages=self.max_pages,
         )
-        print(out)
         return out
 
     def finalize_pages_and_build_summaries(
@@ -162,10 +161,12 @@ class LukaKVCaches:
 
         B, H, T, D = k_raw.shape
         MAX_PAGES = page_ends.shape[1]
-        page_size = self.min_compress_chunk
-
-        # Compute page starts = end - page_size + 1, but clamp at >= 0.
-        page_starts = page_ends - (page_size - 1)
+        # Compute page starts as contiguous segments ending at the provided page_ends.
+        # page_starts[b,0] = 0; page_starts[b,p] = page_ends[b,p-1] + 1
+        page_starts = torch.zeros_like(page_ends)
+        page_starts[:, 0] = 0
+        for p in range(1, MAX_PAGES):
+            page_starts[:, p] = page_ends[:, p - 1] + 1
         page_starts = torch.clamp(page_starts, min=0)
 
         # Store these
@@ -186,7 +187,6 @@ class LukaKVCaches:
                 end_idx = page_ends[b, p].item()
                 if end_idx < 0:
                     break
-
                 start_idx = page_starts[b, p].item()
                 if start_idx > end_idx:
                     continue

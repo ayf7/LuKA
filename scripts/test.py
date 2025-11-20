@@ -5,12 +5,17 @@ Simple script to test boundary detection during generation.
 
 import torch
 from transformers import AutoTokenizer
-from modeling.qwen.luka_qwen3 import load_luka_model
+from modeling.segmenter import KLDivergenceSegmenter
+from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params, set_luka_segmenter
 from artifacts.prompts.prompt_loader import load_prompt
 
 # Configuration
 model_name = "Qwen/Qwen3-1.7B-Base"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Configure LuKA cache parameters and segmenter
+set_luka_kv_params(default_tail_len=16, min_compress_chunk=16, max_pages=15, refine_threshold=0.1)
+set_luka_segmenter(KLDivergenceSegmenter(lag=8, threshold=None, top_k = 10))
 
 # Load model and tokenizer
 model = load_luka_model(

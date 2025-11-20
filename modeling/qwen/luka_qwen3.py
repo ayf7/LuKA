@@ -20,8 +20,33 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.cache_utils import Cache, DynamicCache
 
-from modeling.segmenter import DummySegmenter
+from modeling.segmenter import DummySegmenter, KLDivergenceSegmenter
 from modeling.kv_cache import LukaKVCaches
+
+# Optional global overrides for segmenter and KV cache params, settable by callers (e.g., scripts/test.py)
+_segmenter_override = None
+_kv_params_override: dict[str, int] = {}
+
+def set_luka_segmenter(segmenter: DummySegmenter) -> None:
+    global _segmenter_override
+    _segmenter_override = segmenter
+
+def set_luka_kv_params(
+    *,
+    default_tail_len: int | None = None,
+    min_compress_chunk: int | None = None,
+    max_pages: int | None = None,
+    refine_threshold: float | None = None,
+) -> None:
+    global _kv_params_override
+    if default_tail_len is not None:
+        _kv_params_override["default_tail_len"] = int(default_tail_len)
+    if min_compress_chunk is not None:
+        _kv_params_override["min_compress_chunk"] = int(min_compress_chunk)
+    if max_pages is not None:
+        _kv_params_override["max_pages"] = int(max_pages)
+    if refine_threshold is not None:
+        _kv_params_override["refine_threshold"] = float(refine_threshold)
 
 class LukaQwenAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -51,7 +76,21 @@ class LukaQwenAttention(nn.Module):
         self.q_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        self.luka_kv_caches = LukaKVCaches(None, DummySegmenter(), config.num_hidden_layers) # TODO: make this configurable.
+        segmenter = _segmenter_override if _segmenter_override is not None else KLDivergenceSegmenter(threshold=1.0)
+        kv_defaults = {
+            "default_tail_len": 16,
+            "min_compress_chunk": 16,
+            "max_pages": 15,
+        }
+        kv_defaults.update(_kv_params_override)
+        self.luka_kv_caches = LukaKVCaches(
+            None,
+            segmenter,
+            config.num_hidden_layers,
+            default_tail_len=kv_defaults["default_tail_len"],
+            min_compress_chunk=kv_defaults["min_compress_chunk"],
+            max_pages=kv_defaults["max_pages"],
+        ) # TODO: make this configurable.
 
     def forward(
         self,
@@ -113,6 +152,8 @@ class LukaQwenAttention(nn.Module):
             k, v = past_key_value.layers[self.layer_idx].keys, past_key_value.layers[self.layer_idx].values
             self.luka_kv_caches.finalize_pages_and_build_summaries(self.layer_idx, k, v, page_indices)
             self.luka_kv_caches.initialized[self.layer_idx] = True
+            print(f"LuKA layer {self.layer_idx} page_ends:", page_indices[0].tolist())
+                
 
         else:
             # Decode-time: run LuKA top-down attention using the summary pages
@@ -120,6 +161,7 @@ class LukaQwenAttention(nn.Module):
             # already handled repeat_kv inside attention_interface in prefill).
             # query_states: [B, H_q, L, D], with L typically 1 in decoding.
 
+            thresh = _kv_params_override.get("refine_threshold", 0.15)
             attn_output, attn_weights = self.luka_kv_caches.top_down_attention(
                 layer_idx=self.layer_idx,
                 query_states=query_states,
@@ -127,7 +169,7 @@ class LukaQwenAttention(nn.Module):
                 num_kv_groups=self.num_key_value_groups,
                 attention_mask=attention_mask,
                 sliding_window=self.sliding_window,
-                threshold=0.08,
+                threshold=thresh,
             )
             attn_output = attn_output.transpose(1, 2)
             if self.layer_idx == 0:
