@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from modeling.segmenter import Segmenter
+from modeling.compressor import Compressor, MeanCompressor
 from transformers.cache_utils import Cache, DynamicCache
 
 from typing import Any, Optional, List
@@ -23,9 +24,11 @@ class LukaKVCaches:
             min_compress_chunk: int = 16,
             batch_size: int = 0,
             max_pages: int = 15,
+            compressor: Compressor | None = None,
     ):
         # Original K/V cache, built by default from transformers package
         self.raw_cache = raw_cache
+        self.compressor = compressor if compressor is not None else MeanCompressor()
 
         # # Summary K/V data structures
         self.summary_keys: List[Optional[torch.Tensor]] = [None for _ in range(num_layers)] # list of [B, H_k, MAX_PAGES, D]
@@ -192,16 +195,17 @@ class LukaKVCaches:
                     continue
 
                 # Slice raw KV: [H, page_len, D]
-                k_slice = k_raw[b, :, start_idx:end_idx+1, :]
-                v_slice = v_raw[b, :, start_idx:end_idx+1, :]
+                k_slice = k_raw[b:b+1, :, start_idx:end_idx+1, :]
+                v_slice = v_raw[b:b+1, :, start_idx:end_idx+1, :]
 
-                # Average across the sequence length dimension
-                k_avg = k_slice.mean(dim=1)        # [H, D]
-                v_avg = v_slice.mean(dim=1)        # [H, D]
+                # Compress to summary k/v
+                # Ensure compressor is on same device/dtype as inputs
+                self.compressor.to(device=k_slice.device, dtype=k_slice.dtype)
+                k_comp, v_comp = self.compressor(k_slice, v_slice)  # [1, H, D] each
 
                 # Store them into the L-th summary cache
-                self.summary_keys[layer_idx][b, :, p, :] = k_avg
-                self.summary_values[layer_idx][b, :, p, :] = v_avg
+                self.summary_keys[layer_idx][b, :, p, :] = k_comp[0]
+                self.summary_values[layer_idx][b, :, p, :] = v_comp[0]
 
                 valid_counts[b] += 1
 

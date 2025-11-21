@@ -22,10 +22,11 @@ from transformers.cache_utils import Cache, DynamicCache
 
 from modeling.segmenter import DummySegmenter, KLDivergenceSegmenter
 from modeling.kv_cache import LukaKVCaches
+from modeling.compressor import MeanCompressor, EncoderCompressor
 
 # Optional global overrides for segmenter and KV cache params, settable by callers (e.g., scripts/test.py)
 _segmenter_override = None
-_kv_params_override: dict[str, int] = {}
+_kv_params_override: dict[str, float | int | object] = {}
 
 def set_luka_segmenter(segmenter: DummySegmenter) -> None:
     global _segmenter_override
@@ -37,6 +38,7 @@ def set_luka_kv_params(
     min_compress_chunk: int | None = None,
     max_pages: int | None = None,
     refine_threshold: float | None = None,
+    compressor: object | None = None,
 ) -> None:
     global _kv_params_override
     if default_tail_len is not None:
@@ -47,6 +49,8 @@ def set_luka_kv_params(
         _kv_params_override["max_pages"] = int(max_pages)
     if refine_threshold is not None:
         _kv_params_override["refine_threshold"] = float(refine_threshold)
+    if compressor is not None:
+        _kv_params_override["compressor"] = compressor
 
 class LukaQwenAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -81,6 +85,7 @@ class LukaQwenAttention(nn.Module):
             "default_tail_len": 16,
             "min_compress_chunk": 16,
             "max_pages": 15,
+            "compressor": None,
         }
         kv_defaults.update(_kv_params_override)
         self.luka_kv_caches = LukaKVCaches(
@@ -90,6 +95,7 @@ class LukaQwenAttention(nn.Module):
             default_tail_len=kv_defaults["default_tail_len"],
             min_compress_chunk=kv_defaults["min_compress_chunk"],
             max_pages=kv_defaults["max_pages"],
+            compressor=kv_defaults["compressor"],
         ) # TODO: make this configurable.
 
     def forward(
