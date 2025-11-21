@@ -18,7 +18,7 @@ model = load_luka_model(
     torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     device_map="auto" if device == "cuda" else None,
 )
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
 
 # Load prompts (batch)
 prompts = [
