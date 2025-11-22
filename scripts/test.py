@@ -15,7 +15,7 @@ model_name = "Qwen/Qwen3-1.7B-Base"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Configure LuKA cache parameters, compressor, and segmenter
-encoder_compressor = EncoderCompressor(dim=64)
+encoder_compressor = EncoderCompressor(dim=128)
 set_luka_kv_params(
     default_tail_len=16,
     min_compress_chunk=16,
