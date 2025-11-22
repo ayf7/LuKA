@@ -56,6 +56,8 @@ class LukaKVCaches:
             self.segmenter.min_chunk = self.min_compress_chunk
             self.segmenter.tail_len = self.default_tail_len
             self.segmenter.max_pages = self.max_pages
+            for idx in range(num_layers):
+                self.segmenter._get_layer_state(idx)
 
     def update_original(
         self,
@@ -121,6 +123,8 @@ class LukaKVCaches:
         Given the computed page ends for this layer, update page_start/page_end
         and build summary key/value tensors by averaging raw keys/values on each page.
         """
+        if page_ends is None:
+            return
 
         B, H, T, D = k_raw.shape
         MAX_PAGES = page_ends.shape[1]
@@ -472,6 +476,7 @@ class LukaKVCaches:
                         lengths = lengths[valid]
 
                         unique_lengths = lengths.unique()
+                        # TODO: potentially make this.
                         for L in unique_lengths.tolist():
                             bucket_mask = lengths == L
                             if not bucket_mask.any():
@@ -513,4 +518,7 @@ class LukaKVCaches:
                             update = delta * active_mask
                             attn_output.index_add_(0, b_bucket, update)
 
+        # if layer_idx == 0:
+        #     print(attn_probs.shape, flush=True)
+        #     print(attn_probs, attn_logits)
         return attn_output, attn_probs

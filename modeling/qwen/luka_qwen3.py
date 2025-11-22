@@ -20,7 +20,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.cache_utils import Cache, DynamicCache
 
-from modeling.segmenter import DummySegmenter, KLDivergenceSegmenter
+from modeling.segmenter import BufferedSegmenter, DummySegmenter, KLDivergenceSegmenter
 from modeling.kv_cache import LukaKVCaches
 from modeling.compressor import MeanCompressor, EncoderCompressor
 
@@ -28,7 +28,7 @@ from modeling.compressor import MeanCompressor, EncoderCompressor
 _segmenter_override = None
 _kv_params_override: dict[str, float | int | object] = {}
 
-def set_luka_segmenter(segmenter: DummySegmenter) -> None:
+def set_luka_segmenter(segmenter: BufferedSegmenter) -> None:
     global _segmenter_override
     _segmenter_override = segmenter
 
@@ -160,6 +160,8 @@ class LukaQwenAttention(nn.Module):
                 self.luka_kv_caches.raw_cache = past_key_value
             self.luka_kv_caches.buffer_weights(self.layer_idx, attn_weights, attention_mask)
             page_indices = self.luka_kv_caches.return_page_boundaries(self.layer_idx)
+            if page_indices is None:
+                return attn_output, attn_weights
             k, v = past_key_value.layers[self.layer_idx].keys, past_key_value.layers[self.layer_idx].values
             self.luka_kv_caches.finalize_pages_and_build_summaries(self.layer_idx, k, v, page_indices)
             self.luka_kv_caches.initialized[self.layer_idx] = True
@@ -182,10 +184,19 @@ class LukaQwenAttention(nn.Module):
                 sliding_window=self.sliding_window,
                 threshold=thresh,
             )
-            attn_output = attn_output.transpose(1, 2)
-            if self.layer_idx == 0:
-                print(self.luka_kv_caches.refine_stats[0])
+            # Buffer cover-level probabilities for later segmentation. attn_weights here
+            # are over the cover (summary + raw tail), so we provide a matching mask.
+            if isinstance(self.luka_kv_caches.segmenter, BufferedSegmenter):
+                B, H_q, L_q, T_cover = attn_weights.shape
+                cover_mask = attn_weights.new_ones(B, 1, L_q, T_cover)
+                self.luka_kv_caches.buffer_weights(self.layer_idx, attn_weights, cover_mask)
+                if self.layer_idx == 0:
+                    print(self.luka_kv_caches.refine_stats[0], flush=True)
+                    print(self.luka_kv_caches.segmenter.print_stats(0))
                 
+            attn_output = attn_output.transpose(1, 2)
+
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
