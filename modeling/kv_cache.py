@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
-from modeling.segmenter import Segmenter
+from modeling.segmenter import Segmenter, BufferedSegmenter
 from modeling.compressor import Compressor, MeanCompressor
 from transformers.cache_utils import Cache, DynamicCache
 
 from typing import Any, Optional, List
-from dataclasses import dataclass
 from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
     apply_rotary_pos_emb,
@@ -39,8 +38,6 @@ class LukaKVCaches:
         self.page_end: List[torch.Tensor] = [torch.zeros(batch_size, dtype=torch.long) for _ in range(num_layers)]
 
         # # This is what will be used to eventually construct pages.
-        self.attn_weight_buffer = None # [B, H, L, L_past] # where L_past in this case is last index that's been processed
-
         self.segmenter = segmenter
 
         self.tail_len: List[int] = [0] * num_layers
@@ -48,7 +45,6 @@ class LukaKVCaches:
         self.min_compress_chunk = min_compress_chunk
         self.num_layers = num_layers
         self.initialized = [False] * num_layers
-        self.starts = None
         self.max_pages = max_pages
         # Simple refinement statistics per layer
         self.refine_stats = [
@@ -56,7 +52,10 @@ class LukaKVCaches:
         ]
         # Cached cover per layer to avoid rebuilding when unchanged
         self.cover_cache: List[Optional[dict[str, torch.Tensor]]] = [None for _ in range(num_layers)]
-        pass
+        if isinstance(self.segmenter, BufferedSegmenter):
+            self.segmenter.min_chunk = self.min_compress_chunk
+            self.segmenter.tail_len = self.default_tail_len
+            self.segmenter.max_pages = self.max_pages
 
     def update_original(
         self,
@@ -89,66 +88,27 @@ class LukaKVCaches:
         )
         return k_raw_all, v_raw_all
 
-    def _get_seq_starts(
-        self,
-        attn_mask: torch.Tensor # [B, 1, new_len, total_seq_len]
-    ) -> torch.Tensor:
-        last_rows = attn_mask[:, 0, -1, :]
-        is_zero = (last_rows == 0)
-        indices = is_zero.float().argmax(dim=1)
-        no_zero = (~is_zero).all(dim=1)
-        indices[no_zero] = -1  # or any sentinel you want
-        return indices
-
     def buffer_weights(
         self,
+        layer_idx: int,
         attn_weight: torch.Tensor, # [B, H, new_len, total_seq_len]
         attn_mask: torch.Tensor # [B, 1, new_len, total_seq_len]
     ) -> None:
-        if self.starts is None:
-            self.starts = self._get_seq_starts(attn_mask) # [B]
-        if self.attn_weight_buffer is None:
-            self.attn_weight_buffer = attn_weight
-            return
-        b, h, new, old_and_new = attn_weight.shape
-        b0, h0, old_rows, old_cols = self.attn_weight_buffer.shape
-
-        assert b == b0 and h == h0, (
-            f"buffer_weights: batch/head mismatch "
-            f"(buffer {b0},{h0} vs new {b},{h})"
-        )
-        assert new + old_cols == old_and_new, (
-            f"buffer_weights: inconsistent lengths "
-            f"new={new}, old_cols={old_cols}, total={old_and_new}"
-        )
-
-        # Allocate enlarged buffer:
-        # rows = old_rows + new (old queries + new queries)
-        # cols = old_and_new     (old keys + new keys)
-        new_buffer = attn_weight.new_zeros(b, h, old_rows + new, old_and_new)
-
-        # Copy old block into the top-left corner
-        new_buffer[:, :, :old_rows, :old_cols] = self.attn_weight_buffer
-
-        # Copy new rows (new queries) into the last new rows using negative indexing
-        # new_buffer[:, :, -new:, :] has shape [B, H, new, old_and_new]
-        new_buffer[:, :, -new:, :old_and_new] = attn_weight
-
-        self.attn_weight_buffer = new_buffer
-        if new_buffer.shape[-1] % 10 == 0:
-            self.attn_weight_buffer = self.attn_weight_buffer[:,:,-10:,:]
+        if isinstance(self.segmenter, BufferedSegmenter):
+            self.segmenter.min_chunk = self.min_compress_chunk
+            self.segmenter.tail_len = self.default_tail_len
+            self.segmenter.max_pages = self.max_pages
+            self.segmenter.push(layer_idx, attn_weight, attn_mask)
+        else:
+            raise AttributeError("Segmenter does not support buffering via push().")
     
-    def populate_pages(self) -> Optional[torch.LongTensor]:
-        if self.attn_weight_buffer is None or self.starts is None:
-            return None
-        out = self.segmenter.process(
-            attention_scores=self.attn_weight_buffer,
-            seq_starts=self.starts,
-            min_chunk=self.min_compress_chunk,
-            tail_len=self.default_tail_len,
-            max_pages=self.max_pages,
-        )
-        return out
+    def populate_pages(self, layer_idx: int) -> Optional[torch.LongTensor]:
+        return self.return_page_boundaries(layer_idx)
+
+    def return_page_boundaries(self, layer_idx: int) -> Optional[torch.LongTensor]:
+        if isinstance(self.segmenter, BufferedSegmenter):
+            return self.segmenter.return_page_boundaries(layer_idx)
+        raise AttributeError("Segmenter does not support return_page_boundaries().")
 
     def finalize_pages_and_build_summaries(
         self,

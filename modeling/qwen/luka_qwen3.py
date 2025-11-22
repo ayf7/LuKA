@@ -80,7 +80,6 @@ class LukaQwenAttention(nn.Module):
         self.q_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        segmenter = _segmenter_override if _segmenter_override is not None else KLDivergenceSegmenter(threshold=1.0)
         kv_defaults = {
             "default_tail_len": 16,
             "min_compress_chunk": 16,
@@ -88,6 +87,12 @@ class LukaQwenAttention(nn.Module):
             "compressor": None,
         }
         kv_defaults.update(_kv_params_override)
+        segmenter = _segmenter_override if _segmenter_override is not None else KLDivergenceSegmenter(
+            threshold=1.0,
+            min_chunk=kv_defaults["min_compress_chunk"],
+            tail_len=kv_defaults["default_tail_len"],
+            max_pages=kv_defaults["max_pages"],
+        )
         self.luka_kv_caches = LukaKVCaches(
             None,
             segmenter,
@@ -153,8 +158,8 @@ class LukaQwenAttention(nn.Module):
             )
             if self.luka_kv_caches.raw_cache is None:
                 self.luka_kv_caches.raw_cache = past_key_value
-            self.luka_kv_caches.buffer_weights(attn_weights, attention_mask)
-            page_indices = self.luka_kv_caches.populate_pages()
+            self.luka_kv_caches.buffer_weights(self.layer_idx, attn_weights, attention_mask)
+            page_indices = self.luka_kv_caches.return_page_boundaries(self.layer_idx)
             k, v = past_key_value.layers[self.layer_idx].keys, past_key_value.layers[self.layer_idx].values
             self.luka_kv_caches.finalize_pages_and_build_summaries(self.layer_idx, k, v, page_indices)
             self.luka_kv_caches.initialized[self.layer_idx] = True
