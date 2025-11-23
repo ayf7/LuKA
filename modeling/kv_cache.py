@@ -518,7 +518,9 @@ class LukaKVCaches:
                             update = delta * active_mask
                             attn_output.index_add_(0, b_bucket, update)
 
-        # if layer_idx == 0:
-        #     print(attn_probs.shape, flush=True)
-        #     print(attn_probs, attn_logits)
+        # TODO: we may need to make the cover_mask left-padded, not right-padded.
+        if layer_idx == 0:
+            print(attn_probs.shape, flush=True)
+            print(cover_mask, cover_mask.shape) # [B, 1, 1 (decoding), max(num_pages + raw_tokens)]
+            print(attn_probs[:,0,:,:], attn_probs.shape) # [B, H, 1 (decoding), max(num_pages + raw_tokens)]
         return attn_output, attn_probs

@@ -187,9 +187,7 @@ class LukaQwenAttention(nn.Module):
             # Buffer cover-level probabilities for later segmentation. attn_weights here
             # are over the cover (summary + raw tail), so we provide a matching mask.
             if isinstance(self.luka_kv_caches.segmenter, BufferedSegmenter):
-                B, H_q, L_q, T_cover = attn_weights.shape
-                cover_mask = attn_weights.new_ones(B, 1, L_q, T_cover)
-                self.luka_kv_caches.buffer_weights(self.layer_idx, attn_weights, cover_mask)
+                # TODO: support continued bufferng.
                 if self.layer_idx == 0:
                     print(self.luka_kv_caches.refine_stats[0], flush=True)
                     print(self.luka_kv_caches.segmenter.print_stats(0))
