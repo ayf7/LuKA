@@ -91,7 +91,8 @@ class LukaQwenAttention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         if self.layer_idx == 0:
-            print(cache_position)
+            # print(cache_position)
+            pass
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -157,8 +158,9 @@ class LukaQwenAttention(nn.Module):
                 threshold=0.0
             )
 
-        # if self.layer_idx == 0:
-        #     self.luka_kv.print_stats(0)
+        if self.layer_idx == 0:
+            # self.luka_kv.print_stats(0)
+            pass
         
         # Try to create new pages (segmentation & compression)
         # This uses the buffer populated by top_down_attention

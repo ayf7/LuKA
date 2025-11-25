@@ -82,8 +82,9 @@ class RawCache:
             self.raw_seq_start[layer_idx] = self.seq_start[layer_idx].clone()
 
             if layer_idx == 0:
-                print(self.seq_start[layer_idx])
-                print(self.raw_seq_start[layer_idx])
+                # print(self.seq_start[layer_idx])
+                # print(self.raw_seq_start[layer_idx])
+                pass
         return k_all, v_all, self.seq_start[layer_idx], self.raw_seq_start[layer_idx]
 
     def initialize_with_cache(
@@ -241,6 +242,18 @@ class SummaryCache:
         self.page_start: torch.Tensor = None    # [B, max(L_num_pages)] start idx (inclusive) in raw cache
         self.page_end: torch.Tensor = None      # [B, max(L_num_pages)] end idx (inclusive) in raw cache
         self.page_frontier: torch.Tensor = None # [B] first raw index not covered by any page
+
+    def initialize(self, B: int, H: int, D: int, device: torch.device, dtype: torch.dtype):
+        """Initialize with empty state."""
+        if self.keys is not None:
+            return
+            
+        self.keys = torch.zeros(B, H, 0, D, device=device, dtype=dtype)
+        self.values = torch.zeros(B, H, 0, D, device=device, dtype=dtype)
+        self.page_lens = torch.zeros(B, dtype=torch.long, device=device)
+        self.page_start = torch.zeros(B, 0, dtype=torch.long, device=device)
+        self.page_end = torch.zeros(B, 0, dtype=torch.long, device=device)
+        self.page_frontier = torch.zeros(B, dtype=torch.long, device=device)
 
     def add_pages(self,
         keys: torch.Tensor,
@@ -408,7 +421,8 @@ class CoverView:
 
     def update(self,
         keys: torch.Tensor,
-        values: torch.Tensor
+        values: torch.Tensor,
+        indices: torch.Tensor
     ):
         """Append raw tokens into the cover view during decoding.
 
@@ -417,6 +431,8 @@ class CoverView:
                 [B, H, L_new, D] raw keys for new tokens (typically L_new == 1).
             values: torch.Tensor
                 [B, H, L_new, D] raw values for new tokens.
+            indices: torch.Tensor
+                [B, L_new] raw indices for the new tokens.
 
         Returns:
             None; should mutate `cover_keys/cover_values` by concatenating the
@@ -437,10 +453,7 @@ class CoverView:
         self.cover_is_summary = torch.cat([self.cover_is_summary, new_is_summary], dim=1)
         
         # Update indices
-        # We assume we are appending to a raw tail, so indices continue sequentially.
-        last_indices = self.cover_indices[:, -1:] # [B, 1]
-        new_indices = last_indices + 1 + torch.arange(L_new, device=keys.device).unsqueeze(0)
-        self.cover_indices = torch.cat([self.cover_indices, new_indices], dim=1)
+        self.cover_indices = torch.cat([self.cover_indices, indices], dim=1)
 
 
     def update_cover_view(self,
@@ -488,10 +501,18 @@ class CoverView:
         
         for b in range(B):
             # Summary Part
+            # Handle case where summary_cache is smaller than raw_cache (lazy init)
             if sum_k is not None and page_lens is not None:
-                p_len = page_lens[b]
-                k_s = sum_k[b, :, :p_len, :] # [H, P, D]
-                v_s = sum_v[b, :, :p_len, :]
+                if b < page_lens.shape[0]:
+                    p_len = page_lens[b]
+                    k_s = sum_k[b, :, :p_len, :] # [H, P, D]
+                    v_s = sum_v[b, :, :p_len, :]
+                else:
+                    # Batch index outside summary cache -> treat as 0 pages
+                    k_s = torch.empty(H, 0, D, device=device, dtype=k_raw.dtype)
+                    v_s = torch.empty(H, 0, D, device=device, dtype=v_raw.dtype)
+                    p_len = 0
+
                 
                 # Indices for summary: we use the PAGE INDEX (0 to P-1)
                 # But we need to distinguish summary indices from raw indices.
@@ -505,6 +526,7 @@ class CoverView:
                 v_s = torch.empty(H, 0, D, device=device)
                 idx_s = torch.empty(0, dtype=torch.long, device=device)
                 is_sum_s = torch.empty(0, dtype=torch.long, device=device)
+                p_len = 0
             
             # Raw Tail Part
             # Starts at `raw_seq_start[b]`
@@ -780,6 +802,15 @@ class LukaKVController:
                 device=k_raw.device,
                 dtype=k_raw.dtype
             )
+            
+            # Initialize summary cache
+            self.summary_cache[layer_idx].initialize(
+                B=B,
+                H=H, # H_k
+                D=D,
+                device=k_raw.device,
+                dtype=k_raw.dtype
+            )
 
     def update(
         self,
@@ -823,7 +854,17 @@ class LukaKVController:
         if self.cover_view[layer_idx].cover_keys is None:
              self.initialize_views(layer_idx)
         else:
-            self.cover_view[layer_idx].update(keys, values)
+            # Calculate indices for new tokens
+            # k_all: [B, H, T_raw, D]
+            # keys: [B, H, L_new, D]
+            B, H, T_raw, D = k_all.shape
+            L_new = keys.shape[2]
+            device = keys.device
+            
+            # Indices are [T_raw - L_new, ..., T_raw - 1]
+            new_indices = torch.arange(T_raw - L_new, T_raw, device=device).unsqueeze(0).expand(B, -1)
+            
+            self.cover_view[layer_idx].update(keys, values, new_indices)
         
         return k_all, v_all, seq_start, raw_seq_start
 
@@ -947,6 +988,8 @@ class LukaKVController:
             
             # Compress and trim buffer
             self.attn_buffer[layer_idx].compress_and_trim(all_new_pages, new_frontiers)
+            if layer_idx == 0:
+                self.print_stats(layer_idx)
             return True
             
         return False
@@ -1026,6 +1069,7 @@ class LukaKVController:
             raise ValueError(f"Cover keys or values are None for layer {layer_idx} - was it initialized correctly?")
 
         B, H_k, T_cover, D = cover_k.shape
+        L_q = query_states.shape[2]
         
         # Expand KV heads for grouped-query attention
         cover_k_full = repeat_kv(cover_k, num_kv_groups) # [B, H_q, T_cover, D]
@@ -1034,69 +1078,136 @@ class LukaKVController:
         # ----------------------------------------------------------------------
         # Step 2: Attention on Cover
         # ----------------------------------------------------------------------
-        attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling # [B, H_q, L_q, T_cover]
+        # Map cover positions back to raw indices for masking and refinement
+        page_ends = self.summary_cache[layer_idx].page_end       # [B_cache, P_max]
         
-        # Note: `attention_mask` passed in is typically [B, 1, L_q, T_raw].
-        # We need to map it to the cover. 
-        # For this stub, we will assume we can gather it using cover_indices.
-        # If cover_indices is -1 (pad), we mask it out.
-        if attention_mask is not None:
-            # cover_indices: [B, T_cover] -> expand to [B, 1, L_q, T_cover]
-            # We want to gather from attention_mask along the last dim (T_raw).
-            # attention_mask: [B, 1, L_q, T_raw]
-            
-            # Clamp indices to handle -1 (padding) safely during gather
-            gather_idx = cover_indices.clamp(min=0) # [B, T_cover]
-            gather_idx_expanded = gather_idx.unsqueeze(1).unsqueeze(2).expand(B, 1, query_states.shape[2], T_cover)
-            
-            cover_mask = torch.gather(attention_mask, -1, gather_idx_expanded)
-            
-            # Apply large negative value where cover_indices was -1
-            is_pad = (cover_indices < 0).view(B, 1, 1, T_cover)
-            cover_mask = cover_mask.masked_fill(is_pad, torch.finfo(attn_logits.dtype).min)
-            
-            attn_logits = attn_logits + cover_mask
-            
+        # Ensure page_ends matches batch size B
+        if page_ends.shape[0] < B:
+            pad_b = B - page_ends.shape[0]
+            zeros = torch.zeros(pad_b, page_ends.shape[1], device=page_ends.device, dtype=page_ends.dtype)
+            page_ends = torch.cat([page_ends, zeros], dim=0)
 
-        # Log-sum-exp correction for summary tokens.
-        # We want the summary token's logit to represent the sum of probabilities of its constituent raw tokens.
-        # Correction: add log(page_len) to the summary token's logit.
-        if cover_is_summary.any():
-            summary_cache = self.summary_cache[layer_idx]
-            # page_lens: [B, max_pages]
-            # Note: page_end is inclusive, so len = end - start + 1
-            page_lens = (summary_cache.page_end - summary_cache.page_start + 1).float()
-            
-            # Gather page lengths for each summary token in the cover
-            # cover_indices has page_idx for summaries.
-            # We mask non-summaries to 0 for safe gather.
-            is_summary = (cover_is_summary == 1)
-            safe_indices = cover_indices.masked_fill(~is_summary, 0) # [B, T_cover]
-            
-            # Gather: [B, T_cover]
-            gathered_lens = torch.gather(page_lens, 1, safe_indices)
-            
-            # Compute log correction
-            # Avoid log(0) just in case, though valid pages should have len > 0
-            correction = torch.log(gathered_lens + 1e-6)
-            
-            # Apply only to summary tokens
-            # attn_logits: [B, H_q, L_q, T_cover]
-            # correction: [B, T_cover] -> [B, 1, 1, T_cover]
-            attn_logits = attn_logits + (correction.view(B, 1, 1, T_cover) * is_summary.view(B, 1, 1, T_cover))
+        summary_mask = (cover_is_summary == 1)                   # [B, T_cover]
+        cover_raw_indices = cover_indices                        # [B, T_cover]
+        if summary_mask.any():
+            clamped_summary_idx = cover_indices.clamp(min=0, max=page_ends.shape[1] - 1)
+            summary_raw_pos = page_ends.gather(1, clamped_summary_idx)  # [B, T_cover]
+            cover_raw_indices = torch.where(summary_mask, summary_raw_pos, cover_indices)
+
+        # Attention over the cover
+        attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_cover]
+        mask_value = torch.finfo(attn_logits.dtype).min
         
+        if attention_mask is not None:
+            # Gather the precomputed causal/sliding mask for the chosen cover positions
+            # attention_mask: [B, 1, L_q, T_raw]
+            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0)
+            idx_expanded = cover_raw_indices_clamped[:, None, None, :].expand(-1, 1, L_q, -1)
+            cover_mask = attention_mask.gather(3, idx_expanded)
+            
+            # Mask out padding (where cover_indices was -1)
+            # cover_mask = cover_mask.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value) # Moved outside
+            attn_logits = attn_logits + cover_mask
+
+        # Always mask out invalid cover indices (e.g. right-padding in cover view)
+        attn_logits = attn_logits.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value)
+
+        # Replace summary logits with log-sum-exp of their raw pages so the summary
+        # probability mass matches the true raw probabilities that will be split during refinement.
+        if summary_mask.any():
+            k_raw_full, _, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False) # [B, H_k, T_raw, D]
+            k_full_raw = repeat_kv(k_raw_full, num_kv_groups)      # [B, H_q, T_raw, D]
+            
+            summary_cache = self.summary_cache[layer_idx]
+            page_starts = summary_cache.page_start                 # [B_cache, P_max]
+            
+             # Ensure page_starts matches batch size B
+            if page_starts.shape[0] < B:
+                pad_b = B - page_starts.shape[0]
+                zeros = torch.zeros(pad_b, page_starts.shape[1], device=page_starts.device, dtype=page_starts.dtype)
+                page_starts = torch.cat([page_starts, zeros], dim=0)
+
+            b_idx, pos_idx = summary_mask.nonzero(as_tuple=True)
+            if b_idx.numel() > 0:
+                for b in b_idx.unique().tolist():
+                    mask_b = (b_idx == b)
+                    pos_tensor = pos_idx[mask_b]
+                    if pos_tensor.numel() == 0:
+                        continue
+
+                    page_ids = cover_indices[b, pos_tensor]                 # [S]
+                    starts_b = page_starts[b, page_ids]                     # [S]
+                    ends_b = page_ends[b, page_ids]                         # [S]
+
+                    valid = (page_ids >= 0) & (ends_b >= starts_b)
+                    invalid_pos = pos_tensor[~valid]
+                    if invalid_pos.numel() > 0:
+                        attn_logits[b, :, :, invalid_pos] = mask_value
+                    if not valid.any():
+                        continue
+
+                    pos_tensor = pos_tensor[valid]
+                    starts_b = starts_b[valid]
+                    ends_b = ends_b[valid]
+
+                    lengths = ends_b - starts_b + 1                         # [S_valid]
+                    max_len = lengths.max().item()
+                    arange = torch.arange(max_len, device=attn_logits.device)
+
+                    raw_idx = starts_b.unsqueeze(1) + arange.unsqueeze(0)    # [S_valid, max_len]
+                    pad_mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+                    raw_idx = raw_idx.masked_fill(pad_mask, -1)
+
+                    idx_clamped = raw_idx.clamp(min=0)
+                    # Gather keys for all pages at once: [1, H_q, S_valid, max_len, D]
+                    k_flat = torch.index_select(k_full_raw[b], 1, idx_clamped.view(-1))
+                    k_pages = k_flat.view(k_full_raw.shape[1], raw_idx.shape[0], max_len, D).unsqueeze(0)
+
+                    # Queries for this batch
+                    q_b = query_states[b:b+1]                               # [1, H_q, L_q, D]
+                    page_logits = torch.einsum('bhld,bhsmd->bhslm', q_b, k_pages) * scaling  # [1, H_q, S_valid, L_q, max_len]
+
+                    if attention_mask is not None:
+                        mask_b_full = attention_mask[b:b+1]                 # [1, 1, L_q, T_raw]
+                        mask_flat = torch.index_select(mask_b_full, 3, idx_clamped.view(-1))  # [1,1,L_q,S_valid*max_len]
+                        mask_pages = mask_flat.view(1, 1, L_q, raw_idx.shape[0], max_len)     # [1,1,L_q,S_valid,max_len]
+                        mask_pages = mask_pages.permute(0, 1, 3, 2, 4)                         # [1,1,S_valid,L_q,max_len]
+                        page_logits = page_logits + mask_pages
+
+                    # Mask out padded positions
+                    bad_mask = pad_mask.view(1, 1, raw_idx.shape[0], 1, max_len)
+                    page_logits = page_logits.masked_fill(bad_mask, mask_value)
+
+                    summary_logits = torch.logsumexp(page_logits, dim=-1)[0]   # [H_q, S_valid, L_q]
+                    summary_logits = summary_logits.permute(0, 2, 1)           # [H_q, L_q, S_valid]
+                    attn_logits[b, :, :, pos_tensor] = summary_logits
+
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        if layer_idx == 0 and attn_probs.shape[0] > 1:
+            # DEBUG: Check Batch 1 attention
+            b = 1
+            # Check if attending to padding?
+            # cover_indices: [B, T]
+            indices_b = cover_indices[b]
+            is_pad = (indices_b == -1)
+            prob_pad = attn_probs[b, :, :, is_pad].sum()
+            if prob_pad > 0.01:
+                 print(f"DEBUG: Layer {layer_idx} Batch {b} attending to padding! Sum: {prob_pad.item()}")
+
+            # Check if attending to summary
+            is_sum = (cover_is_summary[b] == 1)
+            if is_sum.any():
+                prob_sum = attn_probs[b, :, :, is_sum].sum()
+                print(f"DEBUG: Layer {layer_idx} Batch {b} prob on summary: {prob_sum.item():.4f}")
+
         attn_output = torch.matmul(attn_probs, cover_v_full)
 
         # ----------------------------------------------------------------------
         # Step 3: Refinement
         # ----------------------------------------------------------------------
-        # ... (refinement logic) ...
+        # Optional refinement: descend into pages whose summary tokens dominate attention.
         
-        # (We need to match the refinement logic block, but I can't match huge block easily)
-        # Instead, I will use multi_replace to target the two specific locations.
-
-        # If any summary token has high attention mass, we descend and refine.
         if threshold is not None and threshold >= 0:
             # Identify candidates
             # summary_mask: [B, T_cover]
@@ -1113,6 +1224,13 @@ class LukaKVController:
                 page_start = summary_cache.page_start # [B, max_pages]
                 page_end = summary_cache.page_end     # [B, max_pages]
                 
+                # Ensure matches batch size B
+                if page_start.shape[0] < B:
+                    pad_b = B - page_start.shape[0]
+                    zeros = torch.zeros(pad_b, page_start.shape[1], device=page_start.device, dtype=page_start.dtype)
+                    page_start = torch.cat([page_start, zeros], dim=0)
+                    page_end = torch.cat([page_end, zeros], dim=0)
+
                 # Get raw KV
                 k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
                 
@@ -1200,8 +1318,9 @@ class LukaKVController:
                         active_mask = refine_mask[b_bucket, :, :, pos_bucket].unsqueeze(-1) # [M, H_q, L_q, 1]
                         update = delta * active_mask.to(delta.dtype)
                         
-        # Accumulate
+                        # Accumulate
                         attn_output.index_add_(0, b_bucket, update)
+
 
         # Push to buffer for segmentation
         # attn_probs: [B, H_q, L_q, T_cover]
@@ -1230,6 +1349,18 @@ class LukaKVController:
         if summary_cache.keys is not None:
             print(f"- shape of pages: {summary_cache.keys.shape}")
             print(f"- number of pages per: {summary_cache.page_lens}")
+            
+            starts = summary_cache.page_start
+            ends = summary_cache.page_end
+            lens = summary_cache.page_lens
+            
+            print("- pages (start, end):")
+            for b in range(starts.shape[0]):
+                num_pages = lens[b].item() if b < len(lens) else 0
+                pairs = []
+                for p in range(num_pages):
+                    pairs.append((starts[b, p].item(), ends[b, p].item()))
+                print(f"  Batch {b}: {pairs}")
         else:
             print("- shape of pages: None")
             print("- number of pages per: None")
