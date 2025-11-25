@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
-from modeling.segmenter import Segmenter, BufferedSegmenter
+from modeling.segmenter_new import Segmenter, DummySegmenter
 from modeling.compressor import Compressor, MeanCompressor
 from transformers.cache_utils import Cache, DynamicCache
 from transformers import PretrainedConfig
 
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Tuple
 from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
     apply_rotary_pos_emb,
@@ -127,6 +127,7 @@ class RawCache:
         layer = self.cache.layers[layer_idx]
         k = getattr(layer, "keys", None)
         v = getattr(layer, "values", None)
+        assert k is not None and v is not None
         if not with_offsets:
             return k, v, None, None
         return k, v, self.seq_start[layer_idx], self.raw_seq_start[layer_idx]
@@ -273,7 +274,81 @@ class SummaryCache:
             by writing into the right-padded slots for each batch row. Also
             updates span metadata (`page_start`, `page_end`, `page_frontier`).
         """
-        pass
+        if keys.numel() == 0:
+            return
+
+        B_new, H, L_new, D = keys.shape
+        device = keys.device
+        
+        # Determine required global batch size
+        max_b = int(batch_nums.max().item()) + 1
+        
+        # Initialize if empty
+        if self.keys is None:
+            # We don't know the true global B, but we must accommodate at least max_b.
+            # We'll start with max_b and expand if needed later.
+            self.keys = torch.zeros(max_b, H, L_new, D, device=device, dtype=keys.dtype)
+            self.values = torch.zeros(max_b, H, L_new, D, device=device, dtype=values.dtype)
+            self.page_lens = torch.zeros(max_b, dtype=torch.long, device=device)
+            self.page_start = torch.zeros(max_b, L_new, dtype=torch.long, device=device)
+            self.page_end = torch.zeros(max_b, L_new, dtype=torch.long, device=device)
+            self.page_frontier = torch.zeros(max_b, dtype=torch.long, device=device)
+        
+        # Expand batch dim if needed
+        current_B = self.keys.shape[0]
+        if max_b > current_B:
+            # Pad batch dim
+            pad_b = max_b - current_B
+            self.keys = torch.cat([self.keys, torch.zeros(pad_b, H, self.keys.shape[2], D, device=device, dtype=keys.dtype)], dim=0)
+            self.values = torch.cat([self.values, torch.zeros(pad_b, H, self.values.shape[2], D, device=device, dtype=values.dtype)], dim=0)
+            self.page_lens = torch.cat([self.page_lens, torch.zeros(pad_b, dtype=torch.long, device=device)], dim=0)
+            self.page_start = torch.cat([self.page_start, torch.zeros(pad_b, self.page_start.shape[1], dtype=torch.long, device=device)], dim=0)
+            self.page_end = torch.cat([self.page_end, torch.zeros(pad_b, self.page_end.shape[1], dtype=torch.long, device=device)], dim=0)
+            self.page_frontier = torch.cat([self.page_frontier, torch.zeros(pad_b, dtype=torch.long, device=device)], dim=0)
+
+        # Expand time dim if needed
+        # We need to fit `current_len + L_new` pages.
+        # Since we are adding L_new pages to *some* batches, we need to check the max resulting length.
+        # But here `keys` has `L_new` pages for *each* batch in `batch_nums`.
+        # So we simply need to ensure `self.keys` has enough capacity for the batch with the most pages.
+        # Wait, `L_new` is the number of *new* pages being added.
+        # We need to append these to the existing pages.
+        
+        current_lens = self.page_lens[batch_nums] # [B_new]
+        new_total_lens = current_lens + L_new
+        max_needed = int(new_total_lens.max().item())
+        
+        if max_needed > self.keys.shape[2]:
+            pad_t = max_needed - self.keys.shape[2]
+            # Pad time dim (dim 2)
+            self.keys = torch.cat([self.keys, torch.zeros(self.keys.shape[0], H, pad_t, D, device=device, dtype=keys.dtype)], dim=2)
+            self.values = torch.cat([self.values, torch.zeros(self.values.shape[0], H, pad_t, D, device=device, dtype=values.dtype)], dim=2)
+            self.page_start = torch.cat([self.page_start, torch.zeros(self.page_start.shape[0], pad_t, dtype=torch.long, device=device)], dim=1)
+            self.page_end = torch.cat([self.page_end, torch.zeros(self.page_end.shape[0], pad_t, dtype=torch.long, device=device)], dim=1)
+
+        # Insert new pages
+        # We can't do a simple slice assignment because `current_lens` varies per batch.
+        # We have to scatter or loop.
+        # Since L_new is usually small (often 1), loop might be okay?
+        # Or we can use `scatter`.
+        # But `keys` is [B_new, H, L_new, D].
+        # We want to place `keys[i]` at `self.keys[batch_nums[i], :, current_lens[i]:current_lens[i]+L_new, :]`.
+        
+        # Let's loop for safety and readability for now.
+        for i, b_idx in enumerate(batch_nums.tolist()):
+            start_col = int(current_lens[i].item())
+            end_col = start_col + L_new
+            
+            self.keys[b_idx, :, start_col:end_col, :] = keys[i]
+            self.values[b_idx, :, start_col:end_col, :] = values[i]
+            self.page_start[b_idx, start_col:end_col] = page_start[i]
+            self.page_end[b_idx, start_col:end_col] = page_end[i]
+            
+        # Update lengths and frontier
+        self.page_lens.index_add_(0, batch_nums, torch.full((B_new,), L_new, dtype=torch.long, device=device))
+        
+        if page_frontier is not None:
+            self.page_frontier[batch_nums] = page_frontier
 
 class CoverView:
 
@@ -292,6 +367,45 @@ class CoverView:
         self.cover_indices = None   # [B, max(L_num_pages + L_raw_tokens)] raw index or summary idx
         self.cover_is_summary = None # [B, max(L_num_pages + L_raw_tokens)] 1 if summary, else 0
     
+    def initialize(self,
+        layer_idx: int,
+        raw_cache: RawCache
+    ):
+        """Initialize cover view from the raw cache (e.g. after prefill).
+
+        Args:
+            layer_idx: int
+                Transformer layer index.
+            raw_cache: RawCache
+                Source of raw KV tensors.
+        """
+        k_raw, v_raw, seq_start, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
+        if k_raw is None:
+            raise ValueError("CoverView.initialize called before RawCache.update.")
+
+        # Share references initially for efficiency
+        self.cover_keys = k_raw
+        self.cover_values = v_raw
+        self.seq_start = seq_start
+        self.raw_seq_start = raw_seq_start
+        
+        B, H, T_raw, D = k_raw.shape
+        device = k_raw.device
+        
+        # Initialize indices: all raw
+        # cover_indices[b, t] = t (absolute raw index)
+        self.cover_indices = torch.arange(T_raw, device=device).unsqueeze(0).expand(B, -1).clone()
+        
+        # Mask padding with -1
+        if seq_start is not None:
+            # seq_start: [B]
+            # Create mask: t < seq_start[b]
+            t_indices = torch.arange(T_raw, device=device).unsqueeze(0) # [1, T]
+            is_pad = t_indices < seq_start.unsqueeze(1) # [B, T]
+            self.cover_indices[is_pad] = -1
+
+        self.cover_is_summary = torch.zeros(B, T_raw, dtype=torch.long, device=device)
+
     def update(self,
         keys: torch.Tensor,
         values: torch.Tensor
@@ -308,9 +422,29 @@ class CoverView:
             None; should mutate `cover_keys/cover_values` by concatenating the
             raw tail and adjust `raw_seq_start` as the frontier advances.
         """
-        pass
+        if self.cover_keys is None:
+            # Should have been initialized.
+            raise ValueError("CoverView.update called before initialize()")
+
+        # Append
+        self.cover_keys = torch.cat([self.cover_keys, keys], dim=2)
+        self.cover_values = torch.cat([self.cover_values, values], dim=2)
+        
+        B, H, L_new, D = keys.shape
+        
+        # Update metadata
+        new_is_summary = torch.zeros(B, L_new, dtype=torch.long, device=keys.device)
+        self.cover_is_summary = torch.cat([self.cover_is_summary, new_is_summary], dim=1)
+        
+        # Update indices
+        # We assume we are appending to a raw tail, so indices continue sequentially.
+        last_indices = self.cover_indices[:, -1:] # [B, 1]
+        new_indices = last_indices + 1 + torch.arange(L_new, device=keys.device).unsqueeze(0)
+        self.cover_indices = torch.cat([self.cover_indices, new_indices], dim=1)
+
 
     def update_cover_view(self,
+        layer_idx: int,
         raw_cache: RawCache,
         summary_cache: SummaryCache
     ):
@@ -318,6 +452,8 @@ class CoverView:
         the raw_cache nad summary_cache have initialized their new pages.
 
         Args:
+            layer_idx: int
+                Transformer layer index.
             raw_cache: RawCache
                 Provides the latest raw KV tensors and offsets.
             summary_cache: SummaryCache
@@ -330,26 +466,261 @@ class CoverView:
             also refresh `cover_indices` and `cover_is_summary` so downstream
             attention can translate cover positions into raw spans.
         """
-        pass
+        k_raw, v_raw, seq_start, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
+        if k_raw is None:
+            return # Nothing to do
+
+        # Summary
+        sum_k = summary_cache.keys # [B, H, P_max, D]
+        sum_v = summary_cache.values
+        page_lens = summary_cache.page_lens # [B]
+        
+        # If summary is empty, just copy raw?
+        # Or handle uniformly.
+        
+        B, H, T_raw, D = k_raw.shape
+        device = k_raw.device
+        
+        batched_k = []
+        batched_v = []
+        batched_idx = []
+        batched_is_sum = []
+        
+        for b in range(B):
+            # Summary Part
+            if sum_k is not None and page_lens is not None:
+                p_len = page_lens[b]
+                k_s = sum_k[b, :, :p_len, :] # [H, P, D]
+                v_s = sum_v[b, :, :p_len, :]
+                
+                # Indices for summary: we use the PAGE INDEX (0 to P-1)
+                # But we need to distinguish summary indices from raw indices.
+                # The `cover_indices` contract says: "raw index or summary idx".
+                # Top-down attention uses `cover_indices` to look up `page_start`/`page_end`.
+                # So for summary tokens, it should be the page index `p`.
+                idx_s = torch.arange(p_len, device=device)
+                is_sum_s = torch.ones(p_len, dtype=torch.long, device=device)
+            else:
+                k_s = torch.empty(H, 0, D, device=device)
+                v_s = torch.empty(H, 0, D, device=device)
+                idx_s = torch.empty(0, dtype=torch.long, device=device)
+                is_sum_s = torch.empty(0, dtype=torch.long, device=device)
+            
+            # Raw Tail Part
+            # Starts at `raw_seq_start[b]`
+            r_start = raw_seq_start[b].item() if raw_seq_start is not None else 0
+            # Ensure r_start is valid
+            r_start = min(r_start, T_raw)
+            
+            k_r = k_raw[b, :, r_start:, :] # [H, T_tail, D]
+            v_r = v_raw[b, :, r_start:, :]
+            
+            tail_len = k_r.shape[1]
+            tail_len = k_r.shape[1]
+            idx_r = torch.arange(r_start, r_start + tail_len, device=device)
+            
+            # Mask padding in raw tail
+            if seq_start is not None:
+                pad_end = seq_start[b].item()
+                is_pad = idx_r < pad_end
+                idx_r[is_pad] = -1
+                
+            is_sum_r = torch.zeros(tail_len, dtype=torch.long, device=device)
+            
+            # Concatenate
+            batched_k.append(torch.cat([k_s, k_r], dim=1))
+            batched_v.append(torch.cat([v_s, v_r], dim=1))
+            batched_idx.append(torch.cat([idx_s, idx_r], dim=0))
+            batched_is_sum.append(torch.cat([is_sum_s, is_sum_r], dim=0))
+            
+        # Pad and Stack
+        lengths = [x.shape[1] for x in batched_k]
+        max_len = max(lengths) if lengths else 0
+        
+        self.cover_keys = torch.zeros(B, H, max_len, D, device=device, dtype=k_raw.dtype)
+        self.cover_values = torch.zeros(B, H, max_len, D, device=device, dtype=v_raw.dtype)
+        self.cover_indices = torch.full((B, max_len), -1, dtype=torch.long, device=device)
+        self.cover_is_summary = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        
+        for b in range(B):
+            l = lengths[b]
+            if l > 0:
+                self.cover_keys[b, :, :l, :] = batched_k[b]
+                self.cover_values[b, :, :l, :] = batched_v[b]
+                self.cover_indices[b, :l] = batched_idx[b]
+                self.cover_is_summary[b, :l] = batched_is_sum[b]
+        
+        # Update metadata
+        self.seq_start = seq_start
+        self.raw_seq_start = raw_seq_start
 
 class AttentionScoreBuffer:
 
-    def __init__(self):
-        """Buffer for attention score snapshots used by the segmenter.
-
-        Each push stores the cover-view attention matrix for a decode step so
-        that the segmenter can retrospectively form pages.
+    def initialize(self, B: int, H: int, T_init: int, device: torch.device, dtype: torch.dtype):
+        """Initialize the buffer with empty state.
+        
+        Args:
+            B: Batch size.
+            H: Number of heads.
+            T_init: Initial cover length (e.g. prefill length).
+            device: Tensor device.
+            dtype: Tensor dtype.
         """
-        self.attention_scores = None
-    
-    def push(self):
+        # Start with 0 accumulated length
+        self.attention_weights = torch.zeros(B, H, 0, T_init, device=device, dtype=dtype)
+        # We don't have indices yet, or we assume they match init?
+        # We'll initialize indices to None or a default?
+        # Segmenter needs indices.
+        # Let's initialize indices to a default "raw" state matching T_init?
+        # Or just None and wait for first push?
+        # Push updates indices.
+        self.cover_indices = None
+        self.cover_is_summary = None
+
+    def push(self, attn_weights: torch.Tensor, cover_indices: torch.Tensor, cover_is_summary: torch.Tensor):
         """Append a new attention score slice.
 
-        Expected to cache tensors shaped like [B, H, L_q, L_cover] (cover view
-        length matches `L_num_pages + L_raw_tokens`). The implementation should
-        handle padding and batching policy consistent with the segmenter.
+        Args:
+            attn_weights: [B, H, L_new, T_new]
+            cover_indices: [B, T_new]
+            cover_is_summary: [B, T_new]
         """
-        pass
+        # Detach to save memory graph
+        attn_weights = attn_weights.detach()
+        cover_indices = cover_indices.detach()
+        cover_is_summary = cover_is_summary.detach()
+        
+        if self.attention_weights is None:
+             raise RuntimeError("AttentionScoreBuffer not initialized. Call initialize() first.")
+
+        # Pad width if needed
+        B, H, L_curr, T_curr = self.attention_weights.shape
+        _, _, L_new, T_new = attn_weights.shape
+        
+        if T_new > T_curr:
+            pad_w = T_new - T_curr
+            # Pad existing weights with zeros
+            padding = torch.zeros(B, H, L_curr, pad_w, device=self.attention_weights.device, dtype=self.attention_weights.dtype)
+            self.attention_weights = torch.cat([self.attention_weights, padding], dim=3)
+        elif T_curr > T_new:
+             # Pad new weights
+             pad_w = T_curr - T_new
+             padding = torch.zeros(B, H, L_new, pad_w, device=attn_weights.device, dtype=attn_weights.dtype)
+             attn_weights = torch.cat([attn_weights, padding], dim=3)
+             
+        # Concatenate along L (dim 2)
+        self.attention_weights = torch.cat([self.attention_weights, attn_weights], dim=2)
+        
+        # Update indices (keep latest)
+        self.cover_indices = cover_indices
+        self.cover_is_summary = cover_is_summary
+
+    def get_data(self):
+        return self.attention_weights, self.cover_indices, self.cover_is_summary
+
+    def reset(self):
+        # Reset to empty state with 0 length, preserving B/H/device/dtype
+        if self.attention_weights is not None:
+             B, H, _, _ = self.attention_weights.shape
+             device = self.attention_weights.device
+             dtype = self.attention_weights.dtype
+             self.attention_weights = torch.zeros(B, H, 0, 0, device=device, dtype=dtype)
+        self.cover_indices = None
+        self.cover_is_summary = None
+
+    def compress_and_trim(
+        self,
+        new_pages: List[List[Tuple[int, int]]],
+        new_frontiers: torch.Tensor
+    ):
+        """Compress attention weights for new pages and trim to new frontier.
+
+        Args:
+            new_pages: List of length B. new_pages[b] is a list of (start, end)
+                inclusive raw indices for newly created pages.
+            new_frontiers: [B] raw index of the start of the remaining raw tail.
+        """
+        if self.attention_weights is None:
+            return
+
+        B, H, L, T = self.attention_weights.shape
+        device = self.attention_weights.device
+        dtype = self.attention_weights.dtype
+        
+        batched_weights = []
+        batched_indices = []
+        batched_is_sum = []
+        
+        for b in range(B):
+            # Existing state
+            w_b = self.attention_weights[b] # [H, L, T]
+            idx_b = self.cover_indices[b]   # [T]
+            is_sum_b = self.cover_is_summary[b] # [T]
+            
+            # 1. Keep existing summaries
+            # We assume summaries are at the beginning and marked with is_sum=1
+            # We also need to filter out padding (-1)
+            mask_sum = (is_sum_b == 1) & (idx_b != -1)
+            
+            cols_w = [w_b[:, :, mask_sum]]
+            cols_idx = [idx_b[mask_sum]]
+            cols_is_sum = [is_sum_b[mask_sum]]
+            
+            # 2. Add new pages (compressed)
+            # new_pages[b] contains (start, end) raw indices
+            for start, end in new_pages[b]:
+                # Identify columns corresponding to this page
+                # These must be raw tokens (is_sum=0) and in range [start, end]
+                mask_page = (is_sum_b == 0) & (idx_b >= start) & (idx_b <= end)
+                
+                if mask_page.any():
+                    # Sum weights: [H, L, N_page] -> [H, L, 1]
+                    w_sum = w_b[:, :, mask_page].sum(dim=-1, keepdim=True)
+                    cols_w.append(w_sum)
+                    
+                    # Metadata for new summary
+                    # We use a placeholder index (e.g. -2) since we don't track page indices here strictly
+                    cols_idx.append(torch.tensor([-2], device=device, dtype=torch.long))
+                    cols_is_sum.append(torch.tensor([1], device=device, dtype=torch.long))
+            
+            # 3. Keep remaining raw tail
+            frontier = new_frontiers[b].item()
+            mask_tail = (is_sum_b == 0) & (idx_b >= frontier) & (idx_b != -1)
+            
+            if mask_tail.any():
+                cols_w.append(w_b[:, :, mask_tail])
+                cols_idx.append(idx_b[mask_tail])
+                cols_is_sum.append(is_sum_b[mask_tail])
+            
+            # Concatenate for this batch
+            if cols_w:
+                batched_weights.append(torch.cat(cols_w, dim=-1))
+                batched_indices.append(torch.cat(cols_idx, dim=0))
+                batched_is_sum.append(torch.cat(cols_is_sum, dim=0))
+            else:
+                # Empty batch (shouldn't happen if initialized correctly)
+                batched_weights.append(torch.zeros(H, L, 0, device=device, dtype=dtype))
+                batched_indices.append(torch.zeros(0, device=device, dtype=torch.long))
+                batched_is_sum.append(torch.zeros(0, device=device, dtype=torch.long))
+
+        # Pad and Stack
+        lengths = [x.shape[-1] for x in batched_weights]
+        max_len = max(lengths) if lengths else 0
+        
+        new_weights = torch.zeros(B, H, L, max_len, device=device, dtype=dtype)
+        new_indices = torch.full((B, max_len), -1, device=device, dtype=torch.long)
+        new_is_sum = torch.zeros(B, max_len, device=device, dtype=torch.long)
+        
+        for b in range(B):
+            l = lengths[b]
+            if l > 0:
+                new_weights[b, :, :, :l] = batched_weights[b]
+                new_indices[b, :l] = batched_indices[b]
+                new_is_sum[b, :l] = batched_is_sum[b]
+                
+        self.attention_weights = new_weights
+        self.cover_indices = new_indices
+        self.cover_is_summary = new_is_sum
 
 class LukaKVController:
 
@@ -371,7 +742,45 @@ class LukaKVController:
         self.summary_cache: List[SummaryCache] = [SummaryCache(config) for _ in range(self.num_layers)]
         self.cover_view: List[CoverView] = [CoverView() for _ in range(self.num_layers)]
         self.attn_buffer: List[AttentionScoreBuffer] = [AttentionScoreBuffer() for _ in range(self.num_layers)]
+        
+        # Initialize segmenter and compressor
+        # Using defaults for now; ideally these come from config.
+        self.segmenter = DummySegmenter(min_chunk=16, tail_len=16, max_pages=15)
+        self.compressor = MeanCompressor()
     
+    def initialize_views(self, layer_idx: int):
+        """Initialize cover view and attention buffer for a layer (e.g. after prefill)."""
+        self.cover_view[layer_idx].initialize(layer_idx, self.raw_cache)
+        
+        # Initialize attention buffer
+        # We need B, H, T_init.
+        # raw_cache has this info.
+        k_raw, _, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+        if k_raw is not None:
+            B, H, T, D = k_raw.shape
+            # H might be different if GQA?
+            # AttentionScoreBuffer stores weights for Query heads (H_q).
+            # k_raw has H_kv.
+            # We don't know H_q here easily without config.
+            # But `top_down_attention` gets `query_states` [B, H_q, ...].
+            # So `push` will have H_q.
+            # `initialize` needs H.
+            # We can get it from `self.summary_cache[0].config`?
+            # Or just pass 0/None and let `push` handle H?
+            # No, `initialize` creates the tensor.
+            # We need H_q.
+            # `SummaryCache` has `config`.
+            config = self.summary_cache[layer_idx].config
+            H_q = config.num_attention_heads
+            
+            self.attn_buffer[layer_idx].initialize(
+                B=B,
+                H=H_q,
+                T_init=T,
+                device=k_raw.device,
+                dtype=k_raw.dtype
+            )
+
     def update(
         self,
         layer_idx: int,
@@ -399,6 +808,11 @@ class LukaKVController:
             - Extends the layer's cover view so top-down attention can see the raw tail.
             - Does not create new pages; `try_new_pages` is responsible for that.
         """
+
+        
+        # Initialize views if needed (e.g. first decode step after prefill)
+        # We must initialize BEFORE updating raw_cache to avoid double-counting the new token.
+
         k_all, v_all, seq_start, raw_seq_start = self.raw_cache.update(
             keys,
             values,
@@ -406,7 +820,11 @@ class LukaKVController:
             cache_kwargs=cache_kwargs,
             attention_mask=attention_mask,
         )
-        # TODO: extend cover_view[layer_idx] with new raw tail
+        if self.cover_view[layer_idx].cover_keys is None:
+             self.initialize_views(layer_idx)
+        else:
+            self.cover_view[layer_idx].update(keys, values)
+        
         return k_all, v_all, seq_start, raw_seq_start
 
     def try_new_pages(self, layer_idx: int) -> bool:
@@ -421,7 +839,117 @@ class LukaKVController:
             grew and `cover_view[layer_idx]` should be rebuilt), False otherwise. The
             method should orchestrate the segmenter/compressor once they are wired in.
         """
-        pass
+        # 1. Segment
+        # Get buffer data
+        # 1. Segment
+        # Get buffer data
+        attn_weights, _, _ = self.attn_buffer[layer_idx].get_data()
+        
+        # Use CoverView indices directly as they are the ground truth
+        cover_indices = self.cover_view[layer_idx].cover_indices
+        cover_is_summary = self.cover_view[layer_idx].cover_is_summary
+        if attn_weights is None:
+            return False
+            
+        # page_ends: [B, max_pages] (inclusive raw indices)
+        page_ends = self.segmenter.process(attn_weights, cover_indices, cover_is_summary)
+        if page_ends is None:
+            return False
+
+        summary_cache = self.summary_cache[layer_idx]
+        raw_cache = self.raw_cache
+        
+        # Get current frontier per batch
+        _, _, _, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
+        if raw_seq_start is None:
+            return False
+            
+        B = raw_seq_start.shape[0]
+        device = raw_seq_start.device
+        
+        # Identify new pages
+        new_frontiers = raw_seq_start.clone()
+        has_updates = False
+        all_new_pages = [[] for _ in range(B)] # List of (start, end) for each batch
+        
+        # Optimization: Get full tensors once
+        k_raw, v_raw, _, _ = raw_cache.get_layer(layer_idx, with_offsets=False)
+        if k_raw is None:
+            return False
+            
+        for b in range(B):
+            frontier = raw_seq_start[b].item()
+            p_ends = page_ends[b]
+            valid_mask = (p_ends >= frontier) & (p_ends != -1)
+            
+            if not valid_mask.any():
+                continue
+            
+            valid_ends = p_ends[valid_mask].sort().values
+            
+            b_keys = []
+            b_values = []
+            b_starts = []
+            b_ends = []
+            
+            current_start = frontier
+            
+            for end_idx in valid_ends.tolist():
+                end_idx = int(end_idx)
+                if end_idx < current_start:
+                    continue
+                    
+                # Slice: [current_start, end_idx] inclusive
+                # k_raw: [B, H, T, D]
+                k_slice = k_raw[b, :, current_start : end_idx + 1, :]
+                v_slice = v_raw[b, :, current_start : end_idx + 1, :]
+                
+                # Compress: [H, D]
+                k_in = k_slice.unsqueeze(0)
+                v_in = v_slice.unsqueeze(0)
+                k_sum, v_sum = self.compressor(k_in, v_in) # [1, H, D]
+                
+                b_keys.append(k_sum)
+                b_values.append(v_sum)
+                b_starts.append(current_start)
+                b_ends.append(end_idx)
+                
+                # Record for buffer update
+                all_new_pages[b].append((current_start, end_idx))
+                
+                current_start = end_idx + 1
+            
+            if b_keys:
+                k_stack = torch.stack(b_keys, dim=2)
+                v_stack = torch.stack(b_values, dim=2)
+                
+                summary_cache.add_pages(
+                    keys=k_stack,
+                    values=v_stack,
+                    batch_nums=torch.tensor([b], device=device),
+                    page_start=torch.tensor([b_starts], device=device),
+                    page_end=torch.tensor([b_ends], device=device),
+                    page_frontier=torch.tensor([current_start], device=device)
+                )
+                
+                if layer_idx == 0:
+                    print(f"\033[1;32mDEBUG: Layer {layer_idx}, Batch {b}: Created pages {list(zip(b_starts, b_ends))}\033[0m")
+                
+                new_frontiers[b] = current_start
+                has_updates = True
+
+        if has_updates:
+            # Update raw_seq_start in RawCache
+            raw_cache.raw_seq_start[layer_idx] = new_frontiers
+            
+            # Rebuild CoverView
+            self.cover_view[layer_idx].update_cover_view(layer_idx, raw_cache, summary_cache)
+            
+            # Compress and trim buffer
+            self.attn_buffer[layer_idx].compress_and_trim(all_new_pages, new_frontiers)
+            return True
+            
+        return False
 
     def top_down_attention(
         self,
@@ -433,7 +961,11 @@ class LukaKVController:
         sliding_window: Optional[int] = None,
         threshold: float = 0.2,
     ):
-        """Run attention against cover view, with optional summary refinement.
+        """Run attention against raw cache (cover-view refinement TBD).
+
+        For now this executes exact attention over the raw KV cache. Once the
+        cover view and summary cache are wired, this method should dispatch to
+        cover-aware attention and optional refinement.
 
         Args:
             layer_idx: int
@@ -449,23 +981,265 @@ class LukaKVController:
             sliding_window: Optional[int]
                 If using sliding window attention; retained for parity with upstream API.
             threshold: float
-                Refinement threshold; >=0 triggers descent into summary spans, <0 forces
-                full raw attention (exact path).
+                Placeholder for future refinement logic. If <0, we force exact
+                raw attention; if >=0 we still run exact attention until cover
+                view is implemented.
 
         Returns:
             attn_output: torch.Tensor
                 [B, H_q, L_q, D] attended values.
             attn_probs: torch.Tensor
-                [B, H_q, L_q, T_cover] attention probabilities over the cover view
-                (summary + raw tail). `T_cover` = max(L_num_pages + L_raw_tokens).
-
-        Notes:
-            Implementation should:
-            - Pull cover keys/values + `cover_indices/cover_is_summary` from CoverView.
-            - Map cover summary positions to raw spans via SummaryCache.page_start/page_end.
-            - Replace summary logits with log-sum-exp over their raw spans so probability
-              mass matches exact attention before refinement.
-            - If `threshold` >= 0, refine pages whose summary logits dominate by attending
-              directly to raw spans and mixing the delta back into `attn_output`.
+                [B, H_q, L_q, T_raw] attention probabilities over raw tokens.
         """
-        pass
+        # Exact path: when threshold < 0, skip approximation and run full raw attention.
+        if threshold is not None and threshold < 0:
+            k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+            if k_raw is None or v_raw is None:
+                raise ValueError(f"No raw cache available for layer {layer_idx}.")
+
+            # Expand KV heads for grouped-query attention
+            k_full = repeat_kv(k_raw, num_kv_groups)  # [B, H_q, T_raw, D]
+            v_full = repeat_kv(v_raw, num_kv_groups)
+
+            attn_weights = torch.matmul(query_states, k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_raw]
+            if attention_mask is not None:
+                causal_mask = attention_mask[:, :, :, : k_full.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, v_full)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            return attn_output, attn_weights
+
+        # ----------------------------------------------------------------------
+        # Step 1: Get Cover
+        # ----------------------------------------------------------------------
+        # Retrieve the cover view for this layer.
+        # We assume these are populated by `try_new_pages` / `update`.
+        cover_view = self.cover_view[layer_idx]
+        cover_k = cover_view.cover_keys          # [B, H_k, T_cover, D]
+        cover_v = cover_view.cover_values        # [B, H_k, T_cover, D]
+        cover_indices = cover_view.cover_indices # [B, T_cover]
+        cover_is_summary = cover_view.cover_is_summary # [B, T_cover]
+
+        if cover_k is None or cover_v is None:
+            raise ValueError(f"Cover keys or values are None for layer {layer_idx} - was it initialized correctly?")
+
+        B, H_k, T_cover, D = cover_k.shape
+        
+        # Expand KV heads for grouped-query attention
+        cover_k_full = repeat_kv(cover_k, num_kv_groups) # [B, H_q, T_cover, D]
+        cover_v_full = repeat_kv(cover_v, num_kv_groups) # [B, H_q, T_cover, D]
+
+        # ----------------------------------------------------------------------
+        # Step 2: Attention on Cover
+        # ----------------------------------------------------------------------
+        attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling # [B, H_q, L_q, T_cover]
+        
+        # Note: `attention_mask` passed in is typically [B, 1, L_q, T_raw].
+        # We need to map it to the cover. 
+        # For this stub, we will assume we can gather it using cover_indices.
+        # If cover_indices is -1 (pad), we mask it out.
+        if attention_mask is not None:
+            # cover_indices: [B, T_cover] -> expand to [B, 1, L_q, T_cover]
+            # We want to gather from attention_mask along the last dim (T_raw).
+            # attention_mask: [B, 1, L_q, T_raw]
+            
+            # Clamp indices to handle -1 (padding) safely during gather
+            gather_idx = cover_indices.clamp(min=0) # [B, T_cover]
+            gather_idx_expanded = gather_idx.unsqueeze(1).unsqueeze(2).expand(B, 1, query_states.shape[2], T_cover)
+            
+            cover_mask = torch.gather(attention_mask, -1, gather_idx_expanded)
+            
+            # Apply large negative value where cover_indices was -1
+            is_pad = (cover_indices < 0).view(B, 1, 1, T_cover)
+            cover_mask = cover_mask.masked_fill(is_pad, torch.finfo(attn_logits.dtype).min)
+            
+            attn_logits = attn_logits + cover_mask
+            
+
+        # Log-sum-exp correction for summary tokens.
+        # We want the summary token's logit to represent the sum of probabilities of its constituent raw tokens.
+        # Correction: add log(page_len) to the summary token's logit.
+        if cover_is_summary.any():
+            summary_cache = self.summary_cache[layer_idx]
+            # page_lens: [B, max_pages]
+            # Note: page_end is inclusive, so len = end - start + 1
+            page_lens = (summary_cache.page_end - summary_cache.page_start + 1).float()
+            
+            # Gather page lengths for each summary token in the cover
+            # cover_indices has page_idx for summaries.
+            # We mask non-summaries to 0 for safe gather.
+            is_summary = (cover_is_summary == 1)
+            safe_indices = cover_indices.masked_fill(~is_summary, 0) # [B, T_cover]
+            
+            # Gather: [B, T_cover]
+            gathered_lens = torch.gather(page_lens, 1, safe_indices)
+            
+            # Compute log correction
+            # Avoid log(0) just in case, though valid pages should have len > 0
+            correction = torch.log(gathered_lens + 1e-6)
+            
+            # Apply only to summary tokens
+            # attn_logits: [B, H_q, L_q, T_cover]
+            # correction: [B, T_cover] -> [B, 1, 1, T_cover]
+            attn_logits = attn_logits + (correction.view(B, 1, 1, T_cover) * is_summary.view(B, 1, 1, T_cover))
+        
+        attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_probs, cover_v_full)
+
+        # ----------------------------------------------------------------------
+        # Step 3: Refinement
+        # ----------------------------------------------------------------------
+        # ... (refinement logic) ...
+        
+        # (We need to match the refinement logic block, but I can't match huge block easily)
+        # Instead, I will use multi_replace to target the two specific locations.
+
+        # If any summary token has high attention mass, we descend and refine.
+        if threshold is not None and threshold >= 0:
+            # Identify candidates
+            # summary_mask: [B, T_cover]
+            summary_mask = (cover_is_summary == 1)
+            # refine_mask: [B, H_q, L_q, T_cover]
+            refine_mask = (attn_probs > threshold) & summary_mask.view(B, 1, 1, T_cover)
+            
+            # We only care if *any* head/query wants to refine a specific summary token.
+            refine_positions = refine_mask.any(dim=(1, 2)) # [B, T_cover]
+
+            if refine_positions.any():
+                # Get metadata
+                summary_cache = self.summary_cache[layer_idx]
+                page_start = summary_cache.page_start # [B, max_pages]
+                page_end = summary_cache.page_end     # [B, max_pages]
+                
+                # Get raw KV
+                k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+                
+                # Indices of summary tokens to refine
+                b_idx, pos_idx = refine_positions.nonzero(as_tuple=True)
+                
+                # Map to page indices
+                # cover_indices[b, pos] gives the page index p
+                page_ids = cover_indices[b_idx, pos_idx] # [N]
+                
+                # Get raw start/end
+                starts = page_start[b_idx, page_ids] # [N]
+                ends = page_end[b_idx, page_ids]     # [N]
+                lengths = ends - starts + 1          # [N]
+                
+                # Filter invalid (just in case)
+                valid = (page_ids >= 0) & (ends >= starts)
+                if valid.any():
+                    b_idx = b_idx[valid]
+                    pos_idx = pos_idx[valid]
+                    starts = starts[valid]
+                    lengths = lengths[valid]
+                    
+                    # Group by length for batching
+                    unique_lengths = lengths.unique()
+                    for L in unique_lengths.tolist():
+                        L = int(L)
+                        bucket_mask = (lengths == L)
+                        
+                        b_bucket = b_idx[bucket_mask]     # [M]
+                        pos_bucket = pos_idx[bucket_mask] # [M]
+                        start_bucket = starts[bucket_mask]# [M]
+                        
+                        # Construct raw indices: [M, L]
+                        arange = torch.arange(L, device=query_states.device)
+                        raw_idx = start_bucket.unsqueeze(1) + arange.unsqueeze(0)
+                        
+                        # Gather raw KV: [M, H_k, L, D]
+                        # k_raw: [B, H_k, T_raw, D]
+                        # We need to select batch rows b_bucket, then gather along T_raw
+                        k_batch = k_raw[b_bucket] # [M, H_k, T_raw, D]
+                        v_batch = v_raw[b_bucket]
+                        
+                        # Expand raw_idx for gather: [M, H_k, L, D]
+                        gather_idx = raw_idx.view(raw_idx.shape[0], 1, L, 1).expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
+                        k_slice = torch.gather(k_batch, 2, gather_idx)
+                        v_slice = torch.gather(v_batch, 2, gather_idx)
+                        
+                        # Expand for GQA
+                        k_slice = repeat_kv(k_slice, num_kv_groups) # [M, H_q, L, D]
+                        v_slice = repeat_kv(v_slice, num_kv_groups)
+                        
+                        # Get queries: [M, H_q, L_q, D]
+                        q_bucket = query_states[b_bucket]
+                        
+                        # Attention
+                        raw_logits = torch.matmul(q_bucket, k_slice.transpose(2, 3)) * scaling # [M, H_q, L_q, L]
+                        
+                        if attention_mask is not None:
+                            # mask: [B, 1, L_q, T_raw]
+                            mask_bucket = attention_mask[b_bucket] # [M, 1, L_q, T_raw]
+                            # gather along T_raw using raw_idx
+                            # raw_idx: [M, L] -> [M, 1, 1, L]
+                            mask_gather_idx = raw_idx.view(raw_idx.shape[0], 1, 1, L).expand(-1, 1, mask_bucket.shape[2], -1)
+                            mask_slice = torch.gather(mask_bucket, 3, mask_gather_idx)
+                            raw_logits = raw_logits + mask_slice
+                            
+                        raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                        raw_out = torch.matmul(raw_probs, v_slice) # [M, H_q, L_q, D]
+                        
+                        # Compute Delta
+                        # base_value: The value contributed by the summary token
+                        # cover_v_full: [B, H_q, T_cover, D]
+                        # We need the value at pos_bucket
+                        base_value = cover_v_full[b_bucket, :, pos_bucket, :].unsqueeze(2) # [M, H_q, 1, D]
+                        
+                        # attn_mass: The probability mass assigned to the summary token
+                        # attn_probs: [B, H_q, L_q, T_cover]
+                        attn_mass = attn_probs[b_bucket, :, :, pos_bucket].unsqueeze(-1) # [M, H_q, L_q, 1]
+                        
+                        # delta = (raw_out - base_value) * attn_mass
+                        delta = (raw_out - base_value) * attn_mass
+                        
+                        # Apply only where refine_mask is true
+                        active_mask = refine_mask[b_bucket, :, :, pos_bucket].unsqueeze(-1) # [M, H_q, L_q, 1]
+                        update = delta * active_mask.to(delta.dtype)
+                        
+        # Accumulate
+                        attn_output.index_add_(0, b_bucket, update)
+
+        # Push to buffer for segmentation
+        # attn_probs: [B, H_q, L_q, T_cover]
+        # We need to push cover_indices and cover_is_summary as well.
+        self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
+
+        return attn_output.transpose(1, 2).contiguous(), attn_probs
+
+    def print_stats(self, layer_idx: int):
+        """Print debug stats for raw cache, pages, and cover view."""
+        print(f"\n--- Layer {layer_idx} Stats ---")
+        
+        # RAW_KV_STATS
+        k_raw, _, seq_start, raw_seq_start = self.raw_cache.get_layer(layer_idx, with_offsets=True)
+        print("RAW_KV_STATS:")
+        if k_raw is not None:
+            print(f"- shape of kv cache: {k_raw.shape}")
+            print(f"- start of sequence: {seq_start}")
+            print(f"- start of raw tail: {raw_seq_start}")
+        else:
+            print("- shape of kv cache: None")
+
+        # PAGES_STATS
+        summary_cache = self.summary_cache[layer_idx]
+        print("PAGES_STATS:")
+        if summary_cache.keys is not None:
+            print(f"- shape of pages: {summary_cache.keys.shape}")
+            print(f"- number of pages per: {summary_cache.page_lens}")
+        else:
+            print("- shape of pages: None")
+            print("- number of pages per: None")
+
+        # COVER_STATS
+        cover_view = self.cover_view[layer_idx]
+        print("COVER_STATS:")
+        if cover_view.cover_keys is not None:
+            print(f"- shape of cover: {cover_view.cover_keys.shape}")
+            print(f"- start of sequence: {cover_view.seq_start}")
+            print(f"- start of raw tail: {cover_view.raw_seq_start}")
+        else:
+            print("- shape of cover: None")

@@ -120,27 +120,50 @@ class LukaQwenAttention(nn.Module):
                 cache_kwargs=cache_kwargs,
                 attention_mask=attention_mask,
             )
-        
+
         ####  ATTENTION
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # Replace eager_attention_forward with top_down_attention
+        
+        # attn_output: [B, H_q, L, D]
+        # attn_probs: [B, H_q, L, T_raw]
+        
+        if False:
+            # Eager attention (Vanilla)
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # attn_output: [B, L, H_q, D]
-        # attn_weights: [B, H, L, L+L_past]
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states, # [B, H_q, L, D]
+                key_states, # [B, H_k, L + L_past, D]
+                value_states, # [B, H_k, L + L_past, D]
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
+            
+        else:
+            # Top-down attention (LuKA)
+            attn_output, attn_weights = self.luka_kv.top_down_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
+                scaling=self.scaling,
+                num_kv_groups=self.num_key_value_groups,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                threshold=0.0
+            )
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states, # [B, H_q, L, D]
-            key_states, # [B, H_k, L + L_past, D]
-            value_states, # [B, H_k, L + L_past, D]
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-        # TODO: replace with LukaKVController.top_down_attention once cover view is wired.
+        # if self.layer_idx == 0:
+        #     self.luka_kv.print_stats(0)
+        
+        # Try to create new pages (segmentation & compression)
+        # This uses the buffer populated by top_down_attention
+        self.luka_kv.try_new_pages(self.layer_idx)
+
         # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
