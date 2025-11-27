@@ -7,7 +7,7 @@ compression into HuggingFace's transformers library.
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Any
 
 import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -20,14 +20,13 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.cache_utils import Cache, DynamicCache
 
-from modeling.segmenter import DummySegmenter, KLDivergenceSegmenter
-from modeling.kv_cache import LukaKVCaches
+from modeling.kv_cache import LukaKVController
 
-# Optional global overrides for segmenter and KV cache params, settable by callers (e.g., scripts/test.py)
+# Optional global overrides for KV cache params, settable by callers (e.g., scripts/test.py)
 _segmenter_override = None
-_kv_params_override: dict[str, int] = {}
+_kv_params_override: dict[str, float | int | object] = {}
 
-def set_luka_segmenter(segmenter: DummySegmenter) -> None:
+def set_luka_segmenter(segmenter: Any) -> None:
     global _segmenter_override
     _segmenter_override = segmenter
 
@@ -37,6 +36,7 @@ def set_luka_kv_params(
     min_compress_chunk: int | None = None,
     max_pages: int | None = None,
     refine_threshold: float | None = None,
+    compressor: object | None = None,
 ) -> None:
     global _kv_params_override
     if default_tail_len is not None:
@@ -47,6 +47,8 @@ def set_luka_kv_params(
         _kv_params_override["max_pages"] = int(max_pages)
     if refine_threshold is not None:
         _kv_params_override["refine_threshold"] = float(refine_threshold)
+    if compressor is not None:
+        _kv_params_override["compressor"] = compressor
 
 class LukaQwenAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -76,21 +78,8 @@ class LukaQwenAttention(nn.Module):
         self.q_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = modeling_qwen3.Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        segmenter = _segmenter_override if _segmenter_override is not None else KLDivergenceSegmenter(threshold=1.0)
-        kv_defaults = {
-            "default_tail_len": 16,
-            "min_compress_chunk": 16,
-            "max_pages": 15,
-        }
-        kv_defaults.update(_kv_params_override)
-        self.luka_kv_caches = LukaKVCaches(
-            None,
-            segmenter,
-            config.num_hidden_layers,
-            default_tail_len=kv_defaults["default_tail_len"],
-            min_compress_chunk=kv_defaults["min_compress_chunk"],
-            max_pages=kv_defaults["max_pages"],
-        ) # TODO: make this configurable.
+        # Luka KV controller reference; injected by LukaQwen3Model so all layers share one.
+        self.luka_kv: LukaKVController | None = None
 
     def forward(
         self,
@@ -101,6 +90,9 @@ class LukaQwenAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None, # [L]
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        if self.layer_idx == 0:
+            # print(cache_position)
+            pass
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -113,26 +105,34 @@ class LukaQwenAttention(nn.Module):
         # [B, H_q, L, D], [B, H_k, L, D]        L = 1 in decoding, typically
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            if self.luka_kv is None:
+                raise RuntimeError("LukaKVController not initialized; ensure LukaQwen3Model injected it.")
+            # Bind the DynamicCache to Luka's RawCache if not already done.
+            if self.luka_kv.raw_cache.cache is None:
+                self.luka_kv.raw_cache.initialize_with_cache(
+                    past_key_value,
+                )
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            
-            #### THIS RETURNS ALL PAST KEYS AND VALUES
-            # Note: H_k refers to the number of K/V heads. Can be different from Q.
-            # [B, H_k, L + L_past, D], [B, H_k, L + L_past, D]
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
+            # Update raw cache and retrieve concatenated KV (same as past_key_value.update)
+            key_states, value_states, _, _ = self.luka_kv.update(
+                self.layer_idx,
+                key_states,
+                value_states,
+                cache_kwargs=cache_kwargs,
+                attention_mask=attention_mask,
+            )
+
         ####  ATTENTION
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        # attn_output: [B, L, H_q, D]
-        # attn_weights: [B, H, L, L+L_past]
-
-        if self.layer_idx == 0:
-            print("tick:", cache_position)
-
-        if not self.luka_kv_caches.initialized[self.layer_idx]:
+        # Replace eager_attention_forward with top_down_attention
+        
+        # attn_output: [B, H_q, L, D]
+        # attn_probs: [B, H_q, L, T_raw]
+        
+        if False:
+            # Eager attention (Vanilla)
+            attention_interface: Callable = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
             attn_output, attn_weights = attention_interface(
                 self,
@@ -145,39 +145,45 @@ class LukaQwenAttention(nn.Module):
                 sliding_window=self.sliding_window,  # diff with Llama
                 **kwargs,
             )
-            if self.luka_kv_caches.raw_cache is None:
-                self.luka_kv_caches.raw_cache = past_key_value
-            self.luka_kv_caches.buffer_weights(attn_weights, attention_mask)
-            page_indices = self.luka_kv_caches.populate_pages()
-            k, v = past_key_value.layers[self.layer_idx].keys, past_key_value.layers[self.layer_idx].values
-            self.luka_kv_caches.finalize_pages_and_build_summaries(self.layer_idx, k, v, page_indices)
-            self.luka_kv_caches.initialized[self.layer_idx] = True
-            print(f"LuKA layer {self.layer_idx} page_ends:", page_indices[0].tolist())
-                
-
+            
         else:
-            # Decode-time: run LuKA top-down attention using the summary pages
-            # For now we assume query_states heads already match KV heads (HF has
-            # already handled repeat_kv inside attention_interface in prefill).
-            # query_states: [B, H_q, L, D], with L typically 1 in decoding.
-
-            thresh = _kv_params_override.get("refine_threshold", 0.15)
-            attn_output, attn_weights = self.luka_kv_caches.top_down_attention(
+            # Top-down attention (LuKA)
+            attn_output, attn_weights = self.luka_kv.top_down_attention(
                 layer_idx=self.layer_idx,
                 query_states=query_states,
                 scaling=self.scaling,
                 num_kv_groups=self.num_key_value_groups,
                 attention_mask=attention_mask,
                 sliding_window=self.sliding_window,
-                threshold=thresh,
+                threshold=0.1
             )
-            attn_output = attn_output.transpose(1, 2)
-            if self.layer_idx == 0:
-                print(self.luka_kv_caches.refine_stats[0])
-                
+
+        if self.layer_idx == 0:
+            # self.luka_kv.print_stats(0)
+            pass
+        
+        # Try to create new pages (segmentation & compression)
+        # This uses the buffer populated by top_down_attention
+        self.luka_kv.try_new_pages(self.layer_idx)
+
+        # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+class LukaQwen3Model(modeling_qwen3.Qwen3Model):
+    """
+    Qwen3Model that owns a single LukaKVController shared across all attention layers.
+    """
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__(config)
+        # Create one controller and share it with every attention module.
+        self.luka_kv_controller = LukaKVController(config)
+        for layer in self.layers:
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.luka_kv = self.luka_kv_controller
 
 
 class LukaQwen3ForCausalLM(modeling_qwen3.Qwen3ForCausalLM):
@@ -230,6 +236,7 @@ def initialize_luka_hook():
 
     Call this before loading any Qwen3 models if you want the LuKA effects.
     """
+    modeling_qwen3.Qwen3Model = LukaQwen3Model
     modeling_qwen3.Qwen3Attention = LukaQwenAttention
     modeling_qwen3.Qwen3ForCausalLM = LukaQwen3ForCausalLM
 

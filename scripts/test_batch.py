@@ -1,5 +1,5 @@
 """
-Test script for LuKA with HuggingFace Transformers.
+Test script for LuKA with HuggingFace Transformers (new controller path).
 Simple script to test boundary detection during generation.
 """
 
@@ -35,7 +35,7 @@ if device == "cuda":
 # Generate
 outputs = model.generate(
     **inputs,
-    max_new_tokens=128,
+    max_new_tokens=256,
     temperature=0.7,
     top_p=0.9,
     do_sample=True,
@@ -43,7 +43,7 @@ outputs = model.generate(
 
 # Decode and print each result
 for i, (prompt, output) in enumerate(zip(prompts, outputs)):
-    generated_text = tokenizer.decode(output, skip_special_tokens=True)
+    generated_text = tokenizer.decode(output, skip_special_tokens=False)
     new_text = generated_text[len(prompt):]
 
     print("\n" + "=" * 80)

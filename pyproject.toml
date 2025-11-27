@@ -8,11 +8,10 @@ authors = [{ name = "Anthony Fei", email = "ayf7@cornell.edu" }]
 
 dependencies = [
   "torch>=2.1",
-  "transformers>=4.40",
+  "transformers==4.55.4",
   "matplotlib",
   "tqdm",
   "numpy",
-  "vllm",
   "accelerate",
 ]
 
