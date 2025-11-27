@@ -82,8 +82,8 @@ class RawCache:
             self.raw_seq_start[layer_idx] = self.seq_start[layer_idx].clone()
 
             if layer_idx == 0:
-                # print(self.seq_start[layer_idx])
-                # print(self.raw_seq_start[layer_idx])
+                print(self.seq_start[layer_idx])
+                print(self.raw_seq_start[layer_idx])
                 pass
         return k_all, v_all, self.seq_start[layer_idx], self.raw_seq_start[layer_idx]
 
@@ -578,6 +578,8 @@ class CoverView:
 
 class AttentionScoreBuffer:
 
+    refinement_counts = None # [B, T_current]
+        
     def initialize(self, B: int, H: int, T_init: int, device: torch.device, dtype: torch.dtype):
         """Initialize the buffer with empty state.
         
@@ -591,13 +593,14 @@ class AttentionScoreBuffer:
         # Start with 0 accumulated length
         self.attention_weights = torch.zeros(B, H, 0, T_init, device=device, dtype=dtype)
         # We don't have indices yet, or we assume they match init?
-        # We'll initialize indices to None or a default?
-        # Segmenter needs indices.
-        # Let's initialize indices to a default "raw" state matching T_init?
+        # We'll initialize indices to a default "raw" state matching T_init?
         # Or just None and wait for first push?
         # Push updates indices.
         self.cover_indices = None
         self.cover_is_summary = None
+        self.refinement_counts = torch.zeros(B, T_init, dtype=torch.long, device=device)
+        self.total_summaries_seen = 0
+        self.total_refinements_made = 0
 
     def push(self, attn_weights: torch.Tensor, cover_indices: torch.Tensor, cover_is_summary: torch.Tensor):
         """Append a new attention score slice.
@@ -624,6 +627,11 @@ class AttentionScoreBuffer:
             # Pad existing weights with zeros
             padding = torch.zeros(B, H, L_curr, pad_w, device=self.attention_weights.device, dtype=self.attention_weights.dtype)
             self.attention_weights = torch.cat([self.attention_weights, padding], dim=3)
+            
+            # Pad refinement counts
+            pad_counts = torch.zeros(B, pad_w, device=self.refinement_counts.device, dtype=self.refinement_counts.dtype)
+            self.refinement_counts = torch.cat([self.refinement_counts, pad_counts], dim=1)
+            
         elif T_curr > T_new:
              # Pad new weights
              pad_w = T_curr - T_new
@@ -636,6 +644,15 @@ class AttentionScoreBuffer:
         # Update indices (keep latest)
         self.cover_indices = cover_indices
         self.cover_is_summary = cover_is_summary
+        
+        # Update refinement counts?
+        # We assume T_new matches current cover.
+        # If T_new > T_curr (new tokens added), refinement counts for new tokens start at 0.
+        # This is handled by padding above.
+        
+        if self.refinement_counts is None or self.refinement_counts.shape[1] < T_new:
+             # This should be handled by padding logic above if T_new > T_curr
+             pass
 
     def get_data(self):
         return self.attention_weights, self.cover_indices, self.cover_is_summary
@@ -649,6 +666,10 @@ class AttentionScoreBuffer:
              self.attention_weights = torch.zeros(B, H, 0, 0, device=device, dtype=dtype)
         self.cover_indices = None
         self.cover_is_summary = None
+        if self.refinement_counts is not None:
+             self.refinement_counts = torch.zeros_like(self.refinement_counts)
+        self.total_summaries_seen = 0
+        self.total_refinements_made = 0
 
     def compress_and_trim(
         self,
@@ -672,12 +693,14 @@ class AttentionScoreBuffer:
         batched_weights = []
         batched_indices = []
         batched_is_sum = []
+        batched_ref_counts = []
         
         for b in range(B):
             # Existing state
             w_b = self.attention_weights[b] # [H, L, T]
             idx_b = self.cover_indices[b]   # [T]
             is_sum_b = self.cover_is_summary[b] # [T]
+            ref_b = self.refinement_counts[b] # [T]
             
             # 1. Keep existing summaries
             # We assume summaries are at the beginning and marked with is_sum=1
@@ -687,6 +710,7 @@ class AttentionScoreBuffer:
             cols_w = [w_b[:, :, mask_sum]]
             cols_idx = [idx_b[mask_sum]]
             cols_is_sum = [is_sum_b[mask_sum]]
+            cols_ref = [ref_b[mask_sum]]
             
             # 2. Add new pages (compressed)
             # new_pages[b] contains (start, end) raw indices
@@ -704,6 +728,7 @@ class AttentionScoreBuffer:
                     # We use a placeholder index (e.g. -2) since we don't track page indices here strictly
                     cols_idx.append(torch.tensor([-2], device=device, dtype=torch.long))
                     cols_is_sum.append(torch.tensor([1], device=device, dtype=torch.long))
+                    cols_ref.append(torch.tensor([0], device=device, dtype=torch.long)) # New summary, 0 refinements
             
             # 3. Keep remaining raw tail
             frontier = new_frontiers[b].item()
@@ -713,17 +738,20 @@ class AttentionScoreBuffer:
                 cols_w.append(w_b[:, :, mask_tail])
                 cols_idx.append(idx_b[mask_tail])
                 cols_is_sum.append(is_sum_b[mask_tail])
+                cols_ref.append(ref_b[mask_tail])
             
             # Concatenate for this batch
             if cols_w:
                 batched_weights.append(torch.cat(cols_w, dim=-1))
                 batched_indices.append(torch.cat(cols_idx, dim=0))
                 batched_is_sum.append(torch.cat(cols_is_sum, dim=0))
+                batched_ref_counts.append(torch.cat(cols_ref, dim=0))
             else:
                 # Empty batch (shouldn't happen if initialized correctly)
                 batched_weights.append(torch.zeros(H, L, 0, device=device, dtype=dtype))
                 batched_indices.append(torch.zeros(0, device=device, dtype=torch.long))
                 batched_is_sum.append(torch.zeros(0, device=device, dtype=torch.long))
+                batched_ref_counts.append(torch.zeros(0, device=device, dtype=torch.long))
 
         # Pad and Stack
         lengths = [x.shape[-1] for x in batched_weights]
@@ -732,6 +760,7 @@ class AttentionScoreBuffer:
         new_weights = torch.zeros(B, H, L, max_len, device=device, dtype=dtype)
         new_indices = torch.full((B, max_len), -1, device=device, dtype=torch.long)
         new_is_sum = torch.zeros(B, max_len, device=device, dtype=torch.long)
+        new_ref_counts = torch.zeros(B, max_len, device=device, dtype=torch.long)
         
         for b in range(B):
             l = lengths[b]
@@ -739,10 +768,35 @@ class AttentionScoreBuffer:
                 new_weights[b, :, :, :l] = batched_weights[b]
                 new_indices[b, :l] = batched_indices[b]
                 new_is_sum[b, :l] = batched_is_sum[b]
+                new_ref_counts[b, :l] = batched_ref_counts[b]
                 
         self.attention_weights = new_weights
         self.cover_indices = new_indices
         self.cover_is_summary = new_is_sum
+        self.refinement_counts = new_ref_counts
+
+    def get_stats(self):
+        # Calculate stats
+        # Total summaries
+        if self.cover_is_summary is None:
+            return {}
+            
+        is_sum = (self.cover_is_summary == 1)
+        num_summaries = is_sum.sum().item()
+        
+        # Average refinements per summary (historical)
+        # This tracks "how many times has a summary been refined" if we were incrementing counts.
+        # But user wants "rate of refinement" over time.
+        # We'll return the running totals.
+        
+        rate = self.total_refinements_made / self.total_summaries_seen if self.total_summaries_seen > 0 else 0.0
+        
+        return {
+            "num_summaries_current": num_summaries,
+            "total_summaries_seen": self.total_summaries_seen,
+            "total_refinements_made": self.total_refinements_made,
+            "refinement_rate": rate
+        }
 
 class LukaKVController:
 
@@ -1213,6 +1267,23 @@ class LukaKVController:
             # refine_mask: [B, H_q, L_q, T_cover]
             refine_mask = (attn_probs > threshold) & summary_mask.view(B, 1, 1, T_cover)
             
+            # Update stats
+            # M: total summaries seen in this attention pass (across all heads/queries)
+            # We count each head/query attending to a summary as an instance.
+            # summary_mask has shape [B, T_cover].
+            # We want B * H_q * L_q * (num_summaries_in_batch)
+            # But summary_mask varies per batch.
+            # M = summary_mask.sum().item() * H_q * L_q?
+            # Yes, if we sum over batch.
+            num_summaries = summary_mask.sum().item()
+            M = num_summaries * query_states.shape[1] * query_states.shape[2]
+            
+            # N: total refinements triggered
+            N = refine_mask.sum().item()
+            
+            self.attn_buffer[layer_idx].total_summaries_seen += M
+            self.attn_buffer[layer_idx].total_refinements_made += N
+            
             # We only care if *any* head/query wants to refine a specific summary token.
             refine_positions = refine_mask.any(dim=(1, 2)) # [B, T_cover]
 
@@ -1328,7 +1399,10 @@ class LukaKVController:
         return attn_output.transpose(1, 2).contiguous(), attn_probs
 
     def print_stats(self, layer_idx: int):
-        """Print debug stats for raw cache, pages, and cover view."""
+        """Print debug stats for raw cache, pages, cover view, and attention buffer."""
+        stats = self.attn_buffer[layer_idx].get_stats()
+        if stats:
+            print(f"DEBUG: Layer {layer_idx} Stats: Summaries={stats['num_summaries_current']}, Total Seen={stats['total_summaries_seen']}, Refinements={stats['total_refinements_made']}, Rate={stats['refinement_rate']:.4f}")
         print(f"\n--- Layer {layer_idx} Stats ---")
         
         # RAW_KV_STATS

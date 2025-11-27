@@ -20,15 +20,23 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.cache_utils import Cache, DynamicCache
 
+from modeling.segmenter import DummySegmenter, KLSegmenter
+from modeling.compressor import MeanCompressor, EncoderCompressor
 from modeling.kv_cache import LukaKVController
 
 # Optional global overrides for KV cache params, settable by callers (e.g., scripts/test.py)
 _segmenter_override = None
 _kv_params_override: dict[str, float | int | object] = {}
 
-def set_luka_segmenter(segmenter: Any) -> None:
-    global _segmenter_override
-    _segmenter_override = segmenter
+SEGMENTER_REGISTRY = {
+    "dummy": DummySegmenter,
+    "kl": KLSegmenter,
+}
+
+COMPRESSOR_REGISTRY = {
+    "mean": MeanCompressor,
+    "encoder": EncoderCompressor,
+}
 
 def set_luka_kv_params(
     *,
@@ -37,6 +45,9 @@ def set_luka_kv_params(
     max_pages: int | None = None,
     refine_threshold: float | None = None,
     compressor: object | None = None,
+    compressor_kwargs: dict | None = None,
+    segmenter: object | None = None,
+    segmenter_kwargs: dict | None = None,
 ) -> None:
     global _kv_params_override
     if default_tail_len is not None:
@@ -47,8 +58,28 @@ def set_luka_kv_params(
         _kv_params_override["max_pages"] = int(max_pages)
     if refine_threshold is not None:
         _kv_params_override["refine_threshold"] = float(refine_threshold)
+    
     if compressor is not None:
-        _kv_params_override["compressor"] = compressor
+        if isinstance(compressor, str):
+            if compressor not in COMPRESSOR_REGISTRY:
+                raise ValueError(f"Compressor {compressor} not found in registry. Available: {list(COMPRESSOR_REGISTRY.keys())}")
+            kwargs = compressor_kwargs or {}
+            _kv_params_override["compressor"] = COMPRESSOR_REGISTRY[compressor](**kwargs)
+        else:
+            if compressor_kwargs:
+                raise ValueError("Cannot provide compressor_kwargs when passing a compressor instance.")
+            _kv_params_override["compressor"] = compressor
+
+    if segmenter is not None:
+        if isinstance(segmenter, str):
+            if segmenter not in SEGMENTER_REGISTRY:
+                raise ValueError(f"Segmenter {segmenter} not found in registry. Available: {list(SEGMENTER_REGISTRY.keys())}")
+            kwargs = segmenter_kwargs or {}
+            _kv_params_override["segmenter"] = SEGMENTER_REGISTRY[segmenter](**kwargs)
+        else:
+            if segmenter_kwargs:
+                raise ValueError("Cannot provide segmenter_kwargs when passing a segmenter instance.")
+            _kv_params_override["segmenter"] = segmenter
 
 class LukaQwenAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -155,7 +186,7 @@ class LukaQwenAttention(nn.Module):
                 num_kv_groups=self.num_key_value_groups,
                 attention_mask=attention_mask,
                 sliding_window=self.sliding_window,
-                threshold=0.1
+                threshold=0.05
             )
 
         if self.layer_idx == 0:
