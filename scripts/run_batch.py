@@ -5,12 +5,19 @@ Simple script to test boundary detection during generation.
 
 import torch
 from transformers import AutoTokenizer
-from modeling.qwen.luka_qwen3 import load_luka_model
+from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
 
 # Configuration
 model_name = "Qwen/Qwen3-1.7B-Base"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Set LuKA params using registry
+set_luka_kv_params(
+    compressor="mean",
+    segmenter="dummy",
+    # segmenter_kwargs={"threshold": 2.0}
+)
 
 # Load model and tokenizer
 model = load_luka_model(
@@ -43,7 +50,7 @@ outputs = model.generate(
 
 # Decode and print each result
 for i, (prompt, output) in enumerate(zip(prompts, outputs)):
-    generated_text = tokenizer.decode(output, skip_special_tokens=False)
+    generated_text = tokenizer.decode(output, skip_special_tokens=True)
     new_text = generated_text[len(prompt):]
 
     print("\n" + "=" * 80)
