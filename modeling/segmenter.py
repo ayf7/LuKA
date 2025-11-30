@@ -15,7 +15,8 @@ class Segmenter(ABC):
         self,
         attn_weights: torch.Tensor,
         cover_indices: torch.Tensor,
-        cover_is_summary: torch.Tensor
+        cover_is_summary: torch.Tensor,
+        layer_idx: Optional[int] = None
     ) -> Optional[torch.LongTensor]:
         """
         Args:
@@ -32,6 +33,29 @@ class Segmenter(ABC):
                 or -1 where no further pages remain.
         """
         raise NotImplementedError
+
+    def _validate_output(self, page_ends: torch.LongTensor, cover_indices: torch.Tensor):
+        """
+        Validate that generated page boundaries are within valid raw token ranges.
+
+        Args:
+            page_ends: [B, max_pages]
+                Inclusive raw indices of page endings. -1 indicates padding.
+            cover_indices: [B, T]
+                Mapping from cover view columns to raw indices (or page indices).
+                Used to determine the maximum valid raw index available.
+        """
+        if page_ends is None: return
+        
+        # Check bounds: Page ends must be valid raw indices.
+        # Since cover_indices contains the latest raw tokens at the tail,
+        # the max value in cover_indices represents the furthest raw token we know about.
+        if cover_indices.numel() > 0:
+            max_idx = cover_indices.max().item()
+            assert (page_ends == -1).all() or (page_ends.max() <= max_idx), \
+                f"Invariant Violation: Page end index {page_ends.max()} exceeds max available raw index {max_idx}."
+
+
 
 
 class DummySegmenter(Segmenter):
@@ -54,7 +78,8 @@ class DummySegmenter(Segmenter):
         self,
         attn_weights: torch.Tensor,
         cover_indices: torch.Tensor,
-        cover_is_summary: torch.Tensor
+        cover_is_summary: torch.Tensor,
+        layer_idx: Optional[int] = None
     ) -> Optional[torch.LongTensor]:
         
         B, H, L, T = attn_weights.shape
@@ -108,6 +133,10 @@ class DummySegmenter(Segmenter):
             if ends:
                 page_ends[b, :len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
             
+            if ends:
+                page_ends[b, :len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
+        
+        self._validate_output(page_ends, cover_indices)
         return page_ends
 
 
@@ -128,6 +157,7 @@ class KLSegmenter(Segmenter):
         eps: float = 1e-8,
         top_k: int | None = None,
         min_page_len: int = 16,
+        tail_len: int = 16,
         max_pages: int = 15,
     ):
         if lag <= 0:
@@ -137,85 +167,127 @@ class KLSegmenter(Segmenter):
         self.eps = float(eps)
         self.top_k = None if top_k is None else int(top_k)
         self.min_page_len = int(min_page_len)
+        self.tail_len = int(tail_len)
         self.max_pages = int(max_pages)
 
-    def _kl_scores(self, attn: torch.Tensor, start_idx: int = 0) -> torch.Tensor:
+    def _kl_scores(self, attn: torch.Tensor) -> torch.Tensor:
         """
         attn: [L, T] (head/query-aggregated, causal rows)
-        start_idx: index of the first valid (non-padding) row/column.
         Returns: [L] scores (0 for rows without enough context)
         """
-        # attn is likely [L, T].
+        # Safety check for NaNs
+        if torch.isnan(attn).any():
+            raise ValueError("NaN values found in attention scores during KL segmentation.")
+            
+        attn = attn.float()
         L, T = attn.shape
+        scores = attn.new_zeros(L)
         if L < 2 * self.lag:
-            return attn.new_zeros(L)
+            return scores
 
-        # Normalize attention rows to ensure they sum to 1 (handling any pre-existing issues)
+        # Create causal mask for "next" window truncation
+        # mask[r, c] = 1 if c <= r
+        row_idx = torch.arange(L, device=attn.device).unsqueeze(1)
+        col_idx = torch.arange(T, device=attn.device).unsqueeze(0)
+        tril_mask = (col_idx <= row_idx).float()
+
+        # Normalize attn (curr)
         # Add eps to avoid division by zero
-        attn = attn.float() + self.eps
-        attn = attn / attn.sum(dim=1, keepdim=True)
-        
-        # Zero out padding rows to avoid NaN propagation in cumsum
-        if start_idx > 0:
-            attn[:start_idx] = 0.0
-        
-        # Compute cumulative sum along L dimension for sliding window averages
-        # Pad with one zero row at the beginning for easier indexing
-        # c_pad: [L+1, T]
-        c_pad = torch.cat([torch.zeros(1, T, device=attn.device, dtype=attn.dtype), attn.cumsum(dim=0)], dim=0)
-        
-        # We need to compute scores for r in [lag, L - lag - 1]
-        # But we must also respect start_idx.
-        # We need `r - lag >= start_idx` to ensure the previous window is valid.
-        
-        min_r = max(self.lag, start_idx + self.lag)
-        max_r = L - self.lag
-        
-        if min_r >= max_r:
-             return attn.new_zeros(L)
-             
-        valid_r = torch.arange(min_r, max_r, device=attn.device)
+        attn_eps = attn + self.eps
+        attn_norm = attn_eps / attn_eps.sum(dim=1, keepdim=True)
         
         # 1. Compute Q_prev (mean of previous `lag` rows)
-        # For row r, prev window is [r-lag, r).
-        # Sum is c_pad[r] - c_pad[r-lag]
-        # We need this for all r in valid_r.
-        # indices in c_pad:
-        idx_end_prev = valid_r
-        idx_start_prev = valid_r - self.lag
+        # Use cumsum for O(1) window sum
+        # Pad with zeros to handle boundary
+        c_pad = torch.cat([torch.zeros(1, T, device=attn.device, dtype=attn.dtype), attn_norm], dim=0)
+        c_sum = c_pad.cumsum(dim=0)
         
-        sum_prev = c_pad[idx_end_prev] - c_pad[idx_start_prev] # [N, T]
-        Q_prev = sum_prev / self.lag
+        # For row r, prev window is [r-lag, r).
+        # Sum is c_sum[r] - c_sum[r-lag]
+        # We compute this for all r.
+        # Shift indices:
+        # We want prev_mean[r] to be mean of attn_norm[r-lag : r]
+        # This corresponds to c_sum[r] - c_sum[r-lag]
+        
+        # We can compute this for valid r >= lag
+        # But to keep tensor shapes aligned, let's compute for all and mask later.
+        
+        # S[r] - S[r-lag]
+        # We can use slicing.
+        # sum_prev[i] = c_sum[i] - c_sum[i-lag] for i >= lag
+        
+        sum_prev = c_sum[self.lag:] - c_sum[:-self.lag]
+        # sum_prev has shape [L+1 - lag, T].
+        # We want to align it with r.
+        # sum_prev[0] corresponds to r=lag-1 (window 0..lag-1).
+        # We want prev_mean at r to use window ending at r.
+        # So prev_mean[r] uses sum_prev[r - lag + 1]?
+        # Wait. r-lag : r. Length is lag.
+        # If r=lag, window is 0:lag. Sum is c_sum[lag] - c_sum[0].
+        # sum_prev[0] = c_sum[lag] - c_sum[0].
+        # So sum_prev[r - lag] corresponds to window ending at r.
+        
+        # Let's pad sum_prev to length L
+        # It currently has length L - lag + 1.
+        # We need to pad `lag` zeros at the beginning?
+        # If r < lag, prev_mean is undefined (or zero).
+        
+        prev_mean = torch.zeros_like(attn)
+        if sum_prev.shape[0] > 0:
+             # We place sum_prev such that index r uses appropriate window
+             # prev_mean[lag:] = sum_prev[:-1] ?
+             # r=lag: window [0, lag). Sum is c_sum[lag]-c_sum[0]. This is sum_prev[0].
+             # So prev_mean[lag] = sum_prev[0].
+             prev_mean[self.lag:] = sum_prev[:-1]
+             
+        prev_mean = prev_mean / self.lag
+        prev_mean = prev_mean.clamp_min(self.eps)
         
         # 2. Compute Q_next (mean of next `lag` rows)
         # For row r, next window is [r+1, r+1+lag).
-        # Sum is c_pad[r+1+lag] - c_pad[r+1]
-        idx_end_next = valid_r + 1 + self.lag
-        idx_start_next = valid_r + 1
+        # We must truncate these rows to length r+1 (causal mask at r).
+        # We use a loop over k=1..lag
         
-        sum_next = c_pad[idx_end_next] - c_pad[idx_start_next] # [N, T]
-        Q_next = sum_next / self.lag
+        next_mean = torch.zeros_like(attn)
         
-        # 3. Get P (current rows)
-        P = attn[valid_r] # [N, T]
+        for k in range(1, self.lag + 1):
+            # Get attn[r+k] for all r
+            # Shift attn up by k
+            future = attn.roll(-k, dims=0)
+            # The last k rows wrap around or are invalid. We should zero them.
+            # But we only care about r < L - lag.
+            
+            # Apply causal mask at r
+            # future[r] is attn[r+k]. We want to mask it with tril_mask[r].
+            future_masked = future * tril_mask
+            
+            # Normalize
+            future_norm = future_masked + self.eps
+            future_norm = future_norm / future_norm.sum(dim=1, keepdim=True)
+            
+            next_mean += future_norm
+            
+        next_mean = next_mean / self.lag
+        next_mean = next_mean.clamp_min(self.eps)
         
-        # 4. Compute KL Divergence
-        # Normalize Qs to ensure they sum to 1 (they should approx, but for numerical stability)
-        Q_prev = Q_prev + self.eps
-        Q_prev = Q_prev / Q_prev.sum(dim=1, keepdim=True)
+        # 3. Compute KL
+        # curr is attn_norm
+        curr = attn_norm.clamp_min(self.eps)
         
-        Q_next = Q_next + self.eps
-        Q_next = Q_next / Q_next.sum(dim=1, keepdim=True)
+        log_curr = torch.log(curr)
+        log_prev = torch.log(prev_mean)
+        log_next = torch.log(next_mean)
         
-        log_P = torch.log(P)
-        kl_prev = (P * (log_P - torch.log(Q_prev))).sum(dim=1)
-        kl_next = (P * (log_P - torch.log(Q_next))).sum(dim=1)
+        kl_prev = (curr * (log_curr - log_prev)).sum(dim=1)
+        kl_next = (curr * (log_curr - log_next)).sum(dim=1)
         
-        scores_valid = 0.5 * (kl_prev + kl_next)
+        scores = 0.5 * (kl_prev + kl_next)
         
-        # 5. Map back to full scores tensor
-        scores = attn.new_zeros(L)
-        scores[valid_r] = scores_valid
+        # Zero out invalid scores
+        # r < lag: prev undefined
+        scores[:self.lag] = 0
+        # r >= L - lag: next undefined
+        scores[L - self.lag:] = 0
         
         return scores
 
@@ -223,7 +295,8 @@ class KLSegmenter(Segmenter):
         self,
         attn_weights: torch.Tensor,
         cover_indices: torch.Tensor,
-        cover_is_summary: torch.Tensor
+        cover_is_summary: torch.Tensor,
+        layer_idx: Optional[int] = None
     ) -> Optional[torch.LongTensor]:
         """
         Args:
@@ -231,100 +304,142 @@ class KLSegmenter(Segmenter):
             cover_indices: [B, T]
             cover_is_summary: [B, T]
         """
+        if layer_idx == 0:
+             print(f"KLSegmenter running for layer {layer_idx}", flush=True)
         device = attn_weights.device
         B, H, L, T_total = attn_weights.shape
-        
-        # We don't have seq_starts passed in, but we can infer valid rows?
-        # In LuKA, attn_weights usually accumulates.
-        # We assume L corresponds to the number of queries processed so far (or in this chunk).
-        # If L is small (decoding), we might not have enough context for KL.
-        # But let's assume L is large enough or we are in prefill/maintenance.
         
         # Aggregate over heads
         attn_mean = attn_weights.mean(dim=1)  # [B, L, T_total]
         page_ends = torch.full((B, self.max_pages), -1, device=device, dtype=torch.long)
 
         for b in range(B):
-            # We assume we process the whole L for now.
-            # In the reference, it used seq_starts to map to absolute positions.
-            # Here, we just return indices relative to the current buffer?
-            # Or do we return raw indices?
-            # Segmenter.process returns "page end indices (inclusive) per batch element... in raw coordinates".
-            # `cover_indices` maps column index -> raw index.
-            
-            # We compute scores for each row in L.
-            # Row `r` corresponds to query `r`.
-            # Does query `r` correspond to raw token `r`?
-            # In `AttentionScoreBuffer`, we accumulate weights.
-            # If we assume L grows with T (roughly), then row `r` is token `r`.
             indices_b = cover_indices[b] # [T]
             is_sum_b = cover_is_summary[b] # [T]
             
-            # Infer start_idx from attention weights
-            # Padding rows should have near-zero sum
-            attn_b = attn_mean[b] # [L, T]
-            row_sums = attn_b.sum(dim=1)
-            valid_rows = (row_sums > 0.01) # Threshold for valid attention
+            # Identify raw tail in cover
+            # We assume the raw tail is at the end of the sequence.
+            # We need to find the rows in L that correspond to this raw tail.
+            # Assumption: The last N_raw rows of L correspond to the N_raw raw tokens.
             
-            if not valid_rows.any():
+            # Count raw tokens at the end
+            # We can scan from right to left until we hit a summary or padding?
+            # Or just count is_sum == 0 from the end?
+            # cover_indices might have padding (-1) at the end if batching?
+            # No, usually right-padded in cover view?
+            # CoverView is usually [summaries, raw_tail].
+            # So we count raw tokens.
+            
+            # Filter out padding (-1)
+            valid_mask = indices_b != -1
+            if not valid_mask.any():
                 continue
                 
-            start_idx = valid_rows.nonzero()[0].item()
+            # Get valid indices and is_sum
+            valid_indices = indices_b[valid_mask]
+            valid_is_sum = is_sum_b[valid_mask]
+            
+            # Find start of raw tail
+            # It's the first index where is_sum is 0 and stays 0?
+            # Or just all is_sum == 0?
+            # In LuKA, raw tail is always appended.
+            # So we can just take all raw tokens.
+            raw_mask = (valid_is_sum == 0)
+            if not raw_mask.any():
+                continue
+                
+            num_raw = raw_mask.sum().item()
+            
+            # We need at least tail_len tokens to keep as tail.
+            # And we need some tokens before that to form pages.
+            if num_raw <= self.tail_len:
+                continue
+                
+            # The rows corresponding to these raw tokens are the last num_raw rows of L.
+            # We also need context (lag) before them.
+            # So we take a slice of attn_mean.
+            
+            # Slice L: [L - num_raw - lag, L]?
+            # We need to compute scores for the raw region.
+            # The scores are computed for rows r.
+            # We want to check boundaries in the raw region.
+            # The raw region starts at row index `start_row = L - num_raw`.
+            # We need `start_row` to be valid.
+            
+            if L < num_raw:
+                # Should not happen if L accumulates
+                continue
+                
+            # We compute scores for the whole relevant window or just pass the whole thing?
+            # Passing the whole thing is safer for context.
+            # But we only care about peaks in the raw region.
+            
+            attn_b = attn_mean[b] # [L, T]
             
             # Compute scores with masking
-            scores = self._kl_scores(attn_b, start_idx=start_idx)
-            
-            # print(f"Max KL score (batch {b}): {scores.max().item()}")
-
-            if self.top_k is None and self.threshold is None:
-                # Default behavior if neither set?
-                # The user's code raises ValueError.
-                # But we have default threshold=0.5 in __init__.
-                pass
+            scores = self._kl_scores(attn_b)
 
             # Identify candidate positions (indices in L)
-            row_pos_b = torch.arange(L, device=device)
-            selected_positions = row_pos_b.new_tensor([], dtype=row_pos_b.dtype)
+            # We only care about positions corresponding to the raw region eligible for paging.
+            # Raw region: [L - num_raw, L]
+            
+            start_search = L - num_raw
+            end_search = L - self.tail_len
+            
+            if start_search >= end_search:
+                continue
+                
+            # Get scores in search region
+            # We need to map back to L indices
+            search_indices = torch.arange(start_search, end_search, device=device)
+            search_scores = scores[search_indices]
+            
+            if layer_idx == 13 and b == 0:
+                print(f"DEBUG: start_search={start_search}, end_search={end_search}, max_score={search_scores.max().item():.4f}", flush=True)
+            
+            selected_indices = search_indices.new_tensor([], dtype=torch.long)
 
             if self.top_k is not None and self.top_k > 0:
-                k = min(self.top_k, scores.numel())
-                scores_top, top_idx = torch.topk(scores, k, largest=True)
-                selected_positions = row_pos_b[top_idx]
+                k = min(self.top_k, search_scores.numel())
+                scores_top, top_idx = torch.topk(search_scores, k, largest=True)
+                candidates = search_indices[top_idx]
+                
                 if self.threshold is not None:
                     mask = scores_top > self.threshold
-                    selected_positions = selected_positions[mask]
+                    candidates = candidates[mask]
+                selected_indices = candidates
 
             if self.threshold is not None and (self.top_k is None or self.top_k <= 0):
-                selected_positions = row_pos_b[scores > self.threshold]
+                mask = search_scores > self.threshold
+                selected_indices = search_indices[mask]
 
-            if selected_positions.numel() == 0:
+            if selected_indices.numel() == 0:
                 continue
 
-            selected_positions = selected_positions.sort().values
-
-            # Map to raw indices using cover_indices
-            # We assume row `r` corresponds to column `r`?
-            # If so, we can use cover_indices[b][r].
-            # But we must check if column `r` is a raw token.
+            selected_indices = selected_indices.sort().values
+            
+            # Map selected L-indices to raw indices
+            # Row r corresponds to raw token at `valid_indices[r - (L - num_raw) + offset_in_valid]`?
+            # Wait, `valid_indices` contains the raw tokens at the end.
+            # `valid_indices[-num_raw:]` are the raw tokens.
+            # Row `r` (where `r >= L - num_raw`) corresponds to `valid_indices[-num_raw + (r - (L - num_raw))]`
+            # = `valid_indices[r - L]`. (Python negative indexing logic matches!)
+            # e.g. r = L-1 (last row) -> index -1 (last token).
+            
+            raw_tokens = valid_indices[-num_raw:] # [num_raw]
             
             ends = []
+            # Initialize last_boundary.
+            # The first page starts at the beginning of the raw region.
+            # Raw region start index: raw_tokens[0]
+            # So last_boundary = raw_tokens[0] - 1
+            last_boundary = raw_tokens[0].item() - 1
             
-            # Initialize last_boundary to enforce min_page_len for the first page
-            # First page starts at seq_start (indices_b[start_idx])
-            # We want raw_idx - seq_start + 1 >= min_page_len
-            # So last_boundary = seq_start - 1
-            seq_start = indices_b[start_idx].item()
-            last_boundary = seq_start - 1
-            
-            for pos in selected_positions.tolist():
-                if pos >= T_total:
-                    continue
-                
-                # Check if it's a raw token
-                if is_sum_b[pos] != 0:
-                    continue
-                    
-                raw_idx = indices_b[pos].item()
+            for r in selected_indices.tolist():
+                # Map r to raw index
+                # r is in [L - num_raw, L - tail_len)
+                idx_in_raw = r - (L - num_raw)
+                raw_idx = raw_tokens[idx_in_raw].item()
                 
                 if raw_idx - last_boundary < self.min_page_len:
                     continue
@@ -338,5 +453,6 @@ class KLSegmenter(Segmenter):
             if ends:
                 page_ends[b, : len(ends)] = torch.tensor(ends, device=device)
 
+        self._validate_output(page_ends, cover_indices)
         return page_ends
 

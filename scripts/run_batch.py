@@ -15,8 +15,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # Set LuKA params using registry
 set_luka_kv_params(
     compressor="mean",
-    segmenter="dummy",
-    # segmenter_kwargs={"threshold": 2.0}
+    segmenter="kl",
+    segmenter_kwargs={"threshold": 3, "lag": 8},
+    refine_threshold=1
 )
 
 # Load model and tokenizer

@@ -22,6 +22,41 @@ class Compressor(ABC, nn.Module):
     def forward(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    def _validate_input(self, k: torch.Tensor, v: torch.Tensor):
+        """
+        Validate input tensor shapes for compression.
+
+        Checks:
+        - k is a 4D tensor [B, H, L, D]
+        - v is a 4D tensor [B, H, L, D]
+        - k and v have identical shapes
+
+        Args:
+            k: [B, H, L, D] Key tensor to compress.
+            v: [B, H, L, D] Value tensor to compress.
+        """
+        assert k.ndim == 4, f"Invariant Violation: Expected 4D keys [B, H, L, D], got {k.shape}"
+        assert v.ndim == 4, f"Invariant Violation: Expected 4D values [B, H, L, D], got {v.shape}"
+        assert k.shape == v.shape, f"Invariant Violation: Key/Value shape mismatch: {k.shape} vs {v.shape}"
+
+    def _validate_output(self, k_sum: torch.Tensor, v_sum: torch.Tensor, B: int, H: int, D: int):
+        """
+        Validate output tensor shapes after compression.
+
+        Checks:
+        - k_sum has shape [B, H, D]
+        - v_sum has shape [B, H, D]
+        - Dimensions match the expected batch (B), head (H), and hidden (D) sizes
+
+        Args:
+            k_sum: [B, H, D] Compressed key summary.
+            v_sum: [B, H, D] Compressed value summary.
+            B, H, D: Expected batch, head, and hidden dimensions.
+        """
+        assert k_sum.shape == (B, H, D), f"Invariant Violation: Output keys shape {k_sum.shape} != expected {(B, H, D)}"
+        assert v_sum.shape == (B, H, D), f"Invariant Violation: Output values shape {v_sum.shape} != expected {(B, H, D)}"
+
+
 
 class MeanCompressor(Compressor):
     """
@@ -29,9 +64,11 @@ class MeanCompressor(Compressor):
     """
 
     def forward(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._validate_input(k, v)
         # k, v: [B, H, L, D]
         k_summary = k.mean(dim=2)
         v_summary = v.mean(dim=2)
+        self._validate_output(k_summary, v_summary, k.shape[0], k.shape[1], k.shape[3])
         return k_summary, v_summary
 
 
@@ -80,6 +117,7 @@ class EncoderCompressor(Compressor):
         self.dim = dim
 
     def forward(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._validate_input(k, v)
         # k, v: [B, H, L, D]
         B, H, L, D = k.shape
         if self.encoder is None:
@@ -95,4 +133,5 @@ class EncoderCompressor(Compressor):
         pooled = self.proj_out(pooled)
         pooled = pooled.view(B, H, 2 * D)
         k_summary, v_summary = torch.split(pooled, self.dim, dim=-1)
+        self._validate_output(k_summary, v_summary, B, H, D)
         return k_summary, v_summary
