@@ -15,8 +15,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # Set LuKA params using registry
 set_luka_kv_params(
     compressor="mean",
-    segmenter="kl",
-    segmenter_kwargs={"threshold": 3, "lag": 8},
+    segmenter="dummy",
+    # segmenter_kwargs={"threshold": 3, "lag": 8},
     refine_threshold=1
 )
 
@@ -63,3 +63,11 @@ for i, (prompt, output) in enumerate(zip(prompts, outputs)):
     print("Generated output:")
     print(new_text)
     print("\n" + "=" * 80)
+
+# Print LuKA debug summaries after generation
+if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
+    controller = model.model.luka_kv_controller
+    print("\n=== LuKA Layer Summaries ===")
+    for layer_idx in range(controller.num_layers):
+        print("------------------------------")
+        controller.print_layer_summary(layer_idx)

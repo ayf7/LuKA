@@ -22,7 +22,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from modeling.compressor import EncoderCompressor, MeanCompressor
 from modeling.kv_cache import LukaKVController
-from modeling.segmenter import DummySegmenter, KLSegmenter
+from modeling.segmenter import DummySegmenter, KLSegmenter, GaussianSegmenter
 
 # Optional global overrides for KV cache params, settable by callers (e.g., scripts/test.py)
 _segmenter_override = None
@@ -31,6 +31,7 @@ _kv_params_override: dict[str, float | int | object] = {}
 SEGMENTER_REGISTRY = {
     "dummy": DummySegmenter,
     "kl": KLSegmenter,
+    "gaussian": GaussianSegmenter,
 }
 
 COMPRESSOR_REGISTRY = {

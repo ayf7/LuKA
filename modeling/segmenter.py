@@ -304,8 +304,6 @@ class KLSegmenter(Segmenter):
             cover_indices: [B, T]
             cover_is_summary: [B, T]
         """
-        if layer_idx == 0:
-             print(f"KLSegmenter running for layer {layer_idx}", flush=True)
         device = attn_weights.device
         B, H, L, T_total = attn_weights.shape
         
@@ -394,9 +392,6 @@ class KLSegmenter(Segmenter):
             search_indices = torch.arange(start_search, end_search, device=device)
             search_scores = scores[search_indices]
             
-            if layer_idx == 13 and b == 0:
-                print(f"DEBUG: start_search={start_search}, end_search={end_search}, max_score={search_scores.max().item():.4f}", flush=True)
-            
             selected_indices = search_indices.new_tensor([], dtype=torch.long)
 
             if self.top_k is not None and self.top_k > 0:
@@ -456,3 +451,81 @@ class KLSegmenter(Segmenter):
         self._validate_output(page_ends, cover_indices)
         return page_ends
 
+
+class GaussianSegmenter(Segmenter):
+    """
+    Page generator that samples a page length from a Gaussian and tiles the raw
+    tail into fixed-size pages.
+
+    - Draws page_len ~ N(mean, std), rounded to the nearest integer and clamped
+      to at least 1.
+    - If page_len exceeds the number of compressible raw tokens
+      (num_raw - tail_len), no pages are emitted for that batch.
+    - Otherwise, fills sequential pages of length page_len from the raw tail
+      until the tail_len is reached or max_pages is hit.
+    """
+
+    def __init__(
+        self,
+        mean: float = 64.0,
+        std: float = 16.0,
+        tail_len: int = 16,
+        max_pages: int = 15,
+    ):
+        self.mean = float(mean)
+        self.std = float(std)
+        self.tail_len = int(tail_len)
+        self.max_pages = int(max_pages)
+
+    def _sample_length(self, device) -> int:
+        sample = torch.normal(
+            mean=torch.tensor(self.mean, device=device),
+            std=torch.tensor(self.std, device=device),
+        )
+        return int(torch.round(sample).item())
+
+    def process(
+        self,
+        attn_weights: torch.Tensor,
+        cover_indices: torch.Tensor,
+        cover_is_summary: torch.Tensor,
+        layer_idx: Optional[int] = None
+    ) -> Optional[torch.LongTensor]:
+        B, H, L, T = attn_weights.shape
+        device = attn_weights.device
+        page_ends = torch.full((B, self.max_pages), -1, device=device, dtype=torch.long)
+
+        for b in range(B):
+            indices = cover_indices[b]  # [T]
+            is_sum = cover_is_summary[b]  # [T]
+
+            raw_mask = (is_sum == 0) & (indices != -1)
+            if not raw_mask.any():
+                continue
+
+            raw_indices = indices[raw_mask]
+            num_raw = raw_indices.numel()
+            compressible = num_raw - self.tail_len
+            if compressible <= 0:
+                continue
+
+            page_len = self._sample_length(device)
+            # Reject invalid/too-long samples
+            if page_len <= 0 or page_len > compressible:
+                continue
+
+            compressible_indices = raw_indices[:compressible]
+            num_pages = min(compressible // page_len, self.max_pages)
+            if num_pages == 0:
+                continue
+
+            ends = []
+            for i in range(num_pages):
+                end_idx = (i + 1) * page_len - 1
+                ends.append(int(compressible_indices[end_idx].item()))
+
+            if ends:
+                page_ends[b, : len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
+
+        self._validate_output(page_ends, cover_indices)
+        return page_ends
