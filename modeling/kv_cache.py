@@ -988,9 +988,6 @@ class LukaKVController:
         if page_ends is None:
             return False
 
-        if layer_idx == 0:
-            print(f"[Layer {layer_idx}] page_ends: {page_ends}", flush=True)
-
         summary_cache = self.summary_cache[layer_idx]
         raw_cache = self.raw_cache
         
@@ -1183,13 +1180,13 @@ class LukaKVController:
         # Map cover positions back to raw indices for masking and refinement
         page_ends = self.summary_cache[layer_idx].page_end       # [B_cache, P_max]
         
-        if layer_idx == 0:
-            num_summary = (cover_is_summary == 1).sum().item()
-            num_raw = (cover_is_summary == 0).sum().item()
-            print(f"[Layer {layer_idx}] Cover stats: Summary={num_summary}, Raw={num_raw}", flush=True)
-            if num_summary > 0:
-                 print(f"  First 10 cover indices: {cover_indices[0].tolist()}", flush=True)
-                 print(f"  First 10 is_summary: {cover_is_summary[0].tolist()}", flush=True)
+        # if layer_idx == 0:
+        #     num_summary = (cover_is_summary == 1).sum().item()
+        #     num_raw = (cover_is_summary == 0).sum().item()
+        #     print(f"[Layer {layer_idx}] Cover stats: Summary={num_summary}, Raw={num_raw}", flush=True)
+        #     if num_summary > 0:
+        #          print(f"  First 10 cover indices: {cover_indices[0].tolist()}", flush=True)
+        #          print(f"  First 10 is_summary: {cover_is_summary[0].tolist()}", flush=True)
 
         # Ensure page_ends matches batch size B
         if page_ends.shape[0] < B:
@@ -1297,25 +1294,6 @@ class LukaKVController:
         # ----------------------------------------------------------------------
         # Step 4: Output
         # ----------------------------------------------------------------------
-        # Push to buffer for segmentation
-        # attn_probs: [B, H_q, L_q, T_cover]
-        self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
-
-        # if layer_idx == 0 and attn_probs.shape[0] > 1:
-        #     # DEBUG: Check Batch 1 attention
-        #     b = 1
-        #     # Check if attending to padding?
-        #     # cover_indices: [B, T]
-        #     indices_b = cover_indices[b]
-        #     is_pad = (indices_b == -1)
-        #     prob_pad = attn_probs[b, :, :, is_pad].sum()
-
-        #     # Check if attending to summary
-        #     is_sum = (cover_is_summary[b] == 1)
-        #     if is_sum.any():
-        #         prob_sum = attn_probs[b, :, :, is_sum].sum()
-        #         print(f"DEBUG: Layer {layer_idx} Batch {b} prob on summary: {prob_sum.item():.4f}")
-
         attn_output = torch.matmul(attn_probs, cover_v_full)
 
         # ----------------------------------------------------------------------
@@ -1609,3 +1587,72 @@ class LukaKVController:
                      assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
                          "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
 
+    def print_layer_summary(self, layer_idx: int):
+        """
+        Print a concise summary of raw, cover, page, and attention buffer state for a layer.
+
+        Args:
+            layer_idx: int
+                Transformer layer index to report.
+        """
+        raw_k, _, seq_start, raw_seq_start = self.raw_cache.get_layer(layer_idx, with_offsets=True)
+        summary_cache = self.summary_cache[layer_idx]
+        cover_view = self.cover_view[layer_idx]
+        attn_buf = self.attn_buffer[layer_idx]
+
+        def fmt_pages(b: int) -> str:
+            if summary_cache.keys is None:
+                return "[]"
+            if b >= summary_cache.page_lens.shape[0]:
+                return "[]"
+            num = int(summary_cache.page_lens[b].item())
+            starts = summary_cache.page_start[b, :num].tolist()
+            ends = summary_cache.page_end[b, :num].tolist()
+            return "[" + ", ".join(f"[{s}, {e}]" for s, e in zip(starts, ends)) + "]"
+
+        # Raw token summary
+        if raw_k is not None:
+            B, _, T_raw, _ = raw_k.shape
+            print(f"[Layer {layer_idx}] Raw tokens:")
+            for b in range(B):
+                pad = int(seq_start[b].item()) if seq_start is not None else 0
+                num_pages = int(summary_cache.page_lens[b].item()) if summary_cache.keys is not None else 0
+                segments = fmt_pages(b)
+                print(f"  Batch {b}: pad={pad}, pages={num_pages}, segments={segments}, total_tokens={T_raw}")
+        else:
+            print(f"[Layer {layer_idx}] Raw tokens: <empty>")
+
+        # Cover token summary
+        if cover_view.cover_indices is not None:
+            cover_idx = cover_view.cover_indices
+            cover_is_sum = cover_view.cover_is_summary
+            B = cover_idx.shape[0]
+            print(f"[Layer {layer_idx}] Cover view:")
+            for b in range(B):
+                pad = int((cover_idx[b] == -1).sum().item())
+                pages = int(((cover_is_sum[b] == 1) & (cover_idx[b] >= 0)).sum().item())
+                raw_len = int(((cover_is_sum[b] == 0) & (cover_idx[b] >= 0)).sum().item())
+                print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}")
+        else:
+            print(f"[Layer {layer_idx}] Cover view: <empty>")
+
+        # Page summary
+        if summary_cache.keys is not None:
+            lens = summary_cache.page_lens
+            print(f"[Layer {layer_idx}] Pages per batch: {[int(x) for x in lens.tolist()]}")
+        else:
+            print(f"[Layer {layer_idx}] Pages per batch: <empty>")
+
+        # Attention score buffer summary
+        attn_weights, buf_idx, buf_is_sum = attn_buf.get_data()
+        if attn_weights is not None:
+            B, H, L_accum, T = attn_weights.shape
+            print(f"[Layer {layer_idx}] Attention buffer: shape={attn_weights.shape}")
+            if buf_idx is not None and buf_is_sum is not None:
+                for b in range(B):
+                    pad = int((buf_idx[b] == -1).sum().item())
+                    pages = int(((buf_is_sum[b] == 1) & (buf_idx[b] >= 0)).sum().item())
+                    raw_len = int(((buf_is_sum[b] == 0) & (buf_idx[b] >= 0)).sum().item())
+                    print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}, attn_shape={(H, L_accum, T)}")
+        else:
+            print(f"[Layer {layer_idx}] Attention buffer: <empty>")
