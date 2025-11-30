@@ -81,10 +81,18 @@ class RawCache:
         if self.raw_seq_start[layer_idx] is None:
             self.raw_seq_start[layer_idx] = self.seq_start[layer_idx].clone()
 
-            if layer_idx == 0:
-                print(self.seq_start[layer_idx])
-                print(self.raw_seq_start[layer_idx])
-                pass
+        if layer_idx == 0:
+            # print(self.seq_start[layer_idx])
+            # print(self.raw_seq_start[layer_idx])
+            pass
+            
+        # Invariant checks
+        # Ensure seq_start (left padding) is not greater than raw_seq_start (raw frontier)
+        # seq_start: [B], raw_seq_start: [B]
+        if self.seq_start[layer_idx] is not None and self.raw_seq_start[layer_idx] is not None:
+            assert torch.all(self.seq_start[layer_idx] <= self.raw_seq_start[layer_idx]), \
+                f"Invariant Violation: seq_start ({self.seq_start[layer_idx]}) > raw_seq_start ({self.raw_seq_start[layer_idx]})"
+            
         return k_all, v_all, self.seq_start[layer_idx], self.raw_seq_start[layer_idx]
 
     def initialize_with_cache(
@@ -290,6 +298,13 @@ class SummaryCache:
         if keys.numel() == 0:
             return
 
+        # Invariants:
+        # 1. Keys and Values must match shape [B_new, H, L_new, D]
+        # 2. Page start indices must be <= Page end indices
+        assert keys.shape == values.shape, f"Invariant Violation: Keys/Values shape mismatch: {keys.shape} vs {values.shape}"
+        assert torch.all(page_start <= page_end), "Invariant Violation: page_start > page_end"
+
+
         B_new, H, L_new, D = keys.shape
         device = keys.device
         
@@ -441,6 +456,13 @@ class CoverView:
         if self.cover_keys is None:
             # Should have been initialized.
             raise ValueError("CoverView.update called before initialize()")
+
+        # Invariants:
+        # 1. Keys and Values must match shape [B, H, L_new, D]
+        # 2. Indices must match the length of new tokens L_new
+        assert keys.shape == values.shape, f"Invariant Violation: Keys/Values shape mismatch: {keys.shape} vs {values.shape}"
+        assert indices.shape[1] == keys.shape[2], f"Invariant Violation: Indices length {indices.shape[1]} != keys length {keys.shape[2]}"
+
 
         # Append
         self.cover_keys = torch.cat([self.cover_keys, keys], dim=2)
@@ -618,6 +640,14 @@ class AttentionScoreBuffer:
         if self.attention_weights is None:
              raise RuntimeError("AttentionScoreBuffer not initialized. Call initialize() first.")
 
+        # Invariant:
+        # Attention weights width (T_new) must match cover indices width (T_new)
+        # attn_weights: [B, H, L_new, T_new]
+        # cover_indices: [B, T_new]
+        assert attn_weights.shape[-1] == cover_indices.shape[-1], \
+            f"Invariant Violation: Attn weights width {attn_weights.shape[-1]} != cover indices width {cover_indices.shape[-1]}"
+
+
         # Pad width if needed
         B, H, L_curr, T_curr = self.attention_weights.shape
         _, _, L_new, T_new = attn_weights.shape
@@ -712,6 +742,13 @@ class AttentionScoreBuffer:
             cols_is_sum = [is_sum_b[mask_sum]]
             cols_ref = [ref_b[mask_sum]]
             
+            # Determine next summary index
+            if mask_sum.any():
+                # Assuming they are sorted and 0-indexed
+                next_sum_idx = idx_b[mask_sum].max().item() + 1
+            else:
+                next_sum_idx = 0
+
             # 2. Add new pages (compressed)
             # new_pages[b] contains (start, end) raw indices
             for start, end in new_pages[b]:
@@ -725,8 +762,8 @@ class AttentionScoreBuffer:
                     cols_w.append(w_sum)
                     
                     # Metadata for new summary
-                    # We use a placeholder index (e.g. -2) since we don't track page indices here strictly
-                    cols_idx.append(torch.tensor([-2], device=device, dtype=torch.long))
+                    cols_idx.append(torch.tensor([next_sum_idx], device=device, dtype=torch.long))
+                    next_sum_idx += 1
                     cols_is_sum.append(torch.tensor([1], device=device, dtype=torch.long))
                     cols_ref.append(torch.tensor([0], device=device, dtype=torch.long)) # New summary, 0 refinements
             
@@ -945,11 +982,14 @@ class LukaKVController:
         cover_is_summary = self.cover_view[layer_idx].cover_is_summary
         if attn_weights is None:
             return False
-            
-        # page_ends: [B, max_pages] (inclusive raw indices)
-        page_ends = self.segmenter.process(attn_weights, cover_indices, cover_is_summary)
+         # 2. Run segmentation
+        # Returns [B, max_pages] of inclusive end indices (raw coordinates)
+        page_ends = self.segmenter.process(attn_weights, cover_indices, cover_is_summary, layer_idx=layer_idx)
         if page_ends is None:
             return False
+
+        if layer_idx == 0:
+            print(f"[Layer {layer_idx}] page_ends: {page_ends}", flush=True)
 
         summary_cache = self.summary_cache[layer_idx]
         raw_cache = self.raw_cache
@@ -1104,8 +1144,16 @@ class LukaKVController:
                 attn_weights = attn_weights + causal_mask
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            # ----------------------------------------------------------------------
+            # Step 4: Output
+            # ----------------------------------------------------------------------
+            # Push to buffer for segmentation
+            # attn_probs: [B, H_q, L_q, T_raw]
+            self.attn_buffer[layer_idx].push(attn_weights)
+            
             attn_output = torch.matmul(attn_weights, v_full)
             attn_output = attn_output.transpose(1, 2).contiguous()
+            
             return attn_output, attn_weights
 
         # ----------------------------------------------------------------------
@@ -1135,6 +1183,14 @@ class LukaKVController:
         # Map cover positions back to raw indices for masking and refinement
         page_ends = self.summary_cache[layer_idx].page_end       # [B_cache, P_max]
         
+        if layer_idx == 0:
+            num_summary = (cover_is_summary == 1).sum().item()
+            num_raw = (cover_is_summary == 0).sum().item()
+            print(f"[Layer {layer_idx}] Cover stats: Summary={num_summary}, Raw={num_raw}", flush=True)
+            if num_summary > 0:
+                 print(f"  First 10 cover indices: {cover_indices[0].tolist()}", flush=True)
+                 print(f"  First 10 is_summary: {cover_is_summary[0].tolist()}", flush=True)
+
         # Ensure page_ends matches batch size B
         if page_ends.shape[0] < B:
             pad_b = B - page_ends.shape[0]
@@ -1237,6 +1293,13 @@ class LukaKVController:
                     attn_logits[b, :, :, pos_tensor] = summary_logits
 
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # ----------------------------------------------------------------------
+        # Step 4: Output
+        # ----------------------------------------------------------------------
+        # Push to buffer for segmentation
+        # attn_probs: [B, H_q, L_q, T_cover]
+        self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
 
         # if layer_idx == 0 and attn_probs.shape[0] > 1:
         #     # DEBUG: Check Batch 1 attention
@@ -1446,3 +1509,103 @@ class LukaKVController:
             print(f"- start of raw tail: {cover_view.raw_seq_start}")
         else:
             print("- shape of cover: None")
+
+    def verify_invariants(self, layer_idx: int):
+        """
+        Check consistency between raw_cache, summary_cache, cover_view, and attn_buffer.
+        
+        This ensures that:
+        1. RawCache and CoverView agree on sequence boundaries (padding, raw tail).
+        2. CoverView's raw tail correctly maps to valid indices in RawCache.
+        3. SummaryCache's pages are within valid bounds of RawCache.
+        4. AttentionScoreBuffer's dimensions and metadata align with CoverView.
+        """
+        raw_cache = self.raw_cache
+        summary_cache = self.summary_cache[layer_idx]
+        cover_view = self.cover_view[layer_idx]
+        attn_buffer = self.attn_buffer[layer_idx]
+
+        # 1. RawCache vs CoverView Alignment
+        k_raw, _, seq_start, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
+        if k_raw is None or cover_view.cover_keys is None:
+            return # Not initialized yet
+
+        # Verify seq_start (left padding) matches
+        if seq_start is not None and cover_view.seq_start is not None:
+            assert torch.equal(seq_start, cover_view.seq_start), \
+                f"Invariant Violation: Raw seq_start {seq_start} != Cover seq_start {cover_view.seq_start}"
+        
+        # Verify raw_seq_start (frontier) matches
+        if raw_seq_start is not None and cover_view.raw_seq_start is not None:
+            assert torch.equal(raw_seq_start, cover_view.raw_seq_start), \
+                f"Invariant Violation: Raw raw_seq_start {raw_seq_start} != Cover raw_seq_start {cover_view.raw_seq_start}"
+
+        # Verify CoverView indices map correctly to RawCache for the tail
+        # The tail starts at raw_seq_start and goes to the end.
+        # In CoverView, this corresponds to where cover_is_summary == 0
+        B = k_raw.shape[0]
+        for b in range(B):
+            if raw_seq_start is None: continue
+            
+            frontier = raw_seq_start[b].item()
+            cover_indices_b = cover_view.cover_indices[b]
+            cover_is_sum_b = cover_view.cover_is_summary[b]
+            
+            # Find raw tail in cover
+            # It should be where indices >= frontier (and not padding -1)
+            # And is_summary should be 0
+            
+            raw_mask = (cover_is_sum_b == 0) & (cover_indices_b != -1)
+            if raw_mask.any():
+                raw_indices = cover_indices_b[raw_mask]
+                # Check they are valid raw indices
+                assert raw_indices.min() >= 0, f"Invariant Violation: Negative raw index in cover view batch {b}"
+                assert raw_indices.max() < k_raw.shape[2], f"Invariant Violation: Raw index {raw_indices.max()} out of bounds {k_raw.shape[2]}"
+
+        # 2. SummaryCache vs RawCache Alignment
+        if summary_cache.keys is not None:
+            page_start = summary_cache.page_start
+            page_end = summary_cache.page_end
+            page_frontier = summary_cache.page_frontier
+            
+            # Check page ranges are within raw bounds
+            # We only check valid pages (up to page_lens)
+            for b in range(min(B, summary_cache.page_lens.shape[0])):
+                num_pages = summary_cache.page_lens[b].item()
+                if num_pages > 0:
+                    s = page_start[b, :num_pages]
+                    e = page_end[b, :num_pages]
+                    assert torch.all(s <= e), f"Invariant Violation: Page start > end in batch {b}"
+                    assert s.min() >= 0, f"Invariant Violation: Negative page start in batch {b}"
+                    assert e.max() < k_raw.shape[2], f"Invariant Violation: Page end {e.max()} out of bounds {k_raw.shape[2]}"
+            
+            # Verify page_frontier aligns with raw_seq_start
+            # page_frontier should be <= raw_seq_start (usually equal if up to date)
+            if raw_seq_start is not None and page_frontier is not None:
+                # We need to handle batch size mismatch if summary cache is lazy
+                min_b = min(B, page_frontier.shape[0])
+                assert torch.all(page_frontier[:min_b] <= raw_seq_start[:min_b]), \
+                    f"Invariant Violation: Summary frontier {page_frontier[:min_b]} > Raw frontier {raw_seq_start[:min_b]}"
+
+        # 3. AttentionScoreBuffer Alignment
+        attn_weights, attn_indices, attn_is_sum = attn_buffer.get_data()
+        if attn_weights is not None:
+            # Verify width matches cover view
+            # Note: attn_buffer accumulates, cover_view grows. They should match in T dimension.
+            
+            if cover_view.cover_keys is not None:
+                T_cover = cover_view.cover_keys.shape[2]
+                T_attn = attn_weights.shape[-1]
+                
+                assert T_attn == T_cover, f"Invariant Violation: Attn buffer width {T_attn} != Cover view length {T_cover}"
+                
+                # Verify indices match
+                if attn_indices is not None:
+                     # attn_indices: [B, T]
+                     # cover_view.cover_indices: [B, T]
+                     min_b = min(attn_indices.shape[0], cover_view.cover_indices.shape[0])
+                     assert torch.equal(attn_indices[:min_b], cover_view.cover_indices[:min_b]), \
+                         "Invariant Violation: Attn buffer indices mismatch with CoverView indices"
+                     assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
+                         "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
+
