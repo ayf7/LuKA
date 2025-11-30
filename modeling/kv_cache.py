@@ -860,6 +860,9 @@ class LukaKVController:
         # Using defaults for now; ideally these come from config.
         self.segmenter = DummySegmenter(min_chunk=16, tail_len=16, max_pages=15)
         self.compressor = MeanCompressor()
+        # How often to attempt segmentation/compression (every N decode steps)
+        self.segment_interval = 1
+        self.seg_step_counters = [0 for _ in range(self.num_layers)]
     
     def initialize_views(self, layer_idx: int):
         """Initialize cover view and attention buffer for a layer (e.g. after prefill)."""
@@ -971,6 +974,11 @@ class LukaKVController:
             grew and `cover_view[layer_idx]` should be rebuilt), False otherwise. The
             method should orchestrate the segmenter/compressor once they are wired in.
         """
+        # Throttle segmentation based on configured interval
+        self.seg_step_counters[layer_idx] += 1
+        if self.segment_interval > 1 and (self.seg_step_counters[layer_idx] % self.segment_interval) != 0:
+            return False
+
         # 1. Segment
         # Get buffer data
         # 1. Segment
@@ -1266,9 +1274,10 @@ class LukaKVController:
                     raw_idx = raw_idx.masked_fill(pad_mask, -1)
 
                     idx_clamped = raw_idx.clamp(min=0)
-                    # Gather keys for all pages at once: [1, H_q, S_valid, max_len, D]
-                    k_flat = torch.index_select(k_full_raw[b], 1, idx_clamped.view(-1))
-                    k_pages = k_flat.view(k_full_raw.shape[1], raw_idx.shape[0], max_len, D).unsqueeze(0)
+                    # Gather keys for all pages at once along the sequence dimension: [1, H_q, S_valid, max_len, D]
+                    k_flat = torch.index_select(k_full_raw, 2, idx_clamped.view(-1))  # [B, H_q, S*max_len, D]
+                    k_flat_b = k_flat[b]  # [H_q, S*max_len, D]
+                    k_pages = k_flat_b.view(k_full_raw.shape[1], raw_idx.shape[0], max_len, D).unsqueeze(0)
 
                     # Queries for this batch
                     q_b = query_states[b:b+1]                               # [1, H_q, L_q, D]

@@ -45,6 +45,7 @@ def set_luka_kv_params(
     min_compress_chunk: int = 16,
     max_pages: int = 15,
     refine_threshold: float = 0.05,
+    segment_interval: int = 1,
     compressor: object = "mean",
     compressor_kwargs: dict | None = None,
     segmenter: object = "dummy",
@@ -59,6 +60,8 @@ def set_luka_kv_params(
         _kv_params_override["max_pages"] = int(max_pages)
     if refine_threshold is not None:
         _kv_params_override["refine_threshold"] = float(refine_threshold)
+    if segment_interval is not None:
+        _kv_params_override["segment_interval"] = int(segment_interval)
     
     if compressor is not None:
         if isinstance(compressor, str):
@@ -226,6 +229,8 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
             self.luka_kv_controller.segmenter = _kv_params_override["segmenter"]
         if "compressor" in _kv_params_override:
             self.luka_kv_controller.compressor = _kv_params_override["compressor"]
+        if "segment_interval" in _kv_params_override:
+            self.luka_kv_controller.segment_interval = _kv_params_override["segment_interval"]
             
         for layer in self.layers:
             if hasattr(layer, "self_attn"):

@@ -509,20 +509,17 @@ class GaussianSegmenter(Segmenter):
             if compressible <= 0:
                 continue
 
-            page_len = self._sample_length(device)
-            # Reject invalid/too-long samples
-            if page_len <= 0 or page_len > compressible:
-                continue
-
             compressible_indices = raw_indices[:compressible]
-            num_pages = min(compressible // page_len, self.max_pages)
-            if num_pages == 0:
-                continue
-
             ends = []
-            for i in range(num_pages):
-                end_idx = (i + 1) * page_len - 1
+            offset = 0
+            while offset < compressible and len(ends) < self.max_pages:
+                page_len = self._sample_length(device)
+                # Reject invalid or too-long samples; stop paging for this batch
+                if page_len <= 0 or page_len > (compressible - offset):
+                    break
+                end_idx = offset + page_len - 1
                 ends.append(int(compressible_indices[end_idx].item()))
+                offset += page_len
 
             if ends:
                 page_ends[b, : len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
