@@ -19,9 +19,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # Configure LuKA cache parameters via registry (matches run_batch.py style)
 set_luka_kv_params(
     compressor="mean",
-    segmenter="gaussian",
-    segmenter_kwargs={"mean": 16, "std": 8},
-    # segmenter_kwargs={"threshold": 999, "lag": 8}, # kl params
+    # segmenter="gaussian",
+    # segmenter_kwargs={"mean": 16, "std": 8},
+    segmenter="kl",
+    segmenter_kwargs={"threshold": 999, "lag": 8}, # kl params
     refine_threshold=1,
 )
 

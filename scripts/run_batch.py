@@ -17,7 +17,8 @@ set_luka_kv_params(
     compressor="mean",
     segmenter="dummy",
     # segmenter_kwargs={"threshold": 3, "lag": 8},
-    refine_threshold=1
+    refine_threshold=1,
+    segment_interval=16,
 )
 
 # Load model and tokenizer
