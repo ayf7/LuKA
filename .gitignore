@@ -1,4 +1,70 @@
-__pycache__
-*.egg-info
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Evaluation results and outputs
+results/
+mock_*.json
+*_scores.json
+comparison_report.*
+baseline_analysis.json
+luka_evaluation_results.json
+eval_results_*.json
+
+# Model artifacts
 profile__*
 model__*
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.pb
+*.onnx
+*.tflite
+
+# HuggingFace cache and downloaded models
+.cache/
+hf_cache/
+transformers_cache/
+huggingface_hub/
+models/
+checkpoints/
+# Specific HuggingFace model patterns
+**/pytorch_model.bin
+**/model.safetensors
+**/tf_model.h5
+**/flax_model.msgpack
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+.temp/
