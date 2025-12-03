@@ -1,29 +1,25 @@
 """
-Test script for LuKA with HuggingFace Transformers.
+Test script for LuKA with HuggingFace Transformers (new controller path).
 Simple script to test boundary detection during generation.
 """
 
 import torch
 from transformers import AutoTokenizer
-from modeling.segmenter import KLDivergenceSegmenter
-from modeling.compressor import EncoderCompressor, MeanCompressor
-from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params, set_luka_segmenter
+from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
 
 # Configuration
 model_name = "Qwen/Qwen3-1.7B-Base"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Configure LuKA cache parameters, compressor, and segmenter
-encoder_compressor = EncoderCompressor(dim=128)
+# Set LuKA params using registry
 set_luka_kv_params(
-    default_tail_len=16,
-    min_compress_chunk=16,
-    max_pages=15,
-    refine_threshold=0.1,
-    compressor=encoder_compressor,
+    compressor="mean",
+    segmenter="dummy",
+    # segmenter_kwargs={"threshold": 3, "lag": 8},
+    refine_threshold=1,
+    segment_interval=16,
 )
-set_luka_segmenter(KLDivergenceSegmenter(lag=8, threshold=None, top_k = 10))
 
 # Load model and tokenizer
 model = load_luka_model(
@@ -31,10 +27,13 @@ model = load_luka_model(
     torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     device_map="auto" if device == "cuda" else None,
 )
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
 
-# Load prompts (single)
-prompts = load_prompt("paragraphs_1")
+# Load prompts (batch)
+prompts = [
+    load_prompt("paragraphs_2"),
+    load_prompt("paragraphs_1"),
+]
 
 # Tokenize with padding for batching
 tokenizer.pad_token = tokenizer.eos_token
@@ -45,7 +44,7 @@ if device == "cuda":
 # Generate
 outputs = model.generate(
     **inputs,
-    max_new_tokens=64,
+    max_new_tokens=256,
     temperature=0.7,
     top_p=0.9,
     do_sample=True,
@@ -65,3 +64,11 @@ for i, (prompt, output) in enumerate(zip(prompts, outputs)):
     print("Generated output:")
     print(new_text)
     print("\n" + "=" * 80)
+
+# Print LuKA debug summaries after generation
+if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
+    controller = model.model.luka_kv_controller
+    print("\n=== LuKA Layer Summaries ===")
+    for layer_idx in range(controller.num_layers):
+        print("------------------------------")
+        controller.print_layer_summary(layer_idx)

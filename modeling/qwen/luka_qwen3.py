@@ -5,38 +5,51 @@ This module provides a monkey-patch approach to integrate LuKA's KV cache
 compression into HuggingFace's transformers library.
 """
 
+from typing import Any, Callable, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Callable, Any
-
+from transformers.cache_utils import Cache, DynamicCache
 import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
 from transformers.models.qwen3.modeling_qwen3 import (
-    rotate_half,
-    apply_rotary_pos_emb,
-    repeat_kv,
-    eager_attention_forward,
     ALL_ATTENTION_FUNCTIONS,
-    Qwen3Config
+    Qwen3Config,
+    apply_rotary_pos_emb,
+    eager_attention_forward,
+    repeat_kv,
+    rotate_half,
 )
-from transformers.cache_utils import Cache, DynamicCache
 
+from modeling.compressor import EncoderCompressor, MeanCompressor
 from modeling.kv_cache import LukaKVController
+from modeling.segmenter import DummySegmenter, KLSegmenter, GaussianSegmenter
 
 # Optional global overrides for KV cache params, settable by callers (e.g., scripts/test.py)
 _segmenter_override = None
 _kv_params_override: dict[str, float | int | object] = {}
 
-def set_luka_segmenter(segmenter: Any) -> None:
-    global _segmenter_override
-    _segmenter_override = segmenter
+SEGMENTER_REGISTRY = {
+    "dummy": DummySegmenter,
+    "kl": KLSegmenter,
+    "gaussian": GaussianSegmenter,
+}
+
+COMPRESSOR_REGISTRY = {
+    "mean": MeanCompressor,
+    "encoder": EncoderCompressor,
+}
 
 def set_luka_kv_params(
     *,
-    default_tail_len: int | None = None,
-    min_compress_chunk: int | None = None,
-    max_pages: int | None = None,
-    refine_threshold: float | None = None,
-    compressor: object | None = None,
+    default_tail_len: int = 16,
+    min_compress_chunk: int = 16,
+    max_pages: int = 15,
+    refine_threshold: float = 0.05,
+    segment_interval: int = 1,
+    compressor: object = "mean",
+    compressor_kwargs: dict | None = None,
+    segmenter: object = "dummy",
+    segmenter_kwargs: dict | None = None,
 ) -> None:
     global _kv_params_override
     if default_tail_len is not None:
@@ -47,8 +60,32 @@ def set_luka_kv_params(
         _kv_params_override["max_pages"] = int(max_pages)
     if refine_threshold is not None:
         _kv_params_override["refine_threshold"] = float(refine_threshold)
+    if segment_interval is not None:
+        _kv_params_override["segment_interval"] = int(segment_interval)
+    
     if compressor is not None:
-        _kv_params_override["compressor"] = compressor
+        if isinstance(compressor, str):
+            if compressor not in COMPRESSOR_REGISTRY:
+                raise ValueError(f"Compressor {compressor} not found in registry. Available: {list(COMPRESSOR_REGISTRY.keys())}")
+            kwargs = compressor_kwargs or {}
+            print(COMPRESSOR_REGISTRY[compressor], flush=True)
+            _kv_params_override["compressor"] = COMPRESSOR_REGISTRY[compressor](**kwargs)
+        else:
+            if compressor_kwargs:
+                raise ValueError("Cannot provide compressor_kwargs when passing a compressor instance.")
+            _kv_params_override["compressor"] = compressor
+
+    if segmenter is not None:
+        if isinstance(segmenter, str):
+            if segmenter not in SEGMENTER_REGISTRY:
+                raise ValueError(f"Segmenter {segmenter} not found in registry. Available: {list(SEGMENTER_REGISTRY.keys())}")
+            kwargs = segmenter_kwargs or {}
+            print(SEGMENTER_REGISTRY[segmenter], flush=True)
+            _kv_params_override["segmenter"] = SEGMENTER_REGISTRY[segmenter](**kwargs)
+        else:
+            if segmenter_kwargs:
+                raise ValueError("Cannot provide segmenter_kwargs when passing a segmenter instance.")
+            _kv_params_override["segmenter"] = segmenter
 
 class LukaQwenAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -91,7 +128,7 @@ class LukaQwenAttention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         if self.layer_idx == 0:
-            # print(cache_position)
+            print(cache_position, flush=True)
             pass
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -155,7 +192,7 @@ class LukaQwenAttention(nn.Module):
                 num_kv_groups=self.num_key_value_groups,
                 attention_mask=attention_mask,
                 sliding_window=self.sliding_window,
-                threshold=0.1
+                threshold=_kv_params_override.get("refine_threshold", 0.05)
             )
 
         if self.layer_idx == 0:
@@ -169,6 +206,11 @@ class LukaQwenAttention(nn.Module):
         # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        
+        # Verify invariants
+        if self.luka_kv is not None:
+            self.luka_kv.verify_invariants(self.layer_idx)
+            
         return attn_output, attn_weights
 
 
@@ -181,6 +223,15 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
         super().__init__(config)
         # Create one controller and share it with every attention module.
         self.luka_kv_controller = LukaKVController(config)
+        
+        # Apply overrides from registry
+        if "segmenter" in _kv_params_override:
+            self.luka_kv_controller.segmenter = _kv_params_override["segmenter"]
+        if "compressor" in _kv_params_override:
+            self.luka_kv_controller.compressor = _kv_params_override["compressor"]
+        if "segment_interval" in _kv_params_override:
+            self.luka_kv_controller.segment_interval = _kv_params_override["segment_interval"]
+            
         for layer in self.layers:
             if hasattr(layer, "self_attn"):
                 layer.self_attn.luka_kv = self.luka_kv_controller
