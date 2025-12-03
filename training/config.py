@@ -21,6 +21,8 @@ class DataConfig:
         batch_size: Per-step batch size.
         num_workers: DataLoader worker count.
         streaming: Whether to stream the dataset from HF Hub.
+        docs_per_sequence: Number of documents to concatenate per training sequence.
+            If > 1, documents are joined with EOS token separator.
     """
 
     model_name: str = "Qwen/Qwen3-1.7B-Base"
@@ -29,6 +31,7 @@ class DataConfig:
     batch_size: int = 1
     num_workers: int = 0
     streaming: bool = True
+    docs_per_sequence: int = 2
 
 
 @dataclass
@@ -78,6 +81,22 @@ class LossConfig:
 
 
 @dataclass
+class ModelConfig:
+    """
+    Compressor model architecture hyperparameters.
+
+    Fields:
+        nhead: Number of attention heads in EncoderCompressor.
+        ff_mult: Feed-forward dimension multiplier (ff_dim = ff_mult * d_model).
+        dropout: Dropout probability for EncoderCompressor layers.
+    """
+
+    nhead: int = 4
+    ff_mult: int = 4
+    dropout: float = 0.0
+
+
+@dataclass
 class TrainConfig:
     """
     End-to-end training hyperparameters.
@@ -91,7 +110,8 @@ class TrainConfig:
         num_steps: Number of optimization steps.
         grad_accum: Gradient accumulation steps to simulate larger batches.
         log_every: Logging frequency (steps).
-        save_path: Destination filepath for serialized compressor weights.
+        save_dir: Directory to save checkpoints (best.pt and last.pt).
+        save_every: Save checkpoint every N steps (0 to disable periodic saving).
         compressor: Compressor type identifier (e.g., "mean", "encoder").
     """
 
@@ -103,5 +123,6 @@ class TrainConfig:
     num_steps: int = 1000
     grad_accum: int = 1
     log_every: int = 10
-    save_path: str = "compressor.pt"
+    save_dir: str = "checkpoints"
+    save_every: int = 100
     compressor: str = "mean"

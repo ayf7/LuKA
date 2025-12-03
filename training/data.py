@@ -63,7 +63,11 @@ def build_dataloader(cfg: DataConfig) -> DataLoader:
         _encode_batch,
         batched=True,
         remove_columns=dataset.column_names,
-        fn_kwargs={"tokenizer": tokenizer, "seq_len": cfg.seq_len},
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "seq_len": cfg.seq_len,
+            "docs_per_sequence": cfg.docs_per_sequence,
+        },
     )
     loader = DataLoader(
         encoded,
@@ -105,6 +109,7 @@ def _encode_batch(
     examples: Dict,
     tokenizer: PreTrainedTokenizerBase,
     seq_len: int,
+    docs_per_sequence: int = 1,
 ) -> Dict[str, list[list[int]]]:
     """
     Tokenize raw text examples to fixed-length sequences.
@@ -113,6 +118,7 @@ def _encode_batch(
         examples: Mapping with key "text"; a batch of strings from C4.
         tokenizer: Hugging Face tokenizer to apply.
         seq_len: Target sequence length for truncation/padding.
+        docs_per_sequence: Number of documents to concatenate per sequence.
 
     Returns:
         dict with:
@@ -122,8 +128,24 @@ def _encode_batch(
     Side effects:
         None; pure transformation.
     """
+    texts = examples["text"]
+
+    # Concatenate documents if requested
+    if docs_per_sequence > 1:
+        # Group documents into chunks of docs_per_sequence
+        concatenated_texts = []
+        eos_token = tokenizer.eos_token or ""
+
+        for i in range(0, len(texts), docs_per_sequence):
+            chunk = texts[i : i + docs_per_sequence]
+            # Join with EOS token separator
+            concatenated = eos_token.join(chunk)
+            concatenated_texts.append(concatenated)
+
+        texts = concatenated_texts
+
     encoded = tokenizer(
-        examples["text"],
+        texts,
         truncation=True,
         max_length=seq_len,
         padding="max_length",

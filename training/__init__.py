@@ -6,12 +6,12 @@ training entrypoints. Implementations live in the sibling modules; this file
 only defines import convenience and the public surface.
 """
 
-from .config import DataConfig, LossConfig, SamplerConfig, SamplerParams, TrainConfig
-from .data import build_dataloader, build_tokenizer
-from .capture import LayerCapture, QKVCapture, patch_qwen3_for_training, restore_qwen3_attention
-from .sampler import sample_segments
-from .losses import alignment_losses
-from .trainer import train
+from training.config import DataConfig, LossConfig, SamplerConfig, SamplerParams, TrainConfig
+from training.data import build_dataloader, build_tokenizer
+from training.capture import LayerCapture, QKVCapture, patch_qwen3_for_training, restore_qwen3_attention
+from training.sampler import sample_segments
+from training.losses import compute_losses
+from training.trainer import train
 
 __all__ = [
     "DataConfig",
@@ -26,6 +26,6 @@ __all__ = [
     "patch_qwen3_for_training",
     "restore_qwen3_attention",
     "sample_segments",
-    "alignment_losses",
+    "compute_losses",
     "train",
 ]
