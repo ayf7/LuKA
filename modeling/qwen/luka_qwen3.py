@@ -125,6 +125,7 @@ class LukaQwenAttention(nn.Module):
         attention_mask: Optional[torch.Tensor], # [B, 1, L, L]
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None, # [L]
+        use_lined_attention: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         if self.layer_idx == 0:
@@ -165,23 +166,26 @@ class LukaQwenAttention(nn.Module):
         # attn_output: [B, H_q, L, D]
         # attn_probs: [B, H_q, L, T_raw]
         
-        if False:
-            # Eager attention (Vanilla)
-            attention_interface: Callable = eager_attention_forward
-            if self.config._attn_implementation != "eager":
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if self.use_lined_attention:
+            # H20 goes here!!
+            pass
+        # if False:
+        #     # Eager attention (Vanilla)
+        #     attention_interface: Callable = eager_attention_forward
+        #     if self.config._attn_implementation != "eager":
+        #         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states, # [B, H_q, L, D]
-                key_states, # [B, H_k, L + L_past, D]
-                value_states, # [B, H_k, L + L_past, D]
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
-            )
+        #     attn_output, attn_weights = attention_interface(
+        #         self,
+        #         query_states, # [B, H_q, L, D]
+        #         key_states, # [B, H_k, L + L_past, D]
+        #         value_states, # [B, H_k, L + L_past, D]
+        #         attention_mask,
+        #         dropout=0.0 if not self.training else self.attention_dropout,
+        #         scaling=self.scaling,
+        #         sliding_window=self.sliding_window,  # diff with Llama
+        #         **kwargs,
+        #     )
             
         else:
             # Top-down attention (LuKA)
