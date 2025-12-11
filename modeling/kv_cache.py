@@ -1261,99 +1261,68 @@ class LukaKVController:
             
         return False
 
-    def _update_grid_scores(self, layer_idx: int):
-        """Update running scores for grid token selection (H2O-style).
+    def _update_grid_scores(
+        self,
+        layer_idx: int,
+        attn_probs: torch.Tensor,      # [B, H_q, L_q, T_cover]
+        cover_indices: torch.Tensor,   # [B, T_cover] (raw indices or -1)
+        cover_is_summary: torch.Tensor # [B, T_cover] (all zeros for lined)
+    ):
+        """Update running scores for grid token selection (H2O-style), using
+        only the current step's attention and cover layout.
         
         Args:
             layer_idx: int
                 Transformer layer index.
+            attn_probs: torch.Tensor
+                Current step's attention probabilities [B, H_q, L_q, T_cover].
+            cover_indices: torch.Tensor
+                Current cover's raw indices [B, T_cover].
+            cover_is_summary: torch.Tensor
+                Current cover's summary flags [B, T_cover] (all zeros for lined).
         """
-        # Get accumulated attention over the cover
-        attn_weights, cover_indices, cover_is_summary = self.attn_buffer[layer_idx].get_data()
-        if attn_weights is None:
+        if attn_probs is None:
             return
 
-        B, H_q, L_accum, T_cover = attn_weights.shape
-        device = attn_weights.device
+        B, H_q, L_q, T_cover = attn_probs.shape
+        device = attn_probs.device
 
-        # Align cover_indices / cover_is_summary to attention width
-        # The buffer may have accumulated with different cover lengths, so we need to align
-        if cover_indices is None:
-            cover_indices = torch.full((B, T_cover), -1, dtype=torch.long, device=device)
-            cover_is_summary = torch.zeros((B, T_cover), dtype=torch.long, device=device)
-        else:
-            T_idx = cover_indices.shape[1]
-            if T_idx < T_cover:
-                # Pad indices/is_summary on the right with invalid positions
-                pad = T_cover - T_idx
-                pad_idx = torch.full((B, pad), -1, dtype=torch.long, device=device)
-                pad_sum = torch.zeros((B, pad), dtype=cover_is_summary.dtype, device=device) if cover_is_summary is not None else torch.zeros((B, pad), dtype=torch.long, device=device)
-                cover_indices = torch.cat([cover_indices, pad_idx], dim=1)
-                cover_is_summary = torch.cat([cover_is_summary, pad_sum], dim=1) if cover_is_summary is not None else pad_sum
-            elif T_idx > T_cover:
-                # Trim to current attention width
-                cover_indices = cover_indices[:, :T_cover]
-                cover_is_summary = cover_is_summary[:, :T_cover] if cover_is_summary is not None else torch.zeros((B, T_cover), dtype=torch.long, device=device)
+        # Column scores for this step: sum over heads and queries
+        col_scores = attn_probs.sum(dim=(1, 2))  # [B, T_cover]
 
-        # Now shapes match:
-        #   cover_indices: [B, T_cover]
-        #   cover_is_summary: [B, T_cover]
+        # Map cover -> raw indices (for lined: already raw indices)
+        cover_raw_indices = cover_indices  # [B, T_cover]
 
-        # Map cover positions -> raw indices
-        # For lined attention, cover_indices are already raw indices (no pages/summaries)
-        cover_raw_indices = cover_indices.clone()  # [B, T_cover]
-
-        # Now compute column scores over the cover: sum over heads and queries
-        # H2O-like: score_j = sum_{h,q} attn_weights[:, h, q, j]
-        col_scores = attn_weights.sum(dim=(1, 2))  # [B, T_cover]
-
-        # Sanity check: shapes must match
-        assert col_scores.shape == cover_raw_indices.shape, \
-            f"col_scores {col_scores.shape} and cover_raw_indices {cover_raw_indices.shape} must match"
-
-        # Initialize / resize raw-space scores
+        # Get raw cache shape
         k_raw, _, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
         if k_raw is None:
             return
-
         B_raw, H_k, T_raw, D = k_raw.shape
-        device = k_raw.device
 
-        # Ensure batch sizes match (they should, but be defensive)
+        # Handle possible batch mismatch defensively
         if B != B_raw:
-            # This shouldn't happen, but handle it gracefully
             B_use = min(B, B_raw)
-            attn_weights = attn_weights[:B_use]
-            cover_indices = cover_indices[:B_use]
-            cover_is_summary = cover_is_summary[:B_use]
-            cover_raw_indices = cover_raw_indices[:B_use]
             col_scores = col_scores[:B_use]
+            cover_raw_indices = cover_raw_indices[:B_use]
             B = B_use
 
+        # Initialize raw-space scores if needed
         if self.grid_scores[layer_idx] is None or self.grid_scores[layer_idx].shape != (B_raw, T_raw):
             self.grid_scores[layer_idx] = torch.zeros(B_raw, T_raw, device=device, dtype=col_scores.dtype)
 
         raw_scores = self.grid_scores[layer_idx]
 
-        # Decay old scores
+        # Exponential decay on previous scores
         raw_scores.mul_(self.grid_decay)
 
-        # Scatter-add new scores to raw indexes
-        # Ignore padding indices (-1)
+        # Scatter-add new scores
         valid_mask = (cover_raw_indices >= 0)
-
         if not valid_mask.any():
             return
 
-        # For scatter, we need per-batch raw indices and scores
-        # Only process batches that exist in both attn_weights and raw_scores
-        flat_b = torch.arange(B, device=device).unsqueeze(1).expand_as(cover_raw_indices)  # [B, T_cover]
-        flat_b = flat_b[valid_mask]                          # [N_valid]
-        flat_idx = cover_raw_indices[valid_mask]             # [N_valid]
-        flat_scores = col_scores[valid_mask]                 # [N_valid]
-
-        # Clamp indices to valid range
-        flat_idx = flat_idx.clamp(min=0, max=T_raw - 1)
+        flat_b = torch.arange(B, device=device).unsqueeze(1).expand_as(cover_raw_indices)[valid_mask]  # [N]
+        flat_idx = cover_raw_indices[valid_mask].clamp(min=0, max=T_raw - 1)                           # [N]
+        flat_scores = col_scores[valid_mask]                                                            # [N]
 
         raw_scores.index_put_(
             (flat_b, flat_idx),
@@ -1390,6 +1359,15 @@ class LukaKVController:
             k_raw = k_raw[:B_use]
             v_raw = v_raw[:B_use]
             B = B_use
+
+        # Optional: avoid picking from very recent tail (sliding window)
+        # This ensures grid focuses on older, globally useful tokens
+        # while the tail already covers the most recent tokens
+        window = getattr(self.segmenter, 'tail_len', 16)
+        if T_raw > window:
+            # Zero out scores in last `window` positions so grid focuses on older context
+            scores = scores.clone()
+            scores[:, T_raw - window:] = 0
 
         # Top-K per batch
         K = min(self.grid_top_k, T_raw)
@@ -1953,12 +1931,12 @@ class LukaKVController:
         attn_output = torch.matmul(attn_probs, cover_v_full)  # [B, H_q, L_q, D]
         
         # --- 5. Update grid scores and refresh grid tokens ---
-        # Push to buffer for grid score updates
+        # Push to buffer (still useful for debugging/stats if needed)
         cover_is_summary = torch.zeros_like(cover_indices)  # All raw tokens in lined attention
         self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
         
-        # Update grid scores
-        self._update_grid_scores(layer_idx)
+        # Update grid scores *from this step's attention*
+        self._update_grid_scores(layer_idx, attn_probs, cover_indices, cover_is_summary)
         
         # Refresh grid tokens periodically
         self.grid_step_counters[layer_idx] += 1
