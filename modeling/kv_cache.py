@@ -1017,6 +1017,11 @@ class LukaKVController:
         # Per-layer running scores over raw positions (initialized lazily)
         self.grid_scores: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
         self.grid_step_counters = [0 for _ in range(self.num_layers)]
+        
+        # Gentle H2O-ish knobs
+        self.min_lined_seq_len = 256        # don't compress before this many tokens
+        self.min_lined_tail_window = 128    # minimum local tail length
+        self.grid_min_change_ratio = 0.3    # only refresh grid if ≥30% of top-K changed
     
     def initialize_views(self, layer_idx: int):
         """Initialize cover view and attention buffer for a layer (e.g. after prefill)."""
@@ -1364,6 +1369,7 @@ class LukaKVController:
         # This ensures grid focuses on older, globally useful tokens
         # while the tail already covers the most recent tokens
         window = getattr(self.segmenter, 'tail_len', 16)
+        window = max(window, self.min_lined_tail_window)  # Use same minimum as lined_attention
         if T_raw > window:
             # Zero out scores in last `window` positions so grid focuses on older context
             scores = scores.clone()
@@ -1372,11 +1378,28 @@ class LukaKVController:
         # Top-K per batch
         K = min(self.grid_top_k, T_raw)
         top_scores, top_indices = torch.topk(scores, k=K, dim=-1)   # [B, K]
+        indices = top_indices.clone()  # [B, K]
 
-        # Optionally: treat near-zero scores as "no token"
-        # For now, mark all as valid
-        indices = top_indices.clone()               # [B, K]
+        # Optional H2O-ish stability: only refresh if top-K actually changed enough
+        prev_indices = None
+        if self.grid_cache[layer_idx].indices is not None:
+            prev = self.grid_cache[layer_idx].indices  # [B_prev, G_max]
+            # Align shapes: we only compare first B rows and first K cols
+            B_prev, G_prev = prev.shape
+            B_cmp = min(B_prev, B)
+            K_cmp = min(G_prev, K)
+            if B_cmp > 0 and K_cmp > 0:
+                prev_indices = prev[:B_cmp, :K_cmp]
+                new_indices = indices[:B_cmp, :K_cmp]
+                diff = (prev_indices != new_indices)
+                change_ratio = diff.float().mean().item()
+                if change_ratio < self.grid_min_change_ratio:
+                    # Not enough change in grid membership; keep old grid, bail out
+                    if layer_idx == 0:  # Debug print for first layer only
+                        print(f"[Layer {layer_idx}] Grid refresh skipped: change_ratio={change_ratio:.3f} < {self.grid_min_change_ratio}")
+                    return
 
+        # If we're here, either there was no previous grid or it changed meaningfully.
         # Gather K/V: [B, H_k, K, D]
         # Build gather index: [B, 1, K, 1] -> expand to [B, H_k, K, D]
         gather_idx = indices.view(B, 1, K, 1).expand(-1, H_k, -1, D)
@@ -1389,6 +1412,12 @@ class LukaKVController:
             values=grid_v,
             indices=indices,
         )
+        
+        # Debug print for first layer only
+        if layer_idx == 0 and B > 0:
+            grid_indices_b0 = indices[0].cpu().tolist()
+            grid_scores_b0 = top_scores[0].cpu().tolist()
+            print(f"[Layer {layer_idx}] Grid refreshed: indices={grid_indices_b0[:5]}... (top 5), scores={[f'{s:.3f}' for s in grid_scores_b0[:5]]}")
 
         # Note: We don't rebuild cover view here because:
         # - top_down_attention uses its own cover view (pages + tail)
@@ -1795,32 +1824,42 @@ class LukaKVController:
         B, H_q, L_q, D = query_states.shape
         device = query_states.device
         
-        # --- 1. Get grid tokens from GridCache ---
-        grid_cache = self.grid_cache[layer_idx]
-        if grid_cache.keys is None or grid_cache.lens is None:
-            # Initialize grid cache if needed
-            k_raw, _, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
-            if k_raw is None:
-                raise ValueError(f"No raw cache available for layer {layer_idx}.")
-            B_raw, H_k, _, D_k = k_raw.shape
-            grid_cache.initialize(B_raw, H_k, D_k, k_raw.device, k_raw.dtype)
-        
-        grid_indices = grid_cache.indices  # [B, G_max]
-        grid_k = grid_cache.keys           # [B, H_k, G_max, D]
-        grid_v = grid_cache.values         # [B, H_k, G_max, D]
-        grid_lens = grid_cache.lens        # [B]
-        
-        # --- 2. Get raw tail indices and K/V ---
+        # --- 1. Get raw cache and apply warmup guard ---
         k_raw, v_raw, seq_start, raw_seq_start = self.raw_cache.get_layer(layer_idx, with_offsets=True)
         if k_raw is None or v_raw is None:
             raise ValueError(f"No raw cache available for layer {layer_idx}.")
         
         B_raw, H_k, T_raw, D_k = k_raw.shape
         
+        # H2O-ish warmup: don't approximate until the sequence is long enough
+        if T_raw < self.min_lined_seq_len:
+            # Fall back to exact/top-down attention
+            return self.top_down_attention(
+                layer_idx=layer_idx,
+                query_states=query_states,
+                scaling=scaling,
+                num_kv_groups=num_kv_groups,
+                attention_mask=attention_mask,
+                sliding_window=sliding_window,
+                threshold=-1.0,   # force exact raw attention path
+            )
+        
+        # --- 2. Get grid tokens from GridCache ---
+        grid_cache = self.grid_cache[layer_idx]
+        if grid_cache.keys is None or grid_cache.lens is None:
+            grid_cache.initialize(B_raw, H_k, D_k, k_raw.device, k_raw.dtype)
+        
+        grid_indices = grid_cache.indices  # [B, G_max]
+        grid_k = grid_cache.keys           # [B, H_k, G_max, D_k]
+        grid_v = grid_cache.values
+        grid_lens = grid_cache.lens        # [B]
+        
+        # --- 3. Build raw tail with a H2O-ish window ---
+        window = getattr(self.segmenter, 'tail_len', 16)
+        # Ensure the local window is reasonably large
+        window = max(window, self.min_lined_tail_window)
+        
         # Build tail indices per batch
-        # Use sliding window: keep the last `window` tokens (most recent)
-        # This provides compression: grid tokens (global) + sliding window (local)
-        window = getattr(self.segmenter, 'tail_len', 16)  # Use segmenter's tail_len as window size
         
         batched_tail_indices = []
         batched_tail_k = []
@@ -1833,8 +1872,7 @@ class LukaKVController:
             else:
                 base_start = 0
             
-            # Sliding window: only keep the last `window` tokens above base_start
-            # This ensures we keep the most recent tokens, not the oldest ones
+            # Sliding *local* window: last `window` tokens
             tail_start = max(base_start, T_raw - window)
             tail_start = min(tail_start, T_raw)
             tail_len = T_raw - tail_start
