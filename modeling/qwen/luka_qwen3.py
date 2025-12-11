@@ -160,7 +160,7 @@ class LukaQwenAttention(nn.Module):
             )
 
         ####  ATTENTION
-        # Replace eager_attention_forward with top_down_attention
+        # Replace eager_attention_forward with top_down_attention or lined_attention
         
         # attn_output: [B, H_q, L, D]
         # attn_probs: [B, H_q, L, T_raw]
@@ -184,24 +184,42 @@ class LukaQwenAttention(nn.Module):
             )
             
         else:
-            # Top-down attention (LuKA)
-            attn_output, attn_weights = self.luka_kv.top_down_attention(
-                layer_idx=self.layer_idx,
-                query_states=query_states,
-                scaling=self.scaling,
-                num_kv_groups=self.num_key_value_groups,
-                attention_mask=attention_mask,
-                sliding_window=self.sliding_window,
-                threshold=_kv_params_override.get("refine_threshold", 0.05)
+            # Choose between lined attention and topdown attention
+            use_lined = (
+                self.luka_kv.use_lined_attention and 
+                self.layer_idx in self.luka_kv.lined_layers
             )
+            
+            if use_lined:
+                # Lined attention (H2O-style: grid tokens + raw tail)
+                attn_output, attn_weights = self.luka_kv.lined_attention(
+                    layer_idx=self.layer_idx,
+                    query_states=query_states,
+                    scaling=self.scaling,
+                    num_kv_groups=self.num_key_value_groups,
+                    attention_mask=attention_mask,
+                    sliding_window=self.sliding_window,
+                )
+                # Lined attention doesn't use paging, so skip try_new_pages
+            else:
+                # Top-down attention (LuKA: pages + raw tail)
+                attn_output, attn_weights = self.luka_kv.top_down_attention(
+                    layer_idx=self.layer_idx,
+                    query_states=query_states,
+                    scaling=self.scaling,
+                    num_kv_groups=self.num_key_value_groups,
+                    attention_mask=attention_mask,
+                    sliding_window=self.sliding_window,
+                    threshold=_kv_params_override.get("refine_threshold", 0.05)
+                )
+                
+                # Try to create new pages (segmentation & compression)
+                # This uses the buffer populated by top_down_attention
+                self.luka_kv.try_new_pages(self.layer_idx)
 
         if self.layer_idx == 0:
             # self.luka_kv.print_stats(0)
             pass
-        
-        # Try to create new pages (segmentation & compression)
-        # This uses the buffer populated by top_down_attention
-        self.luka_kv.try_new_pages(self.layer_idx)
 
         # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
