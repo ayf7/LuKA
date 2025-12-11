@@ -255,6 +255,9 @@ def train(
                       f"Out: {avg_loss_out:.4f} | "
                       f"Pages: {avg_pages:.1f}")
 
+                # Update last_loss for final checkpoint
+                last_loss = avg_loss
+
                 # Track best loss and save checkpoint
                 if avg_loss < best_loss:
                     best_loss = avg_loss

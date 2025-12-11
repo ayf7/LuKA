@@ -11,13 +11,14 @@ from artifacts.prompts.prompt_loader import load_prompt
 # Configuration
 model_name = "Qwen/Qwen3-1.7B-Base"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+use_trained_compressor = True
 
-# Set LuKA params using registry
 set_luka_kv_params(
-    compressor="mean",
-    segmenter="dummy",
-    # segmenter_kwargs={"threshold": 3, "lag": 8},
-    refine_threshold=1,
+    compressor="encoder",
+    compressor_kwargs={"checkpoint_path": "train_1/best.pt"},
+    segmenter="gaussian",
+    segmenter_kwargs={"mean": 16, "std": 4},
+    refine_threshold=0.1,
     segment_interval=16,
 )
 
@@ -66,9 +67,9 @@ for i, (prompt, output) in enumerate(zip(prompts, outputs)):
     print("\n" + "=" * 80)
 
 # Print LuKA debug summaries after generation
-if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
-    controller = model.model.luka_kv_controller
-    print("\n=== LuKA Layer Summaries ===")
-    for layer_idx in range(controller.num_layers):
-        print("------------------------------")
-        controller.print_layer_summary(layer_idx)
+# if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
+#     controller = model.model.luka_kv_controller
+#     print("\n=== LuKA Layer Summaries ===")
+#     for layer_idx in range(controller.num_layers):
+#         print("------------------------------")
+#         controller.print_layer_summary(layer_idx)

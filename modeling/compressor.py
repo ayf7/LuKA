@@ -87,6 +87,7 @@ class EncoderCompressor(Compressor):
         nhead: int = 4,
         ff_mult: int = 4,
         dropout: float = 0.0,
+        checkpoint_path: str | None = None,
     ):
         super().__init__()
         self.init_dim = dim
@@ -97,8 +98,44 @@ class EncoderCompressor(Compressor):
         self.proj_in: nn.Linear | None = None
         self.encoder: nn.TransformerEncoder | None = None
         self.proj_out: nn.Linear | None = None
-        if dim is not None:
+
+        if checkpoint_path is not None:
+            # Load from checkpoint
+            self._load_from_checkpoint(checkpoint_path)
+        elif dim is not None:
             self._build(dim)
+
+    def _load_from_checkpoint(self, checkpoint_path: str):
+        """Load compressor weights from a checkpoint file."""
+        import torch
+        from pathlib import Path
+
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        # Extract architecture params from checkpoint
+        head_dim = checkpoint["head_dim"]
+        config = checkpoint.get("config", {})
+        model_cfg = config.get("model_cfg", {})
+
+        # Override init params with checkpoint values
+        self.nhead = model_cfg.get("nhead", self.nhead)
+        self.ff_mult = model_cfg.get("ff_mult", self.ff_mult)
+        self.dropout = model_cfg.get("dropout", self.dropout)
+
+        # Build architecture
+        self._build(head_dim)
+
+        # Load weights
+        self.load_state_dict(checkpoint["compressor_state_dict"])
+        self.eval()
+
+        print(f"Loaded EncoderCompressor from {checkpoint_path}")
+        print(f"  Layer: {checkpoint['layer_idx']}, Head dim: {head_dim}")
+        print(f"  Step: {checkpoint.get('step', 'N/A')}, Loss: {checkpoint.get('loss', 'N/A'):.4f}")
 
     def _build(self, dim: int, device=None, dtype=None):
         d_model = 2 * dim
@@ -124,6 +161,10 @@ class EncoderCompressor(Compressor):
             self._build(D, device=k.device, dtype=k.dtype)
         elif D != self.dim:
             raise ValueError(f"EncoderCompressor expected dim={self.dim}, got {D}")
+
+        # Ensure compressor is on same device/dtype as inputs
+        if self.proj_in.weight.device != k.device or self.proj_in.weight.dtype != k.dtype:
+            self.to(device=k.device, dtype=k.dtype)
 
         x = torch.cat([k, v], dim=-1)  # [B, H, L, 2D]
         x = x.view(B * H, L, 2 * D)

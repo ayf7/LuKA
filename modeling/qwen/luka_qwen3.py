@@ -46,6 +46,7 @@ def set_luka_kv_params(
     max_pages: int = 15,
     refine_threshold: float = 0.05,
     segment_interval: int = 1,
+    create_pages_in_generation: bool = True,
     compressor: object = "mean",
     compressor_kwargs: dict | None = None,
     segmenter: object = "dummy",
@@ -62,6 +63,8 @@ def set_luka_kv_params(
         _kv_params_override["refine_threshold"] = float(refine_threshold)
     if segment_interval is not None:
         _kv_params_override["segment_interval"] = int(segment_interval)
+    if create_pages_in_generation is not None:
+        _kv_params_override["create_pages_in_generation"] = bool(create_pages_in_generation)
     
     if compressor is not None:
         if isinstance(compressor, str):
@@ -117,6 +120,8 @@ class LukaQwenAttention(nn.Module):
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
         # Luka KV controller reference; injected by LukaQwen3Model so all layers share one.
         self.luka_kv: LukaKVController | None = None
+        self.prefill = False
+        self.is_lined = False
 
     def forward(
         self,
@@ -165,7 +170,10 @@ class LukaQwenAttention(nn.Module):
         # attn_output: [B, H_q, L, D]
         # attn_probs: [B, H_q, L, T_raw]
         
-        if False:
+        if this layer is lined attention:
+
+            # RUN H2O algorithm
+            
             # Eager attention (Vanilla)
             attention_interface: Callable = eager_attention_forward
             if self.config._attn_implementation != "eager":
@@ -180,7 +188,7 @@ class LukaQwenAttention(nn.Module):
                 dropout=0.0 if not self.training else self.attention_dropout,
                 scaling=self.scaling,
                 sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
+                **kwarFalsegs,
             )
             
         else:
@@ -201,7 +209,10 @@ class LukaQwenAttention(nn.Module):
         
         # Try to create new pages (segmentation & compression)
         # This uses the buffer populated by top_down_attention
-        self.luka_kv.try_new_pages(self.layer_idx)
+        if not self.prefill:
+            print(self.luka_kv.try_new_pages(self.layer_idx))
+            self.prefill = True
+            print(f"prefilled for {self.layer_idx}")
 
         # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -231,7 +242,9 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
             self.luka_kv_controller.compressor = _kv_params_override["compressor"]
         if "segment_interval" in _kv_params_override:
             self.luka_kv_controller.segment_interval = _kv_params_override["segment_interval"]
-            
+        if "create_pages_in_generation" in _kv_params_override:
+            self.luka_kv_controller.create_pages_in_generation = _kv_params_override["create_pages_in_generation"]
+
         for layer in self.layers:
             if hasattr(layer, "self_attn"):
                 layer.self_attn.luka_kv = self.luka_kv_controller
