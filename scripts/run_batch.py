@@ -50,8 +50,14 @@ def run_generation(mode_name, use_lined_attention=False, lined_layers=None):
         if lined_layers is not None:
             controller.lined_layers = set(lined_layers)
         else:
-            # Use all layers for lined attention
-            controller.lined_layers = set(range(controller.num_layers)) if use_lined_attention else set()
+            if use_lined_attention:
+                # H2O-style: protect last few layers (most sensitive to approximation)
+                # Use lined attention on early layers (0..23), top-down on last layers (24..27)
+                num_layers = controller.num_layers
+                protect_last_n = 4  # Protect last 4 layers
+                controller.lined_layers = set(range(0, max(0, num_layers - protect_last_n)))
+            else:
+                controller.lined_layers = set()
         
         print(f"Configuration:")
         print(f"  use_lined_attention: {controller.use_lined_attention}")

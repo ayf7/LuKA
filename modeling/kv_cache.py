@@ -1019,8 +1019,8 @@ class LukaKVController:
         self.grid_step_counters = [0 for _ in range(self.num_layers)]
         
         # Gentle H2O-ish knobs
-        self.min_lined_seq_len = 256        # don't compress before this many tokens
-        self.min_lined_tail_window = 128    # minimum local tail length
+        self.min_lined_seq_len = 384        # don't compress before this many tokens (increased for better quality)
+        self.min_lined_tail_window = 192    # minimum local tail length (increased for better context)
         self.grid_min_change_ratio = 0.3    # only refresh grid if ≥30% of top-K changed
     
     def initialize_views(self, layer_idx: int):
