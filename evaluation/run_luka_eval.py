@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import torch
 
-from simple_qa_evaluator import SimpleQAEvaluator
+from simple_qa_evaluator import SimpleQAEvaluator, HuggingFaceModelAdapter
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 
 # Available datasets
@@ -97,8 +97,15 @@ def main():
         print(f"  lined_layers: {controller.lined_layers}")
         print()
 
+
+    adapter = HuggingFaceModelAdapter(
+    model=model,
+    tokenizer_name=model_name,
+    device=device,
+)
     evaluator = SimpleQAEvaluator(str(dataset_path))
-    results = evaluator.evaluate(model, max_examples=args.max_examples)
+    
+    results = evaluator.evaluate(adapter, max_examples=args.max_examples)
 
     evaluator.print_summary(results)
     evaluator.save_results(results, output_file)
