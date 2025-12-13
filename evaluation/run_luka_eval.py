@@ -9,6 +9,7 @@ import torch
 
 from simple_qa_evaluator import SimpleQAEvaluator, HuggingFaceModelAdapter
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
+from transformers import AutoTokenizer
 
 # Available datasets
 DATASETS = {
@@ -80,6 +81,13 @@ def main():
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
     )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Ensure model is on the requested device
+    if device == "cpu":
+        model.to("cpu")
 
     if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
         controller = model.model.luka_kv_controller
@@ -97,11 +105,47 @@ def main():
         print(f"  lined_layers: {controller.lined_layers}")
         print()
 
+    def model_fn(context: str, question: str) -> str:
+        """Wrap the LuKA/Qwen model to the (context, question) -> answer interface."""
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that answers questions based only on the provided context.",
+                },
+                {
+                    "role": "user",
+                    "content": f"Context: {context}\n\nQuestion: {question}\n\nAnswer the question concisely based only on the context.",
+                },
+            ]
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            prompt = f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
 
-    
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=4096, truncation=True).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+
+        answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if prompt in answer:
+            answer = answer[len(prompt):].strip()
+        for marker in ["Answer:", "answer:", "A:"]:
+            if marker in answer:
+                answer = answer.split(marker, 1)[-1].strip()
+                break
+        return answer
+
     evaluator = SimpleQAEvaluator(str(dataset_path))
-    
-    results = evaluator.evaluate(model, max_examples=args.max_examples)
+    results = evaluator.evaluate(model_fn, max_examples=args.max_examples)
 
     evaluator.print_summary(results)
     evaluator.save_results(results, output_file)
