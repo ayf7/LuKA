@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import torch
 
-from simple_qa_evaluator import SimpleQAEvaluator, HuggingFaceModelAdapter
+from simple_qa_evaluator import SimpleQAEvaluator
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from transformers import AutoTokenizer
 
