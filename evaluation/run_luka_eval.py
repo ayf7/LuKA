@@ -33,13 +33,20 @@ def main():
     parser.add_argument('--max-examples', type=int, default=None)
 
     # Attention flags
-    parser.add_argument('--use_lined_attn', action='store_true',
-                        help='Enable lined attention')
-    parser.add_argument('--no_lined_attn', dest='use_lined_attn', action='store_false')
-    parser.set_defaults(use_lined_attn=False)
+    parser.add_argument(
+        '--attention_type',
+        type=str,
+        required=True,
+        choices=['top_down', 'lined', 'mix'],
+        help='Attention mode: top_down, lined, or mix'
+    )
 
-    parser.add_argument('--num_lined_layers', type=int, default=None,
-                        help='Number of initial layers to use lined attention')
+    parser.add_argument(
+        '--num_lined_layers',
+        type=int,
+        default=None,
+        help='Number of initial layers for lined attention (used in mix mode)'
+    )
 
     parser.add_argument('--device', type=str, default='cpu',
                         choices=['cpu', 'cuda'])
@@ -58,7 +65,7 @@ def main():
 
     output_file = Path(__file__).parent / f"eval_results_{args.model}_{args.dataset}.json"
 
-    attn_type = "Lined Attention Only" if args.use_lined_attn else "Top-Down Attention Only"
+    attn_type = args.attention_type
 
     print("=" * 60)
     print(f"LuKA Model: {args.model} ({model_name})")
@@ -89,21 +96,27 @@ def main():
     if device == "cpu":
         model.to("cpu")
 
+    # Configure attention mode
     if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
         controller = model.model.luka_kv_controller
-        controller.use_lined_attention = args.use_lined_attn
+        if args.attention_type == "top_down":
+            controller.use_lined_attention = False
+            controller.lined_layers = set()
 
-        if args.num_lined_layers is not None:
-            controller.lined_layers = set(range(args.num_lined_layers))
-        else:
-            controller.lined_layers = (
-                set(range(controller.num_layers)) if args.use_lined_attn else set()
-            )
+        elif args.attention_type == "lined":
+            controller.use_lined_attention = True
+            controller.lined_layers = set(range(controller.num_layers))
 
-        print("Configuration:")
+        elif args.attention_type == "mix":
+            controller.use_lined_attention = True
+            controller.lined_layers = set(range(0, 6)) | set(range(23, 28))
+                    
+        print(f"Configuration:")
         print(f"  use_lined_attention: {controller.use_lined_attention}")
         print(f"  lined_layers: {controller.lined_layers}")
-        print()
+        print(f"  grid_top_k: {controller.grid_top_k}")
+        print(f"  grid_update_interval: {controller.grid_update_interval}")
+        print(f"  grid_decay: {controller.grid_decay}\n")
 
     def model_fn(context: str, question: str) -> str:
         """Wrap the LuKA/Qwen model to the (context, question) -> answer interface."""
