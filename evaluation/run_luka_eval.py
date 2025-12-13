@@ -98,14 +98,10 @@ def main():
         print()
 
 
-    adapter = HuggingFaceModelAdapter(
-    model=model,
-    tokenizer_name=model_name,
-    device=device,
-)
+    
     evaluator = SimpleQAEvaluator(str(dataset_path))
     
-    results = evaluator.evaluate(adapter, max_examples=args.max_examples)
+    results = evaluator.evaluate(model, max_examples=args.max_examples)
 
     evaluator.print_summary(results)
     evaluator.save_results(results, output_file)
