@@ -439,9 +439,15 @@ def create_plots(results: Dict, output_path: Path, prompt_name: str):
     fig_dir = output_path / "plots"
     fig_dir.mkdir(exist_ok=True)
     
+    # Filter out any modes that failed (missing required keys)
+    valid_modes = [m for m in results.keys() if "perplexity" in results[m] and "compression_stats" in results[m]]
+    if not valid_modes:
+        print("Warning: No valid results to plot. Skipping plot generation.")
+        return
+    
     # 1. Perplexity comparison
     fig, ax = plt.subplots(figsize=(10, 6))
-    modes = list(results.keys())
+    modes = valid_modes
     perplexities = [results[m]["perplexity"] for m in modes]
     colors = ["black", "blue", "green", "orange"]
     
@@ -464,7 +470,11 @@ def create_plots(results: Dict, output_path: Path, prompt_name: str):
     # 2. Perplexity over time (curves)
     fig, ax = plt.subplots(figsize=(12, 6))
     for mode, color in zip(modes, colors[:len(modes)]):
+        if "perplexity_curve" not in results[mode]:
+            continue
         curve = results[mode]["perplexity_curve"]
+        if not curve:
+            continue
         steps = list(range(1, len(curve) + 1))
         ax.plot(steps, curve, label=results[mode]["description"], 
                 color=color, linewidth=2, alpha=0.8)
@@ -480,7 +490,7 @@ def create_plots(results: Dict, output_path: Path, prompt_name: str):
     
     # 3. Compression ratio comparison
     fig, ax = plt.subplots(figsize=(10, 6))
-    compression_ratios = [results[m]["compression_stats"]["compression_ratio"] for m in modes]
+    compression_ratios = [results[m]["compression_stats"].get("compression_ratio", 1.0) for m in modes]
     
     bars = ax.bar(modes, compression_ratios, color=colors[:len(modes)], alpha=0.7)
     ax.set_ylabel("Compression Ratio", fontsize=12)
@@ -502,8 +512,8 @@ def create_plots(results: Dict, output_path: Path, prompt_name: str):
     x = np.arange(len(modes))
     width = 0.35
     
-    raw_tokens = [results[m]["compression_stats"]["raw_tokens"] for m in modes]
-    cover_tokens = [results[m]["compression_stats"]["cover_tokens"] for m in modes]
+    raw_tokens = [results[m]["compression_stats"].get("raw_tokens", 0) for m in modes]
+    cover_tokens = [results[m]["compression_stats"].get("cover_tokens", 0) for m in modes]
     
     bars1 = ax.bar(x - width/2, raw_tokens, width, label="Raw Tokens", 
                    color="red", alpha=0.7)
@@ -524,7 +534,7 @@ def create_plots(results: Dict, output_path: Path, prompt_name: str):
     
     # 5. Speed comparison (tokens/sec)
     fig, ax = plt.subplots(figsize=(10, 6))
-    speeds = [results[m]["tokens_per_sec"] for m in modes]
+    speeds = [results[m].get("tokens_per_sec", 0.0) for m in modes]
     
     bars = ax.bar(modes, speeds, color=colors[:len(modes)], alpha=0.7)
     ax.set_ylabel("Tokens per Second", fontsize=12)

@@ -1502,7 +1502,23 @@ class LukaKVController:
 
             attn_weights = torch.matmul(query_states, k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_raw]
             if attention_mask is not None:
-                causal_mask = attention_mask[:, :, :, : k_full.shape[-2]]
+                T_raw = k_full.shape[-2]
+                T_mask = attention_mask.shape[-1]
+                if T_mask < T_raw:
+                    # Mask is smaller than cache (e.g., only covers new tokens)
+                    # Expand mask to match cache size, padding with -inf for positions beyond mask
+                    mask_value = torch.finfo(attn_weights.dtype).min
+                    expanded_mask = torch.full(
+                        (attention_mask.shape[0], attention_mask.shape[1], attention_mask.shape[2], T_raw),
+                        mask_value,
+                        device=attention_mask.device,
+                        dtype=attention_mask.dtype
+                    )
+                    expanded_mask[:, :, :, :T_mask] = attention_mask
+                    causal_mask = expanded_mask
+                else:
+                    # Mask is same size or larger, truncate to cache size
+                    causal_mask = attention_mask[:, :, :, :T_raw]
                 attn_weights = attn_weights + causal_mask
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -1582,9 +1598,15 @@ class LukaKVController:
         if attention_mask is not None:
             # Gather the precomputed causal/sliding mask for the chosen cover positions
             # attention_mask: [B, 1, L_q, T_raw]
-            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0)
+            T_mask = attention_mask.shape[-1]
+            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0, max=T_mask - 1)
             idx_expanded = cover_raw_indices_clamped[:, None, None, :].expand(-1, 1, L_q, -1)
             cover_mask = attention_mask.gather(3, idx_expanded)
+            # Mask out positions where indices were out of bounds
+            out_of_bounds = (cover_raw_indices < 0) | (cover_raw_indices >= T_mask)
+            if out_of_bounds.any():
+                mask_value = torch.finfo(attn_logits.dtype).min
+                cover_mask = cover_mask.masked_fill(out_of_bounds[:, None, None, :], mask_value)
             
             # Mask out padding (where cover_indices was -1)
             # cover_mask = cover_mask.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value) # Moved outside
@@ -2008,9 +2030,15 @@ class LukaKVController:
             # Map cover indices to raw indices for masking
             # For grid tokens, use their stored indices; for tail, use tail indices
             cover_raw_indices = cover_indices.clone()  # [B, T_cover]
-            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0)
+            T_mask = attention_mask.shape[-1]
+            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0, max=T_mask - 1)
             idx_expanded = cover_raw_indices_clamped[:, None, None, :].expand(-1, 1, L_q, -1)
             cover_mask = attention_mask.gather(3, idx_expanded)
+            # Mask out positions where indices were out of bounds
+            out_of_bounds = (cover_raw_indices < 0) | (cover_raw_indices >= T_mask)
+            if out_of_bounds.any():
+                mask_value = torch.finfo(attn_logits.dtype).min
+                cover_mask = cover_mask.masked_fill(out_of_bounds[:, None, None, :], mask_value)
             attn_logits = attn_logits + cover_mask
         
         # Mask out invalid cover indices (padding)
