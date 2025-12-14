@@ -35,6 +35,7 @@ from comprehensive_eval import (
     prefill_then_decode_perplexity,
     generate_text,
     load_wikisalad_prompt,
+    create_plots,
 )
 
 
@@ -152,6 +153,9 @@ def main():
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"\nResults saved to: {results_file}")
+    
+    # Create plots
+    create_plots(results, output_path, f"baseline_{dataset_name}")
 
 
 if __name__ == "__main__":
