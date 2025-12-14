@@ -1329,6 +1329,15 @@ class LukaKVController:
         flat_idx = cover_raw_indices[valid_mask].clamp(min=0, max=T_raw - 1)                           # [N]
         flat_scores = col_scores[valid_mask]                                                            # [N]
 
+        # Debug: check if we're actually accumulating scores
+        if layer_idx == 0 and flat_scores.numel() > 0:
+            max_score = flat_scores.max().item()
+            mean_score = flat_scores.mean().item()
+            if max_score > 0:
+                # Only print occasionally to avoid spam
+                if self.grid_step_counters[layer_idx] % 50 == 0:
+                    print(f"[Layer {layer_idx}] Grid score update: max={max_score:.6f}, mean={mean_score:.6f}, valid_tokens={valid_mask.sum().item()}")
+
         raw_scores.index_put_(
             (flat_b, flat_idx),
             flat_scores,
@@ -1368,12 +1377,29 @@ class LukaKVController:
         # Optional: avoid picking from very recent tail (sliding window)
         # This ensures grid focuses on older, globally useful tokens
         # while the tail already covers the most recent tokens
+        # BUT: Don't zero out the tail completely - just reduce its weight
+        # Otherwise we lose important recent tokens
         window = getattr(self.segmenter, 'tail_len', 16)
         window = max(window, self.min_lined_tail_window)  # Use same minimum as lined_attention
+        
+        # Debug: check scores before modifying tail
+        if layer_idx == 0 and T_raw > 0:
+            max_score_before = scores.max().item()
+            mean_score_before = scores.mean().item()
+            tail_max = scores[:, max(0, T_raw - window):].max().item() if T_raw > window else 0
+        
         if T_raw > window:
-            # Zero out scores in last `window` positions so grid focuses on older context
+            # Instead of zeroing, just reduce weight of tail tokens
+            # This allows important recent tokens to still be selected, but with lower priority
             scores = scores.clone()
-            scores[:, T_raw - window:] = 0
+            # Reduce tail scores by 50% instead of zeroing (allows important tokens to still be selected)
+            scores[:, T_raw - window:] *= 0.5
+            
+            # Debug: check scores after reducing tail weight
+            if layer_idx == 0:
+                max_score_after = scores.max().item()
+                mean_score_after = scores.mean().item()
+                print(f"[Layer {layer_idx}] Grid scores: before tail reduction - max={max_score_before:.6f}, mean={mean_score_before:.6f}, tail_max={tail_max:.6f}; after - max={max_score_after:.6f}, mean={mean_score_after:.6f}")
 
         # Top-K per batch
         K = min(self.grid_top_k, T_raw)
