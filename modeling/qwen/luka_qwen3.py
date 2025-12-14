@@ -203,6 +203,7 @@ class LukaQwenAttention(nn.Module):
                 # Lined attention doesn't use paging, so skip try_new_pages
             else:
                 # Top-down attention (LuKA: pages + raw tail)
+                threshold = _kv_params_override.get("refine_threshold", 0.05)
                 attn_output, attn_weights = self.luka_kv.top_down_attention(
                     layer_idx=self.layer_idx,
                     query_states=query_states,
@@ -210,12 +211,14 @@ class LukaQwenAttention(nn.Module):
                     num_kv_groups=self.num_key_value_groups,
                     attention_mask=attention_mask,
                     sliding_window=self.sliding_window,
-                    threshold=_kv_params_override.get("refine_threshold", 0.05)
+                    threshold=threshold
                 )
                 
                 # Try to create new pages (segmentation & compression)
-                # This uses the buffer populated by top_down_attention
-                self.luka_kv.try_new_pages(self.layer_idx)
+                # Skip if using raw attention (threshold < 0) since buffer isn't updated
+                if threshold is None or threshold >= 0:
+                    # This uses the buffer populated by top_down_attention
+                    self.luka_kv.try_new_pages(self.layer_idx)
 
         if self.layer_idx == 0:
             # self.luka_kv.print_stats(0)

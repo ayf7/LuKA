@@ -2178,22 +2178,23 @@ class LukaKVController:
         if attn_weights is not None and not is_lined_layer:
             # Verify width matches cover view
             # Note: attn_buffer accumulates, cover_view grows. They should match in T dimension.
+            # Exception: If using raw attention (threshold < 0), buffer isn't updated (attn_indices is None),
+            # so skip this check in that case
             
-            if cover_view.cover_keys is not None:
+            if cover_view.cover_keys is not None and attn_indices is not None:
                 T_cover = cover_view.cover_keys.shape[2]
                 T_attn = attn_weights.shape[-1]
                 
                 assert T_attn == T_cover, f"Invariant Violation: Attn buffer width {T_attn} != Cover view length {T_cover}"
                 
                 # Verify indices match
-                if attn_indices is not None:
-                     # attn_indices: [B, T]
-                     # cover_view.cover_indices: [B, T]
-                     min_b = min(attn_indices.shape[0], cover_view.cover_indices.shape[0])
-                     assert torch.equal(attn_indices[:min_b], cover_view.cover_indices[:min_b]), \
-                         "Invariant Violation: Attn buffer indices mismatch with CoverView indices"
-                     assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
-                         "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
+                # attn_indices: [B, T]
+                # cover_view.cover_indices: [B, T]
+                min_b = min(attn_indices.shape[0], cover_view.cover_indices.shape[0])
+                assert torch.equal(attn_indices[:min_b], cover_view.cover_indices[:min_b]), \
+                    "Invariant Violation: Attn buffer indices mismatch with CoverView indices"
+                assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
+                    "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
 
     def print_layer_summary(self, layer_idx: int):
         """
