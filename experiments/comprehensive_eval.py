@@ -28,7 +28,6 @@ from modeling.compressor import EncoderCompressor, MeanCompressor
 from modeling.qwen.luka_qwen3 import (
     load_luka_model,
     set_luka_kv_params,
-    set_luka_segmenter,
 )
 from modeling.segmenter import DummySegmenter
 
@@ -284,8 +283,8 @@ def run_evaluation(
         max_pages=15,
         refine_threshold=-1.0,  # Force raw attention
         compressor=None,
+        segmenter="dummy",
     )
-    set_luka_segmenter(DummySegmenter())
     
     baseline_model = load_luka_model(
         model_name,
@@ -349,10 +348,8 @@ def run_evaluation(
             max_pages=15,
             refine_threshold=mode_config["refine_threshold"],
             compressor=compressor,
-            min_lined_seq_len=384,
-            min_lined_tail_window=192,
+            segmenter="dummy",
         )
-        set_luka_segmenter(DummySegmenter())
         
         # Load model
         model = load_luka_model(
@@ -368,6 +365,11 @@ def run_evaluation(
             # Set lined attention parameters (if they exist in controller)
             if hasattr(controller, 'use_lined_attention'):
                 controller.use_lined_attention = True
+                # Set lined attention thresholds
+                if hasattr(controller, 'min_lined_seq_len'):
+                    controller.min_lined_seq_len = 384
+                if hasattr(controller, 'min_lined_tail_window'):
+                    controller.min_lined_tail_window = 192
                 if mode_config["lined_layers"] == "auto":
                     # Mixed: early 0-5 and late 23-27 lined, middle 6-22 top-down
                     num_layers = controller.num_layers
