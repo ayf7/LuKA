@@ -1658,10 +1658,13 @@ class LukaKVController:
                         continue
 
                     page_ids = cover_indices[b, pos_tensor]                 # [S]
-                    starts_b = page_starts[b, page_ids]                     # [S]
-                    ends_b = page_ends[b, page_ids]                         # [S]
+                    # Clamp page_ids to valid range before indexing
+                    max_page_idx = page_starts.shape[1] - 1
+                    page_ids_clamped = page_ids.clamp(min=0, max=max_page_idx)
+                    starts_b = page_starts[b, page_ids_clamped]                     # [S]
+                    ends_b = page_ends[b, page_ids_clamped]                         # [S]
 
-                    valid = (page_ids >= 0) & (ends_b >= starts_b)
+                    valid = (page_ids >= 0) & (page_ids <= max_page_idx) & (ends_b >= starts_b)
                     invalid_pos = pos_tensor[~valid]
                     if invalid_pos.numel() > 0:
                         attn_logits[b, :, :, invalid_pos] = mask_value
@@ -1785,13 +1788,17 @@ class LukaKVController:
                 # cover_indices[b, pos] gives the page index p
                 page_ids = cover_indices[b_idx, pos_idx] # [N]
                 
+                # Clamp page_ids to valid range before indexing
+                max_page_idx = page_start.shape[1] - 1
+                page_ids_clamped = page_ids.clamp(min=0, max=max_page_idx)
+                
                 # Get raw start/end
-                starts = page_start[b_idx, page_ids] # [N]
-                ends = page_end[b_idx, page_ids]     # [N]
+                starts = page_start[b_idx, page_ids_clamped] # [N]
+                ends = page_end[b_idx, page_ids_clamped]     # [N]
                 lengths = ends - starts + 1          # [N]
                 
                 # Filter invalid (just in case)
-                valid = (page_ids >= 0) & (ends >= starts)
+                valid = (page_ids >= 0) & (page_ids <= max_page_idx) & (ends >= starts)
                 if valid.any():
                     b_idx = b_idx[valid]
                     pos_idx = pos_idx[valid]
@@ -1812,14 +1819,18 @@ class LukaKVController:
                         arange = torch.arange(L, device=query_states.device)
                         raw_idx = start_bucket.unsqueeze(1) + arange.unsqueeze(0)
                         
+                        # Clamp indices to valid range for both KV cache and attention mask
+                        T_raw_max = k_raw.shape[2] - 1
+                        raw_idx_clamped = raw_idx.clamp(min=0, max=T_raw_max)
+                        
                         # Gather raw KV: [M, H_k, L, D]
                         # k_raw: [B, H_k, T_raw, D]
                         # We need to select batch rows b_bucket, then gather along T_raw
                         k_batch = k_raw[b_bucket] # [M, H_k, T_raw, D]
                         v_batch = v_raw[b_bucket]
                         
-                        # Expand raw_idx for gather: [M, H_k, L, D]
-                        gather_idx = raw_idx.view(raw_idx.shape[0], 1, L, 1).expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
+                        # Expand raw_idx_clamped for gather: [M, H_k, L, D]
+                        gather_idx = raw_idx_clamped.view(raw_idx.shape[0], 1, L, 1).expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
                         k_slice = torch.gather(k_batch, 2, gather_idx)
                         v_slice = torch.gather(v_batch, 2, gather_idx)
                         
@@ -1836,10 +1847,18 @@ class LukaKVController:
                         if attention_mask is not None:
                             # mask: [B, 1, L_q, T_raw]
                             mask_bucket = attention_mask[b_bucket] # [M, 1, L_q, T_raw]
-                            # gather along T_raw using raw_idx
-                            # raw_idx: [M, L] -> [M, 1, 1, L]
-                            mask_gather_idx = raw_idx.view(raw_idx.shape[0], 1, 1, L).expand(-1, 1, mask_bucket.shape[2], -1)
+                            T_mask = mask_bucket.shape[3]
+                            # Clamp indices to valid mask range
+                            raw_idx_mask_clamped = raw_idx.clamp(min=0, max=T_mask - 1)
+                            # gather along T_raw using raw_idx_mask_clamped
+                            # raw_idx_mask_clamped: [M, L] -> [M, 1, 1, L]
+                            mask_gather_idx = raw_idx_mask_clamped.view(raw_idx.shape[0], 1, 1, L).expand(-1, 1, mask_bucket.shape[2], -1)
                             mask_slice = torch.gather(mask_bucket, 3, mask_gather_idx)
+                            # Mask out positions that were out of bounds
+                            out_of_bounds_mask = (raw_idx < 0) | (raw_idx >= T_mask)
+                            if out_of_bounds_mask.any():
+                                mask_val = torch.finfo(raw_logits.dtype).min
+                                mask_slice = mask_slice.masked_fill(out_of_bounds_mask.view(-1, 1, 1, L), mask_val)
                             raw_logits = raw_logits + mask_slice
                             
                         raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
