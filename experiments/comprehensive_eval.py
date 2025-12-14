@@ -3,7 +3,13 @@ Comprehensive evaluation script for LuKA attention modes.
 Evaluates perplexity, generation quality, and compression metrics with visualizations.
 
 Usage:
+    # With prompts from artifacts/prompts/
     python experiments/comprehensive_eval.py --model Qwen/Qwen3-1.7B-Base --prompt paragraphs_1
+    
+    # With WikiSalad dataset
+    python experiments/comprehensive_eval.py --model Qwen/Qwen3-1.7B-Base \
+        --prompt artifacts/hugging_face_wikipedia/wikisalad_datasets/easy_2topic_short.json \
+        --use-wikisalad --wikisalad-example-id 0
 """
 
 import argparse
@@ -211,6 +217,28 @@ def generate_text(
     return new_text, stats
 
 
+def load_wikisalad_prompt(dataset_path: str, example_id: int = 0) -> str:
+    """Load a prompt from WikiSalad dataset."""
+    with open(dataset_path, 'r') as f:
+        data = json.load(f)
+    
+    if isinstance(data, list):
+        examples = data
+    else:
+        examples = data.get('data', [])
+    
+    if example_id >= len(examples):
+        raise ValueError(f"Example ID {example_id} out of range (max: {len(examples)-1})")
+    
+    example = examples[example_id]
+    # WikiSalad format has 'prompt' field with full context
+    if 'prompt' in example:
+        return example['prompt']
+    else:
+        # Fallback: construct from segments if available
+        return str(example)
+
+
 def run_evaluation(
     model_name: str,
     prompt_name: str,
@@ -218,14 +246,28 @@ def run_evaluation(
     max_new_tokens: int = 256,
     prompt_len: Optional[int] = None,
     output_dir: str = "experiments/eval_results",
+    use_wikisalad: bool = False,
+    wikisalad_example_id: int = 0,
 ):
-    """Run comprehensive evaluation for all attention modes."""
+    """Run comprehensive evaluation for all attention modes.
+    
+    Args:
+        use_wikisalad: If True, load prompt from WikiSalad dataset instead of prompts/
+        wikisalad_example_id: Which example to use from WikiSalad dataset
+    """
     device = device if torch.cuda.is_available() else "cpu"
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Load prompt
-    prompt = load_prompt(prompt_name)
+    if use_wikisalad:
+        # Assume prompt_name is the path to WikiSalad dataset
+        prompt = load_wikisalad_prompt(prompt_name, wikisalad_example_id)
+        dataset_name = Path(prompt_name).stem
+    else:
+        prompt = load_prompt(prompt_name)
+        dataset_name = prompt_name
+    
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
     
@@ -373,13 +415,13 @@ def run_evaluation(
         torch.cuda.empty_cache() if device == "cuda" else None
     
     # Save results
-    results_file = output_path / f"eval_results_{prompt_name}.json"
+    results_file = output_path / f"eval_results_{dataset_name}.json"
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"\nResults saved to: {results_file}")
     
     # Create visualizations
-    create_plots(results, output_path, prompt_name)
+    create_plots(results, output_path, dataset_name)
     
     return results
 
@@ -565,6 +607,17 @@ def main():
         default="experiments/eval_results",
         help="Output directory for results and plots",
     )
+    parser.add_argument(
+        "--use-wikisalad",
+        action="store_true",
+        help="Use WikiSalad dataset instead of prompts/",
+    )
+    parser.add_argument(
+        "--wikisalad-example-id",
+        type=int,
+        default=0,
+        help="Which example to use from WikiSalad dataset (default: 0)",
+    )
     
     args = parser.parse_args()
     
@@ -575,6 +628,8 @@ def main():
         max_new_tokens=args.max_new_tokens,
         prompt_len=args.prompt_len,
         output_dir=args.output_dir,
+        use_wikisalad=args.use_wikisalad,
+        wikisalad_example_id=args.wikisalad_example_id,
     )
     
     # Print summary
