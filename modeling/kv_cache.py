@@ -841,7 +841,8 @@ class AttentionScoreBuffer:
                 inclusive raw indices for newly created pages.
             new_frontiers: [B] raw index of the start of the remaining raw tail.
         """
-        if self.attention_weights is None:
+        # Early return if buffer not initialized (e.g., raw attention mode with threshold < 0)
+        if self.cover_indices is None or self.attention_weights is None:
             return
 
         B, H, L, T = self.attention_weights.shape

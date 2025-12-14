@@ -50,7 +50,7 @@ def get_compression_stats(model, layer_idx: int = 0) -> Dict:
         summary_tokens = 0
         if summary_cache.keys is not None:
             page_lens = summary_cache.page_lens
-            if page_lens is not None and len(page_lens) > 0:
+            if page_lens is not None and page_lens.numel() > 0:
                 num_pages = int(page_lens[0].item())
                 summary_tokens = num_pages  # Each page is 1 summary token
         
@@ -58,7 +58,7 @@ def get_compression_stats(model, layer_idx: int = 0) -> Dict:
         grid_cache = controller.grid_cache[layer_idx]
         grid_tokens = 0
         if grid_cache.keys is not None and grid_cache.lens is not None:
-            if len(grid_cache.lens) > 0:
+            if grid_cache.lens.numel() > 0:
                 grid_tokens = int(grid_cache.lens[0].item())
         
         # Get cover view stats
@@ -361,7 +361,13 @@ def run_evaluation(
         
         # Configure lined attention if needed
         if mode_config["use_lined_attention"]:
+            if not hasattr(model.model, 'layers') or len(model.model.layers) == 0:
+                print(f"  Warning: Model has no layers. Skipping {mode_name} mode.")
+                continue
             controller = model.model.layers[0].self_attn.luka_kv
+            if controller is None:
+                print(f"  Warning: Controller is None. Skipping {mode_name} mode.")
+                continue
             # Set lined attention parameters (if they exist in controller)
             if hasattr(controller, 'use_lined_attention'):
                 controller.use_lined_attention = True
