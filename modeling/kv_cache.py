@@ -1429,7 +1429,10 @@ class LukaKVController:
         # If we're here, either there was no previous grid or it changed meaningfully.
         # Gather K/V: [B, H_k, K, D]
         # Build gather index: [B, 1, K, 1] -> expand to [B, H_k, K, D]
-        gather_idx = indices.view(B, 1, K, 1).expand(-1, H_k, -1, D)
+        # Clamp indices to valid range
+        T_raw_max = k_raw.shape[2] - 1
+        indices_clamped = indices.clamp(min=0, max=T_raw_max)
+        gather_idx = indices_clamped.view(B, 1, K, 1).expand(-1, H_k, -1, D)
         grid_k = torch.gather(k_raw, 2, gather_idx)
         grid_v = torch.gather(v_raw, 2, gather_idx)
 
@@ -1677,7 +1680,10 @@ class LukaKVController:
                     pad_mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
                     raw_idx = raw_idx.masked_fill(pad_mask, -1)
 
-                    idx_clamped = raw_idx.clamp(min=0)
+                    # Clamp indices to valid range for both k_full_raw and attention_mask
+                    T_raw_max = k_full_raw.shape[2] - 1
+                    idx_clamped = raw_idx.clamp(min=0, max=T_raw_max)
+                    
                     # Gather keys for all pages at once along the sequence dimension: [1, H_q, S_valid, max_len, D]
                     k_flat = torch.index_select(k_full_raw, 2, idx_clamped.view(-1))  # [B, H_q, S*max_len, D]
                     k_flat_b = k_flat[b]  # [H_q, S*max_len, D]
@@ -1689,8 +1695,15 @@ class LukaKVController:
 
                     if attention_mask is not None:
                         mask_b_full = attention_mask[b:b+1]                 # [1, 1, L_q, T_raw]
-                        mask_flat = torch.index_select(mask_b_full, 3, idx_clamped.view(-1))  # [1,1,L_q,S_valid*max_len]
+                        T_mask = mask_b_full.shape[3]
+                        # Clamp indices to valid mask range
+                        idx_clamped_mask = raw_idx.clamp(min=0, max=T_mask - 1)
+                        mask_flat = torch.index_select(mask_b_full, 3, idx_clamped_mask.view(-1))  # [1,1,L_q,S_valid*max_len]
                         mask_pages = mask_flat.view(1, 1, L_q, raw_idx.shape[0], max_len)     # [1,1,L_q,S_valid,max_len]
+                        # Mask out positions that were out of bounds
+                        out_of_bounds_mask = (raw_idx < 0) | (raw_idx >= T_mask)
+                        if out_of_bounds_mask.any():
+                            mask_pages = mask_pages.masked_fill(out_of_bounds_mask.view(1, 1, 1, -1, max_len), mask_value)
                         mask_pages = mask_pages.permute(0, 1, 3, 2, 4)                         # [1,1,S_valid,L_q,max_len]
                         page_logits = page_logits + mask_pages
 
