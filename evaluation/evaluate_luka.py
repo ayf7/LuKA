@@ -340,15 +340,5 @@ def main():
     save_results(results, "eval_results_lined_attention.json")
 
 
-    # ------------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------------
-    out_file = OUTPUT_DIR / dataset_path.name.replace(".json", "_lined.json")
-    with open(out_file, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"\nSaved generations to {out_file}")
-
-
 if __name__ == "__main__":
     main()
