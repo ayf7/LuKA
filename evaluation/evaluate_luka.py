@@ -1,40 +1,50 @@
 """
 Generate text using lined (H2O-style grid tokens) attention on WikiSalad.
-"""
 
+Datasets are:
+- easy_2topic_short
+- medium_2topic_short
+- hard_3topic_short
+- very_hard_3topic_long.json
+
+- Set max examples with --max-examples, default is 100
+
+- attention modes are {lined, top_down, mixed}
+
+- Results will save in evaluation/results/eval_results_{attention_mode}_attention_{dataset}.json
+
+How to run:
+python3 evaluate_luka.py --attention_mode lined --dataset easy_2topic_short --max-examples 1
+python3 evaluate_luka.py --attention_mode top_down --dataset easy_2topic_short --max-examples 1
+python3 evaluate_luka.py --attention_mode mixed --dataset easy_2topic_short --max-examples 1
+
+"""
 import argparse
 import json
-from pathlib import Path
-from tqdm import tqdm
 import re
-import numpy as np
+from pathlib import Path
 
-from modeling.compressor import EncoderCompressor
+import numpy as np
 import torch
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from modeling.qwen.luka_qwen3 import (
-    load_luka_model,
-    set_luka_kv_params,
-)
-
+from experiments.comprehensive_eval import generate_text
+from modeling.compressor import EncoderCompressor
+from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from utils import (
     EvalResult,
-    print_summary,
-    save_results,
-    resolve_dataset_path,
-    parse_example,
     compute_exact_match,
-    normalize_answer,
     compute_f1,
-    format_qa_prompt
+    format_qa_prompt,
+    normalize_answer,
+    parse_example,
+    print_summary,
+    resolve_dataset_path,
+    save_results,
 )
 
-# Reuse eval helper for generation
-from experiments.comprehensive_eval import generate_text
-
 MAX_NEW_TOKENS = 256
-
 
 def main():
     parser = argparse.ArgumentParser(description="Generate with lined attention on WikiSalad")
@@ -62,12 +72,6 @@ def main():
         help="Device to use (cpu or cuda)",
     )
     parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=256,
-        help="Maximum new tokens to generate (default: 256)",
-    )
-    parser.add_argument(
         "--attention_mode",
         type=str,
         choices=["lined", "top_down", "mixed"],
@@ -89,6 +93,7 @@ def main():
 
     # Configure LuKA
     use_controller = False
+
     # ********************************************************************** #
     # LINED ATTENTION SETUP
     # ********************************************************************** #
@@ -119,13 +124,6 @@ def main():
         controller.grid_decay = 0.95            
         controller.debug = False                 
         controller.lined_layers = set(range(controller.num_layers))
-        
-        print(f"\nLined attention configuration:")
-        print(f"  grid_top_k: {controller.grid_top_k}")
-        print(f"  grid_update_interval: {controller.grid_update_interval}")
-        print(f"  grid_decay: {controller.grid_decay}")
-        print(f"  min_lined_tail_window: {controller.min_lined_tail_window}")
-        print(f"  grid_min_change_ratio: {controller.grid_min_change_ratio}")
     
     # ********************************************************************** #
     # TOP-DOWN ATTENTION SETUP
@@ -177,9 +175,9 @@ def main():
         controller.lined_layers = set(range(0, low_k)) | set(range(num_layers - high_k, num_layers))
 
 
-    # ------------------------------------------------------------------
-    # Generate for every WikiSalad example
-    # ------------------------------------------------------------------
+    # ********************************************************************** #
+    # Run Generations and Evaluate
+    # ********************************************************************** #
     results = []
     print("Num examples: ", len(dataset))
 
@@ -230,7 +228,7 @@ def main():
                         model=model,
                         tokenizer=tokenizer,
                         prompt=input_prompt,
-                        max_new_tokens=args.max_new_tokens,
+                        max_new_tokens=MAX_NEW_TOKENS,
                         temperature=0.3,  # Lower temperature for more focused answers
                         top_p=0.9,
                     )
