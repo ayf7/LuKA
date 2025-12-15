@@ -137,10 +137,6 @@ def compute_exact_match(prediction: str, true_answers):
         # Handle unanswerable questions (empty answer list)
         if not true_answers:
             return 0.0
-        
-        # Handle empty predictions
-        if not prediction or len(prediction.strip()) == 0:
-            return 0.0
 
         pred_norm = normalize_answer(prediction)
 
@@ -201,10 +197,7 @@ def compute_f1(prediction: str, true_answers) -> float:
         f1_scores.append(f1)
 
     return max(f1_scores) if f1_scores else 0.0
-
-def format_qa_prompt(context: str, question: str) -> str:
-    prompt = f"{context}\n\nAnswer the following question in one short phrase. Do not include any other text.\n\nQuestion: {question}\n\nAnswer:"
-    return prompt
+    
 
 def main():
     parser = argparse.ArgumentParser(description="Generate with lined attention on WikiSalad")
@@ -219,27 +212,9 @@ def main():
         type=str,
         default="Qwen/Qwen3-1.7B-Base",
     )
-    parser.add_argument(
-        "--max-examples",
-        type=int,
-        default=10,
-        help="Maximum number of examples to evaluate (default: 10)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="Device to use (cpu or cuda)",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=256,
-        help="Maximum new tokens to generate (default: 256)",
-    )
     args = parser.parse_args()
 
-    device = args.device
+    device = "cpu"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -280,19 +255,12 @@ def main():
     controller = model.model.layers[0].self_attn.luka_kv
     controller.use_lined_attention = True
     controller.min_lined_seq_len = 384
-    controller.min_lined_tail_window = 512  # Increased for debugging (was 192)
-    controller.grid_min_change_ratio = 0.0   # Always refresh for debugging (was 0.3)
-    controller.grid_update_interval = 4     # Refresh every 4 steps (was 1 for debugging, 16 default)
-    controller.grid_decay = 0.95            # Faster adaptation (was 0.99)
-    controller.debug = False                 # Disable debug prints for speed
+    controller.min_lined_tail_window = 192
+    controller.grid_update_interval = 4  # Refresh every 4 steps (faster than every step)
+    controller.grid_decay = 0.95  # Faster adaptation
+    controller.grid_min_change_ratio = 0.0  # Always refresh for stability
+    controller.debug = False  # Disable debug prints for speed
     controller.lined_layers = set(range(controller.num_layers))
-    
-    print(f"\nLined attention configuration:")
-    print(f"  grid_top_k: {controller.grid_top_k}")
-    print(f"  grid_update_interval: {controller.grid_update_interval}")
-    print(f"  grid_decay: {controller.grid_decay}")
-    print(f"  min_lined_tail_window: {controller.min_lined_tail_window}")
-    print(f"  grid_min_change_ratio: {controller.grid_min_change_ratio}")
 
     # ------------------------------------------------------------------
     # Generate for every WikiSalad example
@@ -300,13 +268,12 @@ def main():
     results = []
     print("Num examples: ", len(dataset))
 
-    examples_to_eval = dataset[:args.max_examples]
+    examples_to_eval = dataset
     exact_matches = []
     f1_scores = []
     per_example = []
     verbose = True
 
-    print(f"Evaluating {len(examples_to_eval)} examples (max: {args.max_examples})")
     iterator = tqdm(examples_to_eval, desc="Evaluating") if verbose else examples_to_eval
 
     count = 1
@@ -324,57 +291,23 @@ def main():
                     true_answers = answers_data
                 
                 try:
-                    # CRITICAL FIX: Reset cache before each question to prevent contamination
+                    # CRITICAL: Reset cache before each question to prevent contamination
                     controller.reset()
                     
-                    # Format prompt to encourage short answers
-                    input_prompt = format_qa_prompt(context, question)
-                    
-                    # Debug: dump prompt tokens for Kerry question (question_id=3)
-                    if q_idx == 3 and verbose:
-                        prompt_tokens = tokenizer.encode(input_prompt, add_special_tokens=False)
-                        prompt_text = tokenizer.decode(prompt_tokens[-80:], skip_special_tokens=False)
-                        print(f"\n[DEBUG] Last 80 prompt tokens for question_id=3:")
-                        print(f"  Text: {prompt_text}")
-                        print(f"  Token count: {len(prompt_tokens)}")
-                    
-                    if verbose:
-                        print(f"\n[Example {i}, Question {q_idx}]")
-                        print(f"Question: {question}")
-                        print(f"True answers: {true_answers}")
+                    # Format prompt to encourage short, focused answers
+                    input_prompt = f"{context}\n\nAnswer the following question in one short phrase. Do not include any other text.\n\nQuestion: {question}\n\nAnswer:"
+                    print("INPUT PROMPT IS: " , input_prompt)
 
                     predicted_answer, _ = generate_text(
                         model=model,
                         tokenizer=tokenizer,
                         prompt=input_prompt,
-                        max_new_tokens=args.max_new_tokens,
-                        temperature=0.3,  # Lower temperature for more focused answers
-                        top_p=0.9,
+                        max_new_tokens=MAX_NEW_TOKENS,
                     )
-                    
-                    # Extract first sentence or phrase (stop at newline or period)
-                    # This helps get just the answer, not the continuation
-                    if '\n' in predicted_answer:
-                        predicted_answer = predicted_answer.split('\n')[0].strip()
-                    # Also try to stop after first sentence if it's clearly an answer
-                    if predicted_answer and len(predicted_answer) > 100:
-                        # If it's very long, try to extract just the first part
-                        sentences = predicted_answer.split('.')
-                        if len(sentences) > 1:
-                            # Take first sentence if it seems like an answer
-                            first_sent = sentences[0].strip()
-                            if len(first_sent) > 10:  # If first sentence is substantial
-                                predicted_answer = first_sent
-                    
-                    if verbose:
-                        print(f"Predicted: {predicted_answer}")
                     
                     # Compute metrics
                     em = compute_exact_match(predicted_answer, true_answers)
                     f1 = compute_f1(predicted_answer, true_answers)
-                    
-                    if verbose:
-                        print(f"Exact Match: {em:.2f}, F1: {f1:.2f}")
                     
                     exact_matches.append(em)
                     f1_scores.append(f1)
@@ -388,28 +321,29 @@ def main():
                         'exact_match': em,
                         'f1': f1
                     })
+                    print(per_example)
                     
                 except Exception as e:
                     if verbose:
                         print(f"\nError on example {i}, question {q_idx}: {e}")
-                        import traceback
-                        traceback.print_exc()
                     per_example.append({
                         'example_id': i,
                         'question_id': q_idx,
                         'error': str(e)
                     })
+                break
+            break
 
     results = EvalResult(
-        dataset_name=Path(dataset_path).stem,
-        num_examples=len(per_example),
-        exact_match=float(np.mean(exact_matches)) if exact_matches else 0.0,
-        f1_score=float(np.mean(f1_scores)) if f1_scores else 0.0,
-        per_example_results=per_example
-    )
+            dataset_name=Path(dataset_path).stem,
+            num_examples=len(per_example),
+            exact_match=float(np.mean(exact_matches)),
+            f1_score=float(np.mean(f1_scores)),
+            per_example_results=per_example
+        )
     
     print_summary(results)
-    save_results(results, f"eval_results_lined_attention_{Path(dataset_path).stem}.json")
+    save_results(results, "eval_results_lined_attention.json")
 
 
 if __name__ == "__main__":
