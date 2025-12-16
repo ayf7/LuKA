@@ -1,0 +1,5 @@
+name,description,refine_threshold,create_pages,segment_interval,compressor,avg_time_s,min_time_s,max_time_s,avg_tokens,avg_throughput_tok_s,best_throughput_tok_s
+raw_attention,"Baseline: raw attention, no LuKA overhead",-1.0,False,1,mean,2.6702370308339596,2.6649873796850443,2.6799394162371755,128.0,47.93581937556437,48.030246212695914
+cover_view_only,"Cover view maintained but no pages created, no refinement",1.0,False,1,mean,3.3875618117551007,3.3551922906190157,3.4087082222104073,128.0,37.78528839114614,38.14982537897542
+pages_interval_1,"Pages created every step, no refinement",1.0,True,1,mean,4.707174444881578,4.683697044849396,4.746620810590684,128.0,27.19253375858693,27.328838474034104
+pages_with_refinement_0.05,Full LuKA with refinement threshold 0.05 (more refinement),0.05,True,1,mean,4.9270426441604895,4.875608610920608,4.967560648918152,128.0,25.979072893088325,26.253132729583715
