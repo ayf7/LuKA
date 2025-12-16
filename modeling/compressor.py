@@ -12,6 +12,9 @@ class Compressor(ABC, nn.Module):
     Inputs:
         k: [B, H, L, D]
         v: [B, H, L, D]
+        importance_weights: Optional[torch.Tensor] [B, H, L] or [B, L]
+            Per-token importance scores (e.g., accumulated attention).
+            If provided, can be used for weighted compression.
 
     Returns:
         k_summary: [B, H, D]
@@ -19,7 +22,12 @@ class Compressor(ABC, nn.Module):
     """
 
     @abstractmethod
-    def forward(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
     def _validate_input(self, k: torch.Tensor, v: torch.Tensor):
@@ -56,19 +64,92 @@ class Compressor(ABC, nn.Module):
         assert k_sum.shape == (B, H, D), f"Invariant Violation: Output keys shape {k_sum.shape} != expected {(B, H, D)}"
         assert v_sum.shape == (B, H, D), f"Invariant Violation: Output values shape {v_sum.shape} != expected {(B, H, D)}"
 
-
-
 class MeanCompressor(Compressor):
     """
     Baseline compressor that averages keys and values across the sequence length.
+    Ignores importance_weights (uniform weighting).
     """
 
-    def forward(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._validate_input(k, v)
         # k, v: [B, H, L, D]
         k_summary = k.mean(dim=2)
         v_summary = v.mean(dim=2)
         self._validate_output(k_summary, v_summary, k.shape[0], k.shape[1], k.shape[3])
+        return k_summary, v_summary
+
+
+class AttentionWeightedCompressor(Compressor):
+    """
+    Compressor that weights tokens by their accumulated attention (importance).
+
+    This produces a convex combination biased toward tokens that historically
+    received more attention, which better preserves attention patterns.
+
+    Args:
+        temperature: Softmax temperature for weight normalization.
+            Lower = sharper (more weight on highest-attention token).
+            Default 1.0 uses raw attention scores.
+        fallback_to_mean: If importance_weights is None, fall back to uniform mean.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 1.0,
+        fallback_to_mean: bool = True,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.fallback_to_mean = fallback_to_mean
+
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            k: [B, H, L, D] keys to compress
+            v: [B, H, L, D] values to compress
+            importance_weights: [B, H, L] per-token importance scores
+                Higher values = more important tokens.
+
+        Returns:
+            k_summary: [B, H, D]
+            v_summary: [B, H, D]
+        """
+        self._validate_input(k, v)
+        B, H, L, D = k.shape
+
+        if importance_weights is None:
+            if self.fallback_to_mean:
+                k_summary = k.mean(dim=2)
+                v_summary = v.mean(dim=2)
+                self._validate_output(k_summary, v_summary, B, H, D)
+                return k_summary, v_summary
+            else:
+                raise ValueError("importance_weights required when fallback_to_mean=False")
+
+        # importance_weights: [B, H, L]
+        assert importance_weights.shape == (B, H, L), \
+            f"importance_weights shape {importance_weights.shape} != expected {(B, H, L)}"
+
+        # Normalize to get convex combination weights
+        # softmax ensures weights sum to 1 and are non-negative
+        weights = torch.softmax(importance_weights / self.temperature, dim=-1)  # [B, H, L]
+        weights = weights.unsqueeze(-1)  # [B, H, L, 1]
+
+        # Weighted sum (convex combination)
+        k_summary = (k * weights).sum(dim=2)  # [B, H, D]
+        v_summary = (v * weights).sum(dim=2)  # [B, H, D]
+
+        self._validate_output(k_summary, v_summary, B, H, D)
         return k_summary, v_summary
 
 
@@ -153,7 +234,16 @@ class EncoderCompressor(Compressor):
         self.proj_out = nn.Linear(d_model, d_model, device=device, dtype=dtype)
         self.dim = dim
 
-    def forward(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Note: importance_weights is accepted for API compatibility but currently
+        ignored. The encoder learns its own weighting via attention.
+        """
         self._validate_input(k, v)
         # k, v: [B, H, L, D]
         B, H, L, D = k.shape

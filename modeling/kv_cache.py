@@ -558,8 +558,6 @@ class CoverView:
             
             k_r = k_raw[b, :, r_start:, :] # [H, T_tail, D]
             v_r = v_raw[b, :, r_start:, :]
-            
-            tail_len = k_r.shape[1]
             tail_len = k_r.shape[1]
             idx_r = torch.arange(r_start, r_start + tail_len, device=device)
             
@@ -813,26 +811,40 @@ class AttentionScoreBuffer:
         self.refinement_counts = new_ref_counts
 
     def get_stats(self):
-        # Calculate stats
-        # Total summaries
+        """Get refinement statistics.
+
+        Returns:
+            dict with:
+                - num_summaries_current: Current number of summary positions in cover view
+                - total_summaries_seen: Cumulative (summaries × heads × queries) seen
+                - total_refinements_made: Cumulative refinement count
+                - refinement_rate: Fraction of summary attention that triggered refinement
+                - total_queries_processed: Number of query tokens processed
+                - refinements_per_query: Average refinements per query token
+        """
         if self.cover_is_summary is None:
             return {}
-            
+
         is_sum = (self.cover_is_summary == 1)
         num_summaries = is_sum.sum().item()
-        
-        # Average refinements per summary (historical)
-        # This tracks "how many times has a summary been refined" if we were incrementing counts.
-        # But user wants "rate of refinement" over time.
-        # We'll return the running totals.
-        
+
         rate = self.total_refinements_made / self.total_summaries_seen if self.total_summaries_seen > 0 else 0.0
-        
+
+        # Estimate queries processed from attention buffer shape
+        if self.attention_weights is not None:
+            total_queries = self.attention_weights.shape[2]  # L_accum
+        else:
+            total_queries = 0
+
+        refinements_per_query = self.total_refinements_made / total_queries if total_queries > 0 else 0.0
+
         return {
             "num_summaries_current": num_summaries,
             "total_summaries_seen": self.total_summaries_seen,
             "total_refinements_made": self.total_refinements_made,
-            "refinement_rate": rate
+            "refinement_rate": rate,
+            "total_queries_processed": total_queries,
+            "refinements_per_query": refinements_per_query,
         }
 
 class LukaKVController:
@@ -864,6 +876,9 @@ class LukaKVController:
         self.segment_interval = 1
         # Whether to create pages during generation (decode) or only during prefill
         self.create_pages_in_generation = True
+        # Whether to add log(N) bias to summary attention logits
+        # Set to False when using MeanCompressor (arithmetic mean != log-sum-exp assumption)
+        self.use_log_bias = False
         self.seg_step_counters = [0 for _ in range(self.num_layers)]
     
     def initialize_views(self, layer_idx: int):
@@ -1019,46 +1034,80 @@ class LukaKVController:
         if k_raw is None:
             return False
             
+        # Get number of heads from k_raw for importance weight shape
+        H_kv = k_raw.shape[1]
+
         for b in range(B):
             frontier = raw_seq_start[b].item()
             p_ends = page_ends[b]
             valid_mask = (p_ends >= frontier) & (p_ends != -1)
-            
+
             if not valid_mask.any():
                 continue
-            
+
             valid_ends = p_ends[valid_mask].sort().values
-            
+
             b_keys = []
             b_values = []
             b_starts = []
             b_ends = []
-            
+
             current_start = frontier
-            
+
             for end_idx in valid_ends.tolist():
                 end_idx = int(end_idx)
                 if end_idx < current_start:
                     continue
-                    
+
                 # Slice: [current_start, end_idx] inclusive
                 # k_raw: [B, H, T, D]
                 k_slice = k_raw[b, :, current_start : end_idx + 1, :]
                 v_slice = v_raw[b, :, current_start : end_idx + 1, :]
-                
+
+                # Extract importance weights from attention buffer
+                # Find cover positions that map to raw indices in [current_start, end_idx]
+                importance_weights = None
+                if attn_weights is not None and cover_indices is not None:
+                    cover_idx_b = cover_indices[b]  # [T_cover]
+                    is_sum_b = cover_is_summary[b]  # [T_cover]
+
+                    # Mask for raw tokens in this page's range
+                    page_mask = (
+                        (cover_idx_b >= current_start) &
+                        (cover_idx_b <= end_idx) &
+                        (is_sum_b == 0)
+                    )
+
+                    if page_mask.any():
+                        # attn_weights: [B, H_q, L_accum, T_cover]
+                        # Get attention to these positions, aggregate over queries
+                        page_attn = attn_weights[b, :, :, page_mask]  # [H_q, L_accum, page_len]
+
+                        # Sum over queries (L_accum) to get total attention per token
+                        importance = page_attn.sum(dim=1)  # [H_q, page_len]
+
+                        # Handle GQA: H_q may differ from H_kv
+                        # Average across query head groups to get H_kv importance weights
+                        H_q = importance.shape[0]
+                        if H_q != H_kv:
+                            num_groups = H_q // H_kv
+                            importance = importance.view(H_kv, num_groups, -1).mean(dim=1)  # [H_kv, page_len]
+
+                        importance_weights = importance.unsqueeze(0)  # [1, H_kv, page_len]
+
                 # Compress: [H, D]
                 k_in = k_slice.unsqueeze(0)
                 v_in = v_slice.unsqueeze(0)
-                k_sum, v_sum = self.compressor(k_in, v_in) # [1, H, D]
-                
+                k_sum, v_sum = self.compressor(k_in, v_in, importance_weights)  # [1, H, D]
+
                 b_keys.append(k_sum)
                 b_values.append(v_sum)
                 b_starts.append(current_start)
                 b_ends.append(end_idx)
-                
+
                 # Record for buffer update
                 all_new_pages[b].append((current_start, end_idx))
-                
+
                 current_start = end_idx + 1
             
             if b_keys:
@@ -1073,24 +1122,19 @@ class LukaKVController:
                     page_end=torch.tensor([b_ends], device=device),
                     page_frontier=torch.tensor([current_start], device=device)
                 )
-                
-                if layer_idx == 0:
-                    print(f"\033[1;32mDEBUG: Layer {layer_idx}, Batch {b}: Created pages {list(zip(b_starts, b_ends))}\033[0m")
-                
+
                 new_frontiers[b] = current_start
                 has_updates = True
 
         if has_updates:
             # Update raw_seq_start in RawCache
             raw_cache.raw_seq_start[layer_idx] = new_frontiers
-            
+
             # Rebuild CoverView
             self.cover_view[layer_idx].update_cover_view(layer_idx, raw_cache, summary_cache)
-            
+
             # Compress and trim buffer
             self.attn_buffer[layer_idx].compress_and_trim(all_new_pages, new_frontiers)
-            if layer_idx == 0:
-                self.print_stats(layer_idx)
             return True
             
         return False
@@ -1105,291 +1149,179 @@ class LukaKVController:
         sliding_window: Optional[int] = None,
         threshold: float = 0.2,
     ):
-        """Run attention against raw cache (cover-view refinement TBD).
-
-        For now this executes exact attention over the raw KV cache. Once the
-        cover view and summary cache are wired, this method should dispatch to
-        cover-aware attention and optional refinement.
+        """Run attention over cover view (summaries + raw tail) with optional refinement.
 
         Args:
-            layer_idx: int
-                Transformer layer index.
-            query_states: torch.Tensor
-                [B, H_q, L_q, D] query projections for this layer.
-            scaling: float
-                Attention scaling factor (typically 1/sqrt(D)).
-            num_kv_groups: int
-                H_q // H_k; used to expand KV heads for grouped-query attention.
-            attention_mask: Optional[torch.Tensor]
-                [B, 1, L_q, T_raw] causal + padding mask aligned to raw indices.
-            sliding_window: Optional[int]
-                If using sliding window attention; retained for parity with upstream API.
-            threshold: float
-                Placeholder for future refinement logic. If <0, we force exact
-                raw attention; if >=0 we still run exact attention until cover
-                view is implemented.
+            layer_idx: Transformer layer index.
+            query_states: [B, H_q, L_q, D] query projections.
+            scaling: Attention scaling factor (1/sqrt(D)).
+            num_kv_groups: H_q // H_k for grouped-query attention.
+            attention_mask: [B, 1, L_q, T_raw] causal + padding mask.
+            sliding_window: Unused, kept for API compatibility.
+            threshold: Refinement threshold. If <0, use exact raw attention.
+                       If >=0, refine summaries with attn_prob > threshold.
 
         Returns:
-            attn_output: torch.Tensor
-                [B, H_q, L_q, D] attended values.
-            attn_probs: torch.Tensor
-                [B, H_q, L_q, T_raw] attention probabilities over raw tokens.
+            attn_output: [B, L_q, H_q, D] attended values.
+            attn_probs: [B, H_q, L_q, T_cover] attention probabilities.
         """
-        # Exact path: when threshold < 0, skip approximation and run full raw attention.
+        # Exact path: skip cover view and run full raw attention
         if threshold is not None and threshold < 0:
             k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
             if k_raw is None or v_raw is None:
                 raise ValueError(f"No raw cache available for layer {layer_idx}.")
 
-            # Expand KV heads for grouped-query attention
-            k_full = repeat_kv(k_raw, num_kv_groups)  # [B, H_q, T_raw, D]
+            k_full = repeat_kv(k_raw, num_kv_groups)
             v_full = repeat_kv(v_raw, num_kv_groups)
 
-            attn_weights = torch.matmul(query_states, k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_raw]
+            attn_weights = torch.matmul(query_states, k_full.transpose(2, 3)) * scaling
             if attention_mask is not None:
-                causal_mask = attention_mask[:, :, :, : k_full.shape[-2]]
-                attn_weights = attn_weights + causal_mask
+                attn_weights = attn_weights + attention_mask[:, :, :, :k_full.shape[-2]]
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            # ----------------------------------------------------------------------
-            # Step 4: Output
-            # ----------------------------------------------------------------------
-            # Push to buffer for segmentation
-            # attn_probs: [B, H_q, L_q, T_raw]
-            # In raw path, all tokens are raw (not summary), and cover_indices are just sequential positions
+
+            # Push to buffer for segmentation (all tokens are raw in this path)
             B_raw, T_raw = k_raw.shape[0], k_raw.shape[2]
             cover_indices_raw = torch.arange(T_raw, device=k_raw.device).unsqueeze(0).expand(B_raw, -1)
             cover_is_summary_raw = torch.zeros(B_raw, T_raw, device=k_raw.device, dtype=torch.long)
             self.attn_buffer[layer_idx].push(attn_weights, cover_indices_raw, cover_is_summary_raw)
 
             attn_output = torch.matmul(attn_weights, v_full)
-            attn_output = attn_output.transpose(1, 2).contiguous()
+            return attn_output.transpose(1, 2).contiguous(), attn_weights
 
-            return attn_output, attn_weights
-
-        # ----------------------------------------------------------------------
-        # Step 1: Get Cover
-        # ----------------------------------------------------------------------
-        # Retrieve the cover view for this layer.
-        # We assume these are populated by `try_new_pages` / `update`.
+        # Get cover view
         cover_view = self.cover_view[layer_idx]
-        cover_k = cover_view.cover_keys          # [B, H_k, T_cover, D]
-        cover_v = cover_view.cover_values        # [B, H_k, T_cover, D]
-        cover_indices = cover_view.cover_indices # [B, T_cover]
-        cover_is_summary = cover_view.cover_is_summary # [B, T_cover]
+        cover_k = cover_view.cover_keys
+        cover_v = cover_view.cover_values
+        cover_indices = cover_view.cover_indices
+        cover_is_summary = cover_view.cover_is_summary
 
         if cover_k is None or cover_v is None:
-            raise ValueError(f"Cover keys or values are None for layer {layer_idx} - was it initialized correctly?")
+            raise ValueError(f"Cover view not initialized for layer {layer_idx}.")
 
         B, H_k, T_cover, D = cover_k.shape
         L_q = query_states.shape[2]
-        
-        # Expand KV heads for grouped-query attention
-        cover_k_full = repeat_kv(cover_k, num_kv_groups) # [B, H_q, T_cover, D]
-        cover_v_full = repeat_kv(cover_v, num_kv_groups) # [B, H_q, T_cover, D]
 
-        # ----------------------------------------------------------------------
-        # Step 2: Attention on Cover
-        # ----------------------------------------------------------------------
-        # Map cover positions back to raw indices for masking and refinement
-        page_ends = self.summary_cache[layer_idx].page_end       # [B_cache, P_max]
-        
-        # if layer_idx == 0:
-        #     num_summary = (cover_is_summary == 1).sum().item()
-        #     num_raw = (cover_is_summary == 0).sum().item()
-        #     print(f"[Layer {layer_idx}] Cover stats: Summary={num_summary}, Raw={num_raw}", flush=True)
-        #     if num_summary > 0:
-        #          print(f"  First 10 cover indices: {cover_indices[0].tolist()}", flush=True)
-        #          print(f"  First 10 is_summary: {cover_is_summary[0].tolist()}", flush=True)
+        cover_k_full = repeat_kv(cover_k, num_kv_groups)
+        cover_v_full = repeat_kv(cover_v, num_kv_groups)
 
-        # Ensure page_ends matches batch size B
+        # Map summary positions to raw indices (using page_end) for mask lookup
+        page_ends = self.summary_cache[layer_idx].page_end
         if page_ends.shape[0] < B:
             pad_b = B - page_ends.shape[0]
             zeros = torch.zeros(pad_b, page_ends.shape[1], device=page_ends.device, dtype=page_ends.dtype)
             page_ends = torch.cat([page_ends, zeros], dim=0)
 
-        summary_mask = (cover_is_summary == 1)                   # [B, T_cover]
-        cover_raw_indices = cover_indices                        # [B, T_cover]
+        summary_mask = (cover_is_summary == 1)
+        cover_raw_indices = cover_indices.clone()
         if summary_mask.any():
-            clamped_summary_idx = cover_indices.clamp(min=0, max=page_ends.shape[1] - 1)
-            summary_raw_pos = page_ends.gather(1, clamped_summary_idx)  # [B, T_cover]
+            clamped_idx = cover_indices.clamp(min=0, max=page_ends.shape[1] - 1)
+            summary_raw_pos = page_ends.gather(1, clamped_idx)
             cover_raw_indices = torch.where(summary_mask, summary_raw_pos, cover_indices)
 
-        # Attention over the cover
-        attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_cover]
+        # Compute attention logits
+        attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling
+
+        # Optionally add log(N) bias for summaries: makes exp(q·k_s + log(N)) ≈ sum_i exp(q·k_i)
+        # Note: This assumes k_summary ≈ log-mean-exp of raw keys. MeanCompressor uses arithmetic
+        # mean, so this bias may hurt more than help. Disable with use_log_bias=False.
+        if self.use_log_bias and summary_mask.any():
+            page_start = self.summary_cache[layer_idx].page_start
+            page_end_cache = self.summary_cache[layer_idx].page_end
+            if page_start.shape[0] < B:
+                pad_b = B - page_start.shape[0]
+                page_start = torch.cat([page_start, torch.zeros(pad_b, page_start.shape[1], device=page_start.device, dtype=page_start.dtype)], dim=0)
+                page_end_cache = torch.cat([page_end_cache, torch.zeros(pad_b, page_end_cache.shape[1], device=page_end_cache.device, dtype=page_end_cache.dtype)], dim=0)
+
+            page_lengths = (page_end_cache - page_start + 1).float()
+            page_idx = cover_indices.clamp(min=0, max=page_lengths.shape[1] - 1)
+            token_lengths = page_lengths.gather(1, page_idx)
+            log_bias = torch.where(summary_mask, token_lengths.clamp(min=1).log(), torch.zeros_like(token_lengths))
+            attn_logits = attn_logits + log_bias[:, None, None, :].to(attn_logits.dtype)
+
+        # Apply causal/padding mask
         mask_value = torch.finfo(attn_logits.dtype).min
-        
         if attention_mask is not None:
-            # Gather the precomputed causal/sliding mask for the chosen cover positions
-            # attention_mask: [B, 1, L_q, T_raw]
-            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0)
+            # Clamp to valid mask bounds (attention_mask may not include newly added tokens)
+            max_mask_idx = attention_mask.shape[3] - 1
+            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0, max=max_mask_idx)
             idx_expanded = cover_raw_indices_clamped[:, None, None, :].expand(-1, 1, L_q, -1)
             cover_mask = attention_mask.gather(3, idx_expanded)
-            
-            # Mask out padding (where cover_indices was -1)
-            # cover_mask = cover_mask.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value) # Moved outside
             attn_logits = attn_logits + cover_mask
 
-        # Always mask out invalid cover indices (e.g. right-padding in cover view)
+        # Mask invalid positions (padding in cover view)
         attn_logits = attn_logits.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value)
 
-        # NOTE: Removed log-sum-exp replacement logic.
-        # Previously, this code replaced summary logits with raw-key-based scores.
-        # Now we use the compressed keys directly for attention, so that refinement
-        # decisions depend on compressor quality.
-
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        # ----------------------------------------------------------------------
-        # Step 4: Output
-        # ----------------------------------------------------------------------
         attn_output = torch.matmul(attn_probs, cover_v_full)
 
-        # ----------------------------------------------------------------------
-        # Step 3: Refinement
-        # ----------------------------------------------------------------------
-        # Optional refinement: descend into pages whose summary tokens dominate attention.
-        
+        # Refinement: descend into pages where attention exceeds threshold
         if threshold is not None and threshold >= 0:
-            # Identify candidates
-            # summary_mask: [B, T_cover]
-            summary_mask = (cover_is_summary == 1)
-            # refine_mask: [B, H_q, L_q, T_cover]
             refine_mask = (attn_probs > threshold) & summary_mask.view(B, 1, 1, T_cover)
-            
-            # Update stats
-            # M: total summaries seen in this attention pass (across all heads/queries)
-            # We count each head/query attending to a summary as an instance.
-            # summary_mask has shape [B, T_cover].
-            # We want B * H_q * L_q * (num_summaries_in_batch)
-            # But summary_mask varies per batch.
-            # M = summary_mask.sum().item() * H_q * L_q?
-            # Yes, if we sum over batch.
+
+            # Track stats
             num_summaries = summary_mask.sum().item()
-            M = num_summaries * query_states.shape[1] * query_states.shape[2]
-            
-            # N: total refinements triggered
-            N = refine_mask.sum().item()
-            
-            self.attn_buffer[layer_idx].total_summaries_seen += M
-            self.attn_buffer[layer_idx].total_refinements_made += N
-            
-            # We only care if *any* head/query wants to refine a specific summary token.
-            refine_positions = refine_mask.any(dim=(1, 2)) # [B, T_cover]
+            self.attn_buffer[layer_idx].total_summaries_seen += num_summaries * query_states.shape[1] * query_states.shape[2]
+            self.attn_buffer[layer_idx].total_refinements_made += refine_mask.sum().item()
+
+            refine_positions = refine_mask.any(dim=(1, 2))  # [B, T_cover]
 
             if refine_positions.any():
-                # Get metadata
                 summary_cache = self.summary_cache[layer_idx]
-                page_start = summary_cache.page_start # [B, max_pages]
-                page_end = summary_cache.page_end     # [B, max_pages]
-                
-                # Ensure matches batch size B
+                page_start = summary_cache.page_start
+                page_end = summary_cache.page_end
                 if page_start.shape[0] < B:
                     pad_b = B - page_start.shape[0]
                     zeros = torch.zeros(pad_b, page_start.shape[1], device=page_start.device, dtype=page_start.dtype)
                     page_start = torch.cat([page_start, zeros], dim=0)
                     page_end = torch.cat([page_end, zeros], dim=0)
 
-                # Get raw KV
                 k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
-                
-                # Indices of summary tokens to refine
                 b_idx, pos_idx = refine_positions.nonzero(as_tuple=True)
-                
-                # Map to page indices
-                # cover_indices[b, pos] gives the page index p
-                page_ids = cover_indices[b_idx, pos_idx] # [N]
-                
-                # Get raw start/end
-                starts = page_start[b_idx, page_ids] # [N]
-                ends = page_end[b_idx, page_ids]     # [N]
-                lengths = ends - starts + 1          # [N]
-                
-                # Filter invalid (just in case)
+                page_ids = cover_indices[b_idx, pos_idx]
+                starts = page_start[b_idx, page_ids]
+                ends = page_end[b_idx, page_ids]
+                lengths = ends - starts + 1
+
                 valid = (page_ids >= 0) & (ends >= starts)
                 if valid.any():
-                    b_idx = b_idx[valid]
-                    pos_idx = pos_idx[valid]
-                    starts = starts[valid]
-                    lengths = lengths[valid]
-                    
-                    # Group by length for batching
-                    unique_lengths = lengths.unique()
-                    for L in unique_lengths.tolist():
-                        L = int(L)
-                        bucket_mask = (lengths == L)
-                        
-                        b_bucket = b_idx[bucket_mask]     # [M]
-                        pos_bucket = pos_idx[bucket_mask] # [M]
-                        start_bucket = starts[bucket_mask]# [M]
-                        
-                        # Construct raw indices: [M, L]
-                        arange = torch.arange(L, device=query_states.device)
-                        raw_idx = start_bucket.unsqueeze(1) + arange.unsqueeze(0)
-                        
-                        # Gather raw KV: [M, H_k, L, D]
-                        # k_raw: [B, H_k, T_raw, D]
-                        # We need to select batch rows b_bucket, then gather along T_raw
-                        k_batch = k_raw[b_bucket] # [M, H_k, T_raw, D]
-                        v_batch = v_raw[b_bucket]
-                        
-                        # Expand raw_idx for gather: [M, H_k, L, D]
-                        gather_idx = raw_idx.view(raw_idx.shape[0], 1, L, 1).expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
-                        k_slice = torch.gather(k_batch, 2, gather_idx)
-                        v_slice = torch.gather(v_batch, 2, gather_idx)
-                        
-                        # Expand for GQA
-                        k_slice = repeat_kv(k_slice, num_kv_groups) # [M, H_q, L, D]
-                        v_slice = repeat_kv(v_slice, num_kv_groups)
-                        
-                        # Get queries: [M, H_q, L_q, D]
+                    b_idx, pos_idx = b_idx[valid], pos_idx[valid]
+                    starts, lengths = starts[valid], lengths[valid]
+
+                    # Process each unique page length as a batch
+                    for page_len in lengths.unique().tolist():
+                        page_len = int(page_len)
+                        bucket_mask = (lengths == page_len)
+                        b_bucket = b_idx[bucket_mask]
+                        pos_bucket = pos_idx[bucket_mask]
+                        start_bucket = starts[bucket_mask]
+
+                        # Gather raw KV for this page
+                        raw_idx = start_bucket.unsqueeze(1) + torch.arange(page_len, device=query_states.device)
+                        gather_idx = raw_idx.view(-1, 1, page_len, 1).expand(-1, k_raw.shape[1], -1, k_raw.shape[3])
+                        k_slice = repeat_kv(torch.gather(k_raw[b_bucket], 2, gather_idx), num_kv_groups)
+                        v_slice = repeat_kv(torch.gather(v_raw[b_bucket], 2, gather_idx), num_kv_groups)
+
+                        # Compute refined attention over raw tokens
                         q_bucket = query_states[b_bucket]
-                        
-                        # Attention
-                        raw_logits = torch.matmul(q_bucket, k_slice.transpose(2, 3)) * scaling # [M, H_q, L_q, L]
-                        
+                        raw_logits = torch.matmul(q_bucket, k_slice.transpose(2, 3)) * scaling
                         if attention_mask is not None:
-                            # mask: [B, 1, L_q, T_raw]
-                            mask_bucket = attention_mask[b_bucket] # [M, 1, L_q, T_raw]
-                            # gather along T_raw using raw_idx
-                            # raw_idx: [M, L] -> [M, 1, 1, L]
-                            mask_gather_idx = raw_idx.view(raw_idx.shape[0], 1, 1, L).expand(-1, 1, mask_bucket.shape[2], -1)
-                            mask_slice = torch.gather(mask_bucket, 3, mask_gather_idx)
-                            raw_logits = raw_logits + mask_slice
-                            
+                            mask_gather_idx = raw_idx.view(-1, 1, 1, page_len).expand(-1, 1, attention_mask.shape[2], -1)
+                            raw_logits = raw_logits + torch.gather(attention_mask[b_bucket], 3, mask_gather_idx)
+
                         raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                        raw_out = torch.matmul(raw_probs, v_slice) # [M, H_q, L_q, D]
-                        
-                        # Compute Delta
-                        # base_value: The value contributed by the summary token
-                        # cover_v_full: [B, H_q, T_cover, D]
-                        # We need the value at pos_bucket
-                        base_value = cover_v_full[b_bucket, :, pos_bucket, :].unsqueeze(2) # [M, H_q, 1, D]
+                        raw_out = torch.matmul(raw_probs, v_slice)
 
-                        # attn_mass: The probability mass assigned to the summary token
-                        # attn_probs: [B, H_q, L_q, T_cover]
-                        attn_mass = attn_probs[b_bucket, :, :, pos_bucket].unsqueeze(-1) # [M, H_q, L_q, 1]
-
-                        # delta = (raw_out - base_value) * attn_mass
-                        # raw_out is weighted by raw_probs (which sum to 1.0), but we need to scale by attn_mass
-                        # because we're only redistributing the attention mass that was on the summary.
-                        # Remove summary contribution: base_value * attn_mass
-                        # Add raw tokens contribution: raw_out * attn_mass
+                        # Delta = (refined - summary) * attention_mass
+                        base_value = cover_v_full[b_bucket, :, pos_bucket, :].unsqueeze(2)
+                        attn_mass = attn_probs[b_bucket, :, :, pos_bucket].unsqueeze(-1)
                         delta = (raw_out - base_value) * attn_mass
-                        
-                        # Apply only where refine_mask is true
-                        active_mask = refine_mask[b_bucket, :, :, pos_bucket].unsqueeze(-1) # [M, H_q, L_q, 1]
-                        update = delta * active_mask.to(delta.dtype)
-                        
-                        # Accumulate
-                        attn_output.index_add_(0, b_bucket, update)
 
+                        # Only apply where refine_mask was true
+                        active_mask = refine_mask[b_bucket, :, :, pos_bucket].unsqueeze(-1)
+                        attn_output.index_add_(0, b_bucket, delta * active_mask.to(delta.dtype))
 
-        # Push to buffer for segmentation
-        # attn_probs: [B, H_q, L_q, T_cover]
-        # We need to push cover_indices and cover_is_summary as well.
         self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
-
         return attn_output.transpose(1, 2).contiguous(), attn_probs
 
     def print_stats(self, layer_idx: int):
@@ -1609,3 +1541,94 @@ class LukaKVController:
                     print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}, attn_shape={(H, L_accum, T)}")
         else:
             print(f"[Layer {layer_idx}] Attention buffer: <empty>")
+
+    def get_refinement_stats(self, layer_idx: Optional[int] = None) -> dict:
+        """Get refinement statistics for one or all layers.
+
+        Args:
+            layer_idx: If provided, get stats for this layer only.
+                       If None, aggregate across all layers.
+
+        Returns:
+            dict with:
+                - num_summaries_current: Total summary positions across layers
+                - total_summaries_seen: Cumulative summary × head × query combinations
+                - total_refinements_made: Cumulative refinement count
+                - refinement_rate: Overall fraction triggering refinement
+                - total_queries_processed: Query tokens processed
+                - refinements_per_query: Average refinements per query
+                - total_pages: Total pages across all layers
+                - per_layer: (if layer_idx is None) dict of per-layer stats
+        """
+        if layer_idx is not None:
+            stats = self.attn_buffer[layer_idx].get_stats()
+            # Add page count
+            summary_cache = self.summary_cache[layer_idx]
+            if summary_cache.page_lens is not None:
+                stats["total_pages"] = int(summary_cache.page_lens.sum().item())
+            else:
+                stats["total_pages"] = 0
+            return stats
+
+        # Aggregate across all layers
+        total_summaries_seen = 0
+        total_refinements_made = 0
+        total_queries = 0
+        num_summaries_current = 0
+        total_pages = 0
+        per_layer = {}
+
+        for idx in range(self.num_layers):
+            layer_stats = self.attn_buffer[idx].get_stats()
+            if not layer_stats:
+                continue
+
+            total_summaries_seen += layer_stats.get("total_summaries_seen", 0)
+            total_refinements_made += layer_stats.get("total_refinements_made", 0)
+            total_queries += layer_stats.get("total_queries_processed", 0)
+            num_summaries_current += layer_stats.get("num_summaries_current", 0)
+
+            summary_cache = self.summary_cache[idx]
+            if summary_cache.page_lens is not None:
+                pages = int(summary_cache.page_lens.sum().item())
+                total_pages += pages
+                layer_stats["total_pages"] = pages
+
+            per_layer[idx] = layer_stats
+
+        refinement_rate = total_refinements_made / total_summaries_seen if total_summaries_seen > 0 else 0.0
+        refinements_per_query = total_refinements_made / total_queries if total_queries > 0 else 0.0
+
+        # Average across layers for more intuitive metrics
+        avg_pages = total_pages / self.num_layers if self.num_layers > 0 else 0
+        avg_summaries = num_summaries_current / self.num_layers if self.num_layers > 0 else 0
+        avg_queries = total_queries / self.num_layers if self.num_layers > 0 else 0
+
+        return {
+            "num_summaries_current": num_summaries_current,
+            "avg_summaries_per_layer": avg_summaries,
+            "total_summaries_seen": total_summaries_seen,
+            "total_refinements_made": total_refinements_made,
+            "refinement_rate": refinement_rate,
+            "total_queries_processed": total_queries,
+            "avg_queries_per_layer": avg_queries,
+            "refinements_per_query": refinements_per_query,
+            "total_pages_all_layers": total_pages,
+            "avg_pages_per_layer": avg_pages,
+            "num_layers": self.num_layers,
+            "per_layer": per_layer,
+        }
+
+    def reset_refinement_stats(self, layer_idx: Optional[int] = None):
+        """Reset refinement counters for one or all layers.
+
+        Args:
+            layer_idx: If provided, reset only this layer. Otherwise reset all.
+        """
+        if layer_idx is not None:
+            self.attn_buffer[layer_idx].total_summaries_seen = 0
+            self.attn_buffer[layer_idx].total_refinements_made = 0
+        else:
+            for idx in range(self.num_layers):
+                self.attn_buffer[idx].total_summaries_seen = 0
+                self.attn_buffer[idx].total_refinements_made = 0

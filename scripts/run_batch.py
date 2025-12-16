@@ -14,11 +14,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 use_trained_compressor = True
 
 set_luka_kv_params(
-    compressor="encoder",
-    compressor_kwargs={"checkpoint_path": "train_1/best.pt"},
-    segmenter="gaussian",
-    segmenter_kwargs={"mean": 16, "std": 4},
-    refine_threshold=0.1,
+    compressor="attention_weighted",
+    compressor_kwargs={"temperature": 1.0},
+    use_log_bias=True,
+    segmenter="dummy",
+    # segmenter_kwargs={"mean": 16, "std": 4},
+    refine_threshold=0.01,
     segment_interval=16,
 )
 
@@ -66,10 +67,19 @@ for i, (prompt, output) in enumerate(zip(prompts, outputs)):
     print(new_text)
     print("\n" + "=" * 80)
 
-# Print LuKA debug summaries after generation
-# if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
-#     controller = model.model.luka_kv_controller
-#     print("\n=== LuKA Layer Summaries ===")
-#     for layer_idx in range(controller.num_layers):
-#         print("------------------------------")
-#         controller.print_layer_summary(layer_idx)
+# Print LuKA refinement statistics
+if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
+    controller = model.model.luka_kv_controller
+    stats = controller.get_refinement_stats()
+
+    print("\n" + "=" * 60)
+    print("LuKA Refinement Statistics")
+    print("=" * 60)
+    print(f"  Layers:                   {stats['num_layers']}")
+    print(f"  Pages (per layer avg):    {stats['avg_pages_per_layer']:.1f}")
+    print(f"  Summary tokens (per layer): {stats['avg_summaries_per_layer']:.1f}")
+    print(f"  Queries processed:        {stats['avg_queries_per_layer']:.0f}")
+    print(f"  Total refinements:        {stats['total_refinements_made']}")
+    print(f"  Refinement rate:          {stats['refinement_rate']:.4f} ({stats['refinement_rate']*100:.2f}%)")
+    print(f"  Refinements per query:    {stats['refinements_per_query']:.2f}")
+    print("=" * 60 + "\n")
