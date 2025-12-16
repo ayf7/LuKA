@@ -6,11 +6,14 @@ Compare perplexity across different compressor strategies:
   4. MeanCompressor without log(N) bias
 
 Run: python experiments/perplexity/compressor_comparison.py
+     python experiments/perplexity/compressor_comparison.py --plot-only
 """
 
+import argparse
 import csv
 import time
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from transformers import AutoTokenizer
@@ -18,10 +21,84 @@ from transformers import AutoTokenizer
 from modeling.compressor import (
     AttentionWeightedCompressor,
     EncoderCompressor,
+    EvictionCompressor,
     MeanCompressor,
 )
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
+
+
+# Output paths
+OUTPUT_DIR = Path("experiments/perplexity")
+CSV_PATH = OUTPUT_DIR / "compressor_comparison.csv"
+RETENTION_CSV_PATH = OUTPUT_DIR / "compressor_retention.csv"
+PPL_PLOT_PATH = OUTPUT_DIR / "compressor_ppl_vs_threshold.png"
+PPL_LOG_PLOT_PATH = OUTPUT_DIR / "compressor_ppl_vs_threshold_log.png"
+RETENTION_PLOT_PATH = OUTPUT_DIR / "compressor_retention_vs_ppl.png"
+RETENTION_LOG_PLOT_PATH = OUTPUT_DIR / "compressor_retention_vs_ppl_log.png"
+RETENTION_LOGLOG_PLOT_PATH = OUTPUT_DIR / "compressor_retention_vs_ppl_loglog.png"
+CURVE_PLOT_PATH = OUTPUT_DIR / "compressor_pertoken_curve.png"
+
+
+# Compressor configurations
+def get_compressor_configs(include_log_bias=True):
+    """Define compressor configurations for testing."""
+    compressors = [
+        {
+            "name": "attention_weighted",
+            "label": "Attn-Weighted",
+            "compressor": AttentionWeightedCompressor(temperature=1.0),
+            "use_log_bias": False,
+            "color": "tab:blue",
+            "linestyle": "-",
+        },
+        {
+            "name": "mean",
+            "label": "Mean",
+            "compressor": MeanCompressor(),
+            "use_log_bias": False,
+            "color": "tab:orange",
+            "linestyle": "-",
+        },
+        {
+            "name": "eviction",
+            "label": "Eviction",
+            "compressor": EvictionCompressor(temperature=1.0),
+            "use_log_bias": False,
+            "color": "tab:purple",
+            "linestyle": "-",
+        },
+    ]
+
+    if include_log_bias:
+        compressors.extend([
+            {
+                "name": "attention_weighted_logbias",
+                "label": "Attn-Weighted + log(N)",
+                "compressor": AttentionWeightedCompressor(temperature=1.0),
+                "use_log_bias": True,
+                "color": "tab:blue",
+                "linestyle": ":",
+            },
+            {
+                "name": "mean_logbias",
+                "label": "Mean + log(N)",
+                "compressor": MeanCompressor(),
+                "use_log_bias": True,
+                "color": "tab:orange",
+                "linestyle": ":",
+            },
+            {
+                "name": "eviction_logbias",
+                "label": "Eviction + log(N)",
+                "compressor": EvictionCompressor(temperature=1.0),
+                "use_log_bias": True,
+                "color": "tab:purple",
+                "linestyle": ":",
+            },
+        ])
+
+    return compressors
 
 
 def generate_baseline_rollout(tokenizer, prompt: str, device: str, max_new_tokens: int = 128):
@@ -87,7 +164,16 @@ def prefill_then_decode_perplexity(model, rollout_ids: torch.Tensor, prompt_len:
     nll_list = []
     total_tokens = T - prompt_len
     start_time = time.perf_counter()
-    for t in range(prompt_len - 1, T - 1):
+
+    # First prediction: use prefill logits (no extra forward pass needed)
+    logits = pre_out.logits[:, -1, :]
+    target = rollout_ids[:, prompt_len]
+    log_probs = torch.log_softmax(logits, dim=-1)
+    nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    nll_list.append(nll)
+
+    # Subsequent predictions: feed each generated token
+    for t in range(prompt_len, T - 1):
         cur_id = rollout_ids[:, t : t + 1]
         attn_mask = torch.ones(1, t + 1, device=device, dtype=rollout_ids.dtype)
         with torch.no_grad():
@@ -133,9 +219,9 @@ def get_stats_from_model(model):
     return None, {}
 
 
-def run():
+def run_experiments(thresholds, max_new_tokens, include_log_bias=True):
+    """Run all compressor experiments and return records."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    thresholds = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
 
     paragraph = load_prompt("paragraphs_1")
     if isinstance(paragraph, list):
@@ -146,63 +232,39 @@ def run():
 
     # Generate baseline rollout
     print("Generating baseline rollout...")
-    rollout_ids, _ = generate_baseline_rollout(tokenizer, paragraph, device)
+    rollout_ids, _ = generate_baseline_rollout(tokenizer, paragraph, device, max_new_tokens)
     rollout_ids = rollout_ids.to(device)
     prompt_len = tokenizer(paragraph, return_tensors="pt")["input_ids"].size(1)
     print(f"Baseline rollout: {rollout_ids.shape[1]} tokens, prompt_len={prompt_len}")
 
-    # Check for trained encoder checkpoint
-    # Try multiple possible paths
-    checkpoint_paths = [
-        Path("train_1/step_1000.pt"),
-        Path("artifacts/compressor_checkpoints/layer_0_step_1000.pt"),
-    ]
-    checkpoint_path = None
-    for cp in checkpoint_paths:
-        if cp.exists():
-            checkpoint_path = cp
-            break
-    has_trained_encoder = checkpoint_path is not None
+    # Evaluate baseline perplexity (raw attention, no compression)
+    print("\nEvaluating baseline (raw attention)...")
+    set_luka_kv_params(
+        default_tail_len=16,
+        min_compress_chunk=16,
+        max_pages=15,
+        refine_threshold=-1,  # Raw attention path
+        compressor="mean",
+        segmenter="dummy",
+        create_pages_in_generation=False,
+        production_mode=True,
+    )
+    baseline_model = load_luka_model(
+        "Qwen/Qwen3-1.7B-Base",
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
+    ).to(device)
+    baseline_model.eval()
+    with torch.no_grad():
+        baseline_ppl, baseline_curve, baseline_tps = prefill_then_decode_perplexity(
+            baseline_model, rollout_ids, prompt_len
+        )
+    del baseline_model
+    torch.cuda.empty_cache()
+    print(f"Baseline perplexity: {baseline_ppl:.3f}, tps={baseline_tps:.1f}")
 
-    # Define compressor configurations
-    compressors = [
-        {
-            "name": "attention_weighted",
-            "label": "Attn-Weighted (no bias)",
-            "compressor": AttentionWeightedCompressor(temperature=1.0),
-            "use_log_bias": False,
-        },
-        {
-            "name": "attention_weighted_bias",
-            "label": "Attn-Weighted (log N bias)",
-            "compressor": AttentionWeightedCompressor(temperature=1.0),
-            "use_log_bias": True,
-        },
-        {
-            "name": "mean_no_bias",
-            "label": "Mean (no bias)",
-            "compressor": MeanCompressor(),
-            "use_log_bias": False,
-        },
-        {
-            "name": "mean_with_bias",
-            "label": "Mean (log N bias)",
-            "compressor": MeanCompressor(),
-            "use_log_bias": True,
-        },
-    ]
-
-    if has_trained_encoder and checkpoint_path is not None:
-        compressors.append({
-            "name": "trained_encoder",
-            "label": "Trained Encoder",
-            "compressor": EncoderCompressor(checkpoint_path=str(checkpoint_path)),
-            "use_log_bias": False,
-        })
-        print(f"Found trained encoder checkpoint at {checkpoint_path}")
-    else:
-        print(f"No trained encoder checkpoint found in {checkpoint_paths}, skipping.")
-
+    # Get compressor configurations
+    compressors = get_compressor_configs(include_log_bias=include_log_bias)
     records = {cfg["name"]: [] for cfg in compressors}
 
     for cfg in compressors:
@@ -220,7 +282,7 @@ def run():
                 use_log_bias=cfg["use_log_bias"],
                 segmenter="dummy",
                 segment_interval=16,
-                create_pages_in_generation=True,  # Explicitly enable page creation during decode
+                create_pages_in_generation=True,
             )
 
             model = load_luka_model(
@@ -253,99 +315,19 @@ def run():
             del model
             torch.cuda.empty_cache()
 
-    # Print summary table
-    print("\n" + "=" * 80)
-    print("Summary")
-    print("=" * 80)
-    for cfg in compressors:
-        print(f"\n{cfg['label']}:")
-        for r in records[cfg["name"]]:
-            frac_str = f"{r['summary_frac']:.3f}" if r["summary_frac"] else "n/a"
-            print(f"  thr={r['threshold']:>4}: ppl={r['perplexity']:.3f}, "
-                  f"summary_frac={frac_str}, tps={r['tokens_per_sec']:.1f}")
+    # Add baseline info to records
+    baseline_info = {
+        "ppl": baseline_ppl,
+        "curve": baseline_curve,
+        "tps": baseline_tps,
+    }
 
-    # Plot: Perplexity vs Threshold
-    plt.figure(figsize=(8, 5))
-    for cfg in compressors:
-        recs = records[cfg["name"]]
-        xs = [r["threshold"] for r in recs]
-        ys = [r["perplexity"] for r in recs]
-        plt.plot(xs, ys, marker="o", label=cfg["label"])
-    plt.xlabel("Refine Threshold")
-    plt.ylabel("Perplexity (tail)")
-    plt.title("Perplexity vs Refine Threshold by Compressor")
-    plt.xscale("log")
-    plt.legend()
-    plt.tight_layout()
-    out_path = "experiments/perplexity/compressor_ppl_vs_threshold.png"
-    plt.savefig(out_path, dpi=150)
-    print(f"\nSaved plot to {out_path}")
+    return records, compressors, baseline_info
 
-    # Plot: Perplexity vs Threshold (log y)
-    plt.figure(figsize=(8, 5))
-    for cfg in compressors:
-        recs = records[cfg["name"]]
-        xs = [r["threshold"] for r in recs]
-        ys = [r["perplexity"] for r in recs]
-        plt.plot(xs, ys, marker="o", label=cfg["label"])
-    plt.xlabel("Refine Threshold")
-    plt.ylabel("Perplexity (log scale)")
-    plt.title("Perplexity vs Refine Threshold by Compressor (log y)")
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.legend()
-    plt.tight_layout()
-    out_log_path = "experiments/perplexity/compressor_ppl_vs_threshold_log.png"
-    plt.savefig(out_log_path, dpi=150)
-    print(f"Saved log plot to {out_log_path}")
 
-    # Plot: Summary Retention vs Perplexity
-    plt.figure(figsize=(8, 5))
-    for cfg in compressors:
-        recs = records[cfg["name"]]
-        xs = [r["summary_frac"] if r["summary_frac"] else 0.0 for r in recs]
-        ys = [r["perplexity"] for r in recs]
-        plt.plot(xs, ys, marker="o", label=cfg["label"])
-        for x, y, r in zip(xs, ys, recs):
-            plt.annotate(f"{r['threshold']}", (x, y), textcoords="offset points",
-                        xytext=(3, 3), fontsize=6)
-    plt.xlabel("Summary Retention (1 - refinement_rate)")
-    plt.ylabel("Perplexity (tail)")
-    plt.title("Perplexity vs Summary Retention by Compressor")
-    plt.legend()
-    plt.tight_layout()
-    retention_path = "experiments/perplexity/compressor_retention_vs_ppl.png"
-    plt.savefig(retention_path, dpi=150)
-    print(f"Saved retention plot to {retention_path}")
-
-    # Plot: Per-token perplexity curves (for threshold=0.05)
-    plt.figure(figsize=(10, 6))
-    for cfg in compressors:
-        recs = records[cfg["name"]]
-        # Find threshold=0.05 or closest
-        target_rec = None
-        for r in recs:
-            if abs(r["threshold"] - 0.05) < 0.01:
-                target_rec = r
-                break
-        if target_rec is None:
-            target_rec = recs[len(recs) // 2]
-
-        curve = target_rec["curve"]
-        token_axis = list(range(1, len(curve) + 1))
-        plt.plot(token_axis, curve, label=f"{cfg['label']} (thr={target_rec['threshold']})")
-
-    plt.xlabel("Token Position")
-    plt.ylabel("Cumulative Perplexity")
-    plt.title("Per-token Perplexity Curve by Compressor (threshold~0.05)")
-    plt.legend()
-    plt.tight_layout()
-    curve_path = "experiments/perplexity/compressor_pertoken_curve.png"
-    plt.savefig(curve_path, dpi=150)
-    print(f"Saved per-token curve to {curve_path}")
-
-    # CSV output
-    csv_path = "experiments/perplexity/compressor_comparison.csv"
+def save_csvs(records, compressors, baseline_info):
+    """Save experiment data to CSV files."""
+    # Full CSV with per-token curves
     first_curve_len = len(records[compressors[0]["name"]][0]["curve"]) if records else 0
     token_cols = [f"token_{i}_ppl" for i in range(1, first_curve_len + 1)]
     fieldnames = [
@@ -353,7 +335,7 @@ def run():
         "tokens_per_sec", "pages", "refinement_rate"
     ] + token_cols
 
-    with open(csv_path, "w", newline="") as f:
+    with open(CSV_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for cfg in compressors:
@@ -370,8 +352,280 @@ def run():
                 for i, val in enumerate(r["curve"], start=1):
                     row[f"token_{i}_ppl"] = val
                 writer.writerow(row)
-    print(f"Saved CSV to {csv_path}")
+    print(f"Saved CSV to {CSV_PATH}")
+
+    # Retention CSV (simpler, just key metrics)
+    retention_fieldnames = ["compressor", "threshold", "perplexity", "summary_frac", "refinement_rate"]
+    with open(RETENTION_CSV_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=retention_fieldnames)
+        writer.writeheader()
+        # Add baseline row
+        writer.writerow({
+            "compressor": "baseline",
+            "threshold": "n/a",
+            "perplexity": baseline_info["ppl"],
+            "summary_frac": "n/a",
+            "refinement_rate": "n/a",
+        })
+        for cfg in compressors:
+            for r in records[cfg["name"]]:
+                writer.writerow({
+                    "compressor": cfg["name"],
+                    "threshold": r["threshold"],
+                    "perplexity": r["perplexity"],
+                    "summary_frac": r["summary_frac"] if r["summary_frac"] else "n/a",
+                    "refinement_rate": r["refinement_rate"],
+                })
+    print(f"Saved retention CSV to {RETENTION_CSV_PATH}")
+
+
+def load_csvs(include_log_bias=True):
+    """Load experiment data from CSV files."""
+    if not CSV_PATH.exists():
+        raise FileNotFoundError(f"CSV not found: {CSV_PATH}. Run without --plot-only first.")
+
+    records = {}
+    compressor_meta = {}  # Store metadata for each compressor
+
+    with open(CSV_PATH, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = row["compressor"]
+
+            # Skip log bias variants if not included
+            if not include_log_bias and "logbias" in name:
+                continue
+
+            if name not in records:
+                records[name] = []
+                # Infer config from name
+                compressor_meta[name] = {
+                    "name": name,
+                    "label": name.replace("_", " ").title().replace("Logbias", "+ log(N)"),
+                    "color": "tab:blue" if "attention" in name else ("tab:orange" if "mean" in name else "tab:purple"),
+                    "linestyle": ":" if "logbias" in name else "-",
+                }
+
+            # Parse curve columns
+            curve = []
+            for key in row:
+                if key.startswith("token_") and key.endswith("_ppl"):
+                    curve.append(float(row[key]))
+
+            summary_frac = None if row["summary_frac"] == "n/a" else float(row["summary_frac"])
+
+            records[name].append({
+                "threshold": float(row["threshold"]),
+                "perplexity": float(row["perplexity"]),
+                "summary_frac": summary_frac,
+                "tokens_per_sec": float(row["tokens_per_sec"]),
+                "curve": curve,
+                "pages": float(row["pages"]),
+                "refinement_rate": float(row["refinement_rate"]),
+            })
+
+    # Build compressors list from metadata
+    compressors = list(compressor_meta.values())
+
+    # Load baseline from retention CSV if available
+    baseline_info = {"ppl": None, "curve": None, "tps": None}
+    if RETENTION_CSV_PATH.exists():
+        with open(RETENTION_CSV_PATH, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["compressor"] == "baseline":
+                    baseline_info["ppl"] = float(row["perplexity"])
+                    break
+
+    return records, compressors, baseline_info
+
+
+def generate_plots(records, compressors, baseline_info):
+    """Generate all plots from records."""
+    # Plot: Perplexity vs Threshold
+    plt.figure(figsize=(10, 6))
+    if baseline_info["ppl"]:
+        plt.axhline(y=baseline_info["ppl"], color="black", linestyle="--", linewidth=1.5, label="Baseline (raw)")
+    for cfg in compressors:
+        recs = records[cfg["name"]]
+        xs = [r["threshold"] for r in recs]
+        ys = [r["perplexity"] for r in recs]
+        plt.plot(xs, ys, marker="o", label=cfg["label"],
+                 color=cfg["color"], linestyle=cfg["linestyle"], linewidth=2)
+    plt.xlabel("Refine Threshold")
+    plt.ylabel("Perplexity (tail)")
+    plt.title("Perplexity vs Refine Threshold by Compressor")
+    plt.xscale("log")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(PPL_PLOT_PATH, dpi=150)
+    print(f"Saved plot to {PPL_PLOT_PATH}")
+
+    # Plot: Perplexity vs Threshold (log y)
+    plt.figure(figsize=(10, 6))
+    if baseline_info["ppl"]:
+        plt.axhline(y=baseline_info["ppl"], color="black", linestyle="--", linewidth=1.5, label="Baseline (raw)")
+    for cfg in compressors:
+        recs = records[cfg["name"]]
+        xs = [r["threshold"] for r in recs]
+        ys = [r["perplexity"] for r in recs]
+        plt.plot(xs, ys, marker="o", label=cfg["label"],
+                 color=cfg["color"], linestyle=cfg["linestyle"], linewidth=2)
+    plt.xlabel("Refine Threshold")
+    plt.ylabel("Perplexity (log scale)")
+    plt.title("Perplexity vs Refine Threshold by Compressor (log y)")
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(PPL_LOG_PLOT_PATH, dpi=150)
+    print(f"Saved log plot to {PPL_LOG_PLOT_PATH}")
+
+    # Plot: Summary Retention vs Perplexity
+    plt.figure(figsize=(10, 6))
+    if baseline_info["ppl"]:
+        plt.axhline(y=baseline_info["ppl"], color="black", linestyle="--", linewidth=1.5, label="Baseline (raw)")
+    for cfg in compressors:
+        recs = records[cfg["name"]]
+        xs = [r["summary_frac"] if r["summary_frac"] else 0.0 for r in recs]
+        ys = [r["perplexity"] for r in recs]
+        plt.plot(xs, ys, marker="o", label=cfg["label"],
+                 color=cfg["color"], linestyle=cfg["linestyle"], linewidth=2)
+        for x, y, r in zip(xs, ys, recs):
+            plt.annotate(f"{r['threshold']}", (x, y), textcoords="offset points",
+                        xytext=(3, 3), fontsize=6)
+    plt.xlabel("Summary Retention (1 - refinement_rate)")
+    plt.ylabel("Perplexity (tail)")
+    plt.title("Perplexity vs Summary Retention by Compressor")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(RETENTION_PLOT_PATH, dpi=150)
+    print(f"Saved retention plot to {RETENTION_PLOT_PATH}")
+
+    # Plot: Summary Retention vs Perplexity (log scale)
+    plt.figure(figsize=(10, 6))
+    if baseline_info["ppl"]:
+        plt.axhline(y=baseline_info["ppl"], color="black", linestyle="--", linewidth=1.5, label="Baseline (raw)")
+    for cfg in compressors:
+        recs = records[cfg["name"]]
+        xs = [r["summary_frac"] if r["summary_frac"] else 0.0 for r in recs]
+        ys = [r["perplexity"] for r in recs]
+        plt.plot(xs, ys, marker="o", label=cfg["label"],
+                 color=cfg["color"], linestyle=cfg["linestyle"], linewidth=2)
+        for x, y, r in zip(xs, ys, recs):
+            plt.annotate(f"{r['threshold']}", (x, y), textcoords="offset points",
+                        xytext=(3, 3), fontsize=6)
+    plt.xlabel("Summary Retention (1 - refinement_rate)")
+    plt.ylabel("Perplexity (log scale)")
+    plt.title("Perplexity vs Summary Retention by Compressor (log y)")
+    plt.yscale("log")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(RETENTION_LOG_PLOT_PATH, dpi=150)
+    print(f"Saved retention log plot to {RETENTION_LOG_PLOT_PATH}")
+
+    # Plot: Summary Retention vs Perplexity (log(log(y)) scale)
+    plt.figure(figsize=(10, 6))
+    if baseline_info["ppl"] and baseline_info["ppl"] > 1:
+        baseline_loglog = np.log(np.log(baseline_info["ppl"]))
+        plt.axhline(y=baseline_loglog, color="black", linestyle="--", linewidth=1.5, label="Baseline (raw)")
+    for cfg in compressors:
+        recs = records[cfg["name"]]
+        xs = [r["summary_frac"] if r["summary_frac"] else 0.0 for r in recs]
+        # Transform y to log(log(y)), filtering out values <= 1
+        ys_raw = [r["perplexity"] for r in recs]
+        ys = [np.log(np.log(y)) if y > 1 else np.nan for y in ys_raw]
+        plt.plot(xs, ys, marker="o", label=cfg["label"],
+                 color=cfg["color"], linestyle=cfg["linestyle"], linewidth=2)
+        for x, y, r in zip(xs, ys, recs):
+            if not np.isnan(y):
+                plt.annotate(f"{r['threshold']}", (x, y), textcoords="offset points",
+                            xytext=(3, 3), fontsize=6)
+    plt.xlabel("Summary Retention")
+    plt.ylabel("log(log(Perplexity))")
+    plt.title("log(log(Perplexity)) vs Summary Retention by Compressor")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(RETENTION_LOGLOG_PLOT_PATH, dpi=150)
+    print(f"Saved retention log-log plot to {RETENTION_LOGLOG_PLOT_PATH}")
+
+    # Plot: Per-token perplexity curves (for threshold~0.05 or middle threshold)
+    plt.figure(figsize=(12, 6))
+    for cfg in compressors:
+        recs = records[cfg["name"]]
+        # Find threshold=0.05 or closest
+        target_rec = None
+        for r in recs:
+            if abs(r["threshold"] - 0.05) < 0.01:
+                target_rec = r
+                break
+        if target_rec is None:
+            target_rec = recs[len(recs) // 2]
+
+        curve = target_rec["curve"]
+        if curve:
+            token_axis = list(range(1, len(curve) + 1))
+            plt.plot(token_axis, curve, label=f"{cfg['label']} (thr={target_rec['threshold']})",
+                     color=cfg["color"], linestyle=cfg["linestyle"], linewidth=1.5)
+
+    plt.xlabel("Token Position")
+    plt.ylabel("Cumulative Perplexity")
+    plt.title("Per-token Perplexity Curve by Compressor (threshold~0.05)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(CURVE_PLOT_PATH, dpi=150)
+    print(f"Saved per-token curve to {CURVE_PLOT_PATH}")
+
+
+def print_summary(records, compressors, baseline_info):
+    """Print summary table."""
+    print("\n" + "=" * 80)
+    print("Summary")
+    print("=" * 80)
+    if baseline_info["ppl"]:
+        print(f"\nBaseline (raw attention): ppl={baseline_info['ppl']:.3f}")
+    for cfg in compressors:
+        print(f"\n{cfg['label']}:")
+        for r in records[cfg["name"]]:
+            frac_str = f"{r['summary_frac']:.3f}" if r["summary_frac"] else "n/a"
+            print(f"  thr={r['threshold']:>6}: ppl={r['perplexity']:.3f}, "
+                  f"summary_frac={frac_str}, tps={r['tokens_per_sec']:.1f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare compressor perplexity")
+    parser.add_argument("--thresholds", type=str, default="0,1e-6,1e-4,1e-3,1e-2,1e-1,1",
+                        help="Comma-separated thresholds to test")
+    parser.add_argument("--max-tokens", type=int, default=128,
+                        help="Max new tokens to generate for rollout")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Only generate plots from existing CSVs")
+    parser.add_argument("--no-log-bias", action="store_true",
+                        help="Exclude log(N) bias variants")
+    args = parser.parse_args()
+
+    thresholds = [float(t) for t in args.thresholds.split(",")]
+    include_log_bias = not args.no_log_bias
+
+    if args.plot_only:
+        print("Loading data from CSVs...")
+        records, compressors, baseline_info = load_csvs(include_log_bias=include_log_bias)
+        print_summary(records, compressors, baseline_info)
+        generate_plots(records, compressors, baseline_info)
+    else:
+        records, compressors, baseline_info = run_experiments(
+            thresholds, args.max_tokens, include_log_bias
+        )
+        print_summary(records, compressors, baseline_info)
+        save_csvs(records, compressors, baseline_info)
+        generate_plots(records, compressors, baseline_info)
 
 
 if __name__ == "__main__":
-    run()
+    main()

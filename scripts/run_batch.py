@@ -11,17 +11,52 @@ from artifacts.prompts.prompt_loader import load_prompt
 # Configuration
 model_name = "Qwen/Qwen3-1.7B-Base"
 device = "cuda" if torch.cuda.is_available() else "cpu"
-use_trained_compressor = True
 
+# Option 1: Attention-Weighted Compressor (Recommended)
+# Uses accumulated attention history to weight tokens. Best quality.
 set_luka_kv_params(
     compressor="attention_weighted",
-    compressor_kwargs={"temperature": 1.0},
-    use_log_bias=True,
+    compressor_kwargs={"temperature": 1.0},  # Lower = sharper weighting
+    use_log_bias=True,  # Not needed for attention-weighted
     segmenter="dummy",
-    # segmenter_kwargs={"mean": 16, "std": 4},
     refine_threshold=0.01,
     segment_interval=16,
 )
+
+# Option 2: Mean Compressor (Baseline)
+# Simple averaging. Fast but dilutes important tokens.
+# set_luka_kv_params(
+#     compressor="mean",
+#     use_log_bias=True,  # log(N) bias doesn't help with arithmetic mean
+#     segmenter="dummy",
+#     refine_threshold=0.01,  # May need higher threshold due to worse summaries
+#     segment_interval=16,
+# )
+
+# # Option 3: Trained Encoder Compressor
+# # Load a trained compressor checkpoint for learned compression.
+# from modeling.compressor import EncoderCompressor
+# trained_compressor = EncoderCompressor(
+#     checkpoint_path="train_1/step_1000.pt"
+# )
+# set_luka_kv_params(
+#     compressor=trained_compressor,
+#     use_log_bias=False,
+#     segmenter="dummy",
+#     refine_threshold=0.05,
+#     segment_interval=16,
+# )
+
+# # Option 4: Attention-Weighted with Sharp Temperature
+# # More aggressive weighting toward highest-attention tokens.
+# set_luka_kv_params(
+#     compressor="attention_weighted",
+#     compressor_kwargs={"temperature": 0.5},  # Sharper = more weight on top token
+#     use_log_bias=False,
+#     segmenter="dummy",
+#     refine_threshold=0.01,
+#     segment_interval=16,
+# )
 
 # Load model and tokenizer
 model = load_luka_model(

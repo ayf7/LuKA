@@ -10,6 +10,7 @@ from transformers import AutoTokenizer
 from modeling.compressor import (
     AttentionWeightedCompressor,
     EncoderCompressor,
+    EvictionCompressor,
     MeanCompressor,
 )
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
@@ -49,7 +50,7 @@ def find_encoder_checkpoint():
     return None
 
 
-def get_compressor_configs(include_trained_encoder: bool = True):
+def get_compressor_configs(include_trained_encoder: bool = True, include_log_bias: bool = True):
     """
     Get list of compressor configurations to test.
 
@@ -70,7 +71,39 @@ def get_compressor_configs(include_trained_encoder: bool = True):
             "use_log_bias": False,
             "color": "tab:orange",
         },
+        {
+            "name": "eviction",
+            "label": "Eviction (attn-K, zero-V)",
+            "compressor": EvictionCompressor(temperature=1.0),
+            "use_log_bias": False,
+            "color": "tab:purple",
+        },
     ]
+
+    if include_log_bias:
+        compressors.extend([
+            {
+                "name": "attn_weighted_logbias",
+                "label": "Attn-Weighted + log(N)",
+                "compressor": AttentionWeightedCompressor(temperature=1.0),
+                "use_log_bias": True,
+                "color": "tab:cyan",
+            },
+            {
+                "name": "mean_logbias",
+                "label": "Mean + log(N)",
+                "compressor": MeanCompressor(),
+                "use_log_bias": True,
+                "color": "tab:red",
+            },
+            {
+                "name": "eviction_logbias",
+                "label": "Eviction + log(N)",
+                "compressor": EvictionCompressor(temperature=1.0),
+                "use_log_bias": True,
+                "color": "tab:pink",
+            },
+        ])
 
     if include_trained_encoder:
         checkpoint_path = find_encoder_checkpoint()
@@ -82,6 +115,7 @@ def get_compressor_configs(include_trained_encoder: bool = True):
                 "use_log_bias": False,
                 "color": "tab:green",
             })
+            # Note: log(N) bias is catastrophic with trained encoder, not included
             print(f"Found trained encoder at {checkpoint_path}")
         else:
             print("No trained encoder checkpoint found, skipping.")

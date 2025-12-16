@@ -160,15 +160,17 @@ def run(
     plt.savefig(out_path, dpi=150)
     print(f"Saved speed plot to {out_path}")
 
-    # Plot 4: Pareto frontier - Perplexity vs Speed
+    # Plot 4: Pareto frontier - Perplexity vs Speed (Attn-Weighted only)
     plt.figure(figsize=(10, 6))
     plt.scatter([base_tps], [base_ppl], color="black", s=150, marker="*", label="Baseline", zorder=5)
 
-    for cfg in compressors:
-        recs = results[cfg["name"]]
+    # Only plot attention-weighted compressor
+    attn_cfg = next((cfg for cfg in compressors if cfg["name"] == "attn_weighted"), None)
+    if attn_cfg:
+        recs = results[attn_cfg["name"]]
         xs = [r["tokens_per_sec"] for r in recs]
         ys = [r["perplexity"] for r in recs]
-        plt.scatter(xs, ys, label=cfg["label"], color=cfg["color"], s=60)
+        plt.scatter(xs, ys, label=attn_cfg["label"], color=attn_cfg["color"], s=60)
 
         # Annotate with threshold values
         for r in recs:
@@ -177,7 +179,7 @@ def run(
 
     plt.xlabel("Tokens per Second")
     plt.ylabel("Perplexity")
-    plt.title("Perplexity vs Speed (Pareto frontier)")
+    plt.title("Perplexity vs Speed (Attn-Weighted)")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

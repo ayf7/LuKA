@@ -1765,123 +1765,104 @@ class LukaKVController:
                     b_idx, pos_idx = b_idx[valid], pos_idx[valid]
                     starts, lengths = starts[valid], lengths[valid]
 
-                    # === Corrected refinement with proper normalizer ===
+                    # === Corrected refinement with proper normalizer (batched) ===
                     # When we refine summaries, the softmax normalizer changes:
                     # Z_full = Z_cover - sum(exp(logit_s)) + sum(Z_page_s)
                     # All attention must be rescaled by Z_cover / Z_full
                     #
-                    # For numerical stability, we work with ratios instead of absolute values:
-                    # - attn_s = exp(logit_s - logsumexp_cover) = attention to summary
-                    # - ratio_page = exp(logsumexp_page - logsumexp_cover) = Z_page / Z_cover
-                    # - scale = 1 / (1 - sum(attn_s) + sum(ratio_page)) = Z_cover / Z_full
-                    #
-                    # We do two passes:
-                    # 1. Compute raw attention for each page and accumulate statistics
-                    # 2. Apply the global scale and per-summary deltas
+                    # Final output formula:
+                    # output = scale * (cover_output - sum(attn_s * v_summary) + sum(ratio_page * raw_out))
+                    # where scale = 1 / (1 - sum(attn_s) + sum(ratio_page))
 
-                    # Accumulators for computing scale per (b, h, l)
-                    # sum_attn_s: sum of attention to refined summaries
-                    # sum_ratio_page: sum of Z_page / Z_cover for refined pages
-                    sum_attn_s = torch.zeros(B, H_q, L_q, device=query_states.device, dtype=torch.float32)
-                    sum_ratio_page = torch.zeros(B, H_q, L_q, device=query_states.device, dtype=torch.float32)
+                    N_refine = b_idx.shape[0]
+                    max_page_len = lengths.max().item()
 
-                    # Store refinement data for second pass
-                    # Each entry: (b_bucket, pos_bucket, raw_out, attn_s, v_summary, ratio_page, active_mask)
-                    refinement_data = []
+                    # Gather raw KV for all refined pages (padded to max_page_len)
+                    # Build indices: [N_refine, max_page_len]
+                    page_offsets = torch.arange(max_page_len, device=query_states.device).unsqueeze(0)  # [1, max_page_len]
+                    raw_idx = starts.unsqueeze(1) + page_offsets  # [N_refine, max_page_len]
+                    # Clamp to valid range (padding will be masked out)
+                    raw_idx = raw_idx.clamp(max=k_raw.shape[2] - 1)
 
-                    # First pass: compute raw attention and gather statistics
-                    for page_len in lengths.unique().tolist():
-                        page_len = int(page_len)
-                        bucket_mask = (lengths == page_len)
-                        b_bucket = b_idx[bucket_mask]
-                        pos_bucket = pos_idx[bucket_mask]
-                        start_bucket = starts[bucket_mask]
+                    # Create padding mask: True where valid, False where padded
+                    valid_mask = page_offsets < lengths.unsqueeze(1)  # [N_refine, max_page_len]
 
-                        # Gather raw KV for this page
-                        raw_idx = start_bucket.unsqueeze(1) + torch.arange(page_len, device=query_states.device)
-                        gather_idx = raw_idx.view(-1, 1, page_len, 1).expand(-1, k_raw.shape[1], -1, k_raw.shape[3])
-                        k_slice = repeat_kv(torch.gather(k_raw[b_bucket], 2, gather_idx), num_kv_groups)
-                        v_slice = repeat_kv(torch.gather(v_raw[b_bucket], 2, gather_idx), num_kv_groups)
+                    # Gather K/V: [N_refine, H_k, max_page_len, D]
+                    gather_idx = raw_idx.view(N_refine, 1, max_page_len, 1).expand(-1, k_raw.shape[1], -1, k_raw.shape[3])
+                    k_slice = repeat_kv(torch.gather(k_raw[b_idx], 2, gather_idx), num_kv_groups)
+                    v_slice = repeat_kv(torch.gather(v_raw[b_idx], 2, gather_idx), num_kv_groups)
 
-                        # Compute refined attention over raw tokens
-                        q_bucket = query_states[b_bucket]
-                        raw_logits = torch.matmul(q_bucket, k_slice.transpose(2, 3)) * scaling
-                        if attention_mask is not None:
-                            mask_gather_idx = raw_idx.view(-1, 1, 1, page_len).expand(-1, 1, attention_mask.shape[2], -1)
-                            raw_logits = raw_logits + torch.gather(attention_mask[b_bucket], 3, mask_gather_idx)
+                    # Compute raw attention logits: [N_refine, H_q, L_q, max_page_len]
+                    q_refine = query_states[b_idx]  # [N_refine, H_q, L_q, D]
+                    raw_logits = torch.matmul(q_refine, k_slice.transpose(2, 3)) * scaling
 
-                        # Compute logsumexp for page (Z_page in log space)
-                        logsumexp_page = torch.logsumexp(raw_logits.float(), dim=-1)  # [N_bucket, H_q, L_q]
+                    # Apply attention mask if present
+                    if attention_mask is not None:
+                        mask_gather_idx = raw_idx.view(N_refine, 1, 1, max_page_len).expand(-1, 1, attention_mask.shape[2], -1)
+                        raw_logits = raw_logits + torch.gather(attention_mask[b_idx], 3, mask_gather_idx)
 
-                        raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                        raw_out = torch.matmul(raw_probs, v_slice)  # [N_bucket, H_q, L_q, D]
+                    # Mask out padded positions before softmax
+                    mask_value = torch.finfo(raw_logits.dtype).min
+                    raw_logits = raw_logits.masked_fill(~valid_mask[:, None, None, :], mask_value)
 
-                        # Get value for each summary being refined
-                        v_summary = cover_v_full[b_bucket, :, pos_bucket, :]  # [N_bucket, H_q, D]
+                    # Compute logsumexp for page (Z_page in log space)
+                    logsumexp_page = torch.logsumexp(raw_logits.float(), dim=-1)  # [N_refine, H_q, L_q]
 
-                        # Active mask: which (bucket, head, query) combos are actually refined
-                        active = refine_mask[b_bucket, :, :, pos_bucket].float()  # [N_bucket, H_q, L_q]
+                    # Softmax and weighted sum
+                    raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                    raw_out = torch.matmul(raw_probs, v_slice)  # [N_refine, H_q, L_q, D]
 
-                        # attn_s: attention to summary - already computed in attn_probs (numerically stable)
-                        attn_s = attn_probs[b_bucket, :, :, pos_bucket].float()  # [N_bucket, H_q, L_q]
+                    # Get values for summaries being refined
+                    v_summary = cover_v_full[b_idx, :, pos_idx, :]  # [N_refine, H_q, D]
 
-                        # ratio_page = Z_page / Z_cover = exp(logsumexp_page - logsumexp_cover)
-                        # This is stable since we're subtracting in log space before exp
-                        logsumexp_cover_bucket = logsumexp_cover[b_bucket]  # [N_bucket, H_q, L_q]
-                        log_ratio = (logsumexp_page - logsumexp_cover_bucket).clamp(min=-80, max=80)
-                        ratio_page = torch.exp(log_ratio)  # [N_bucket, H_q, L_q]
+                    # Active mask: which (refine_idx, head, query) combos are actually refined
+                    active = refine_mask[b_idx, :, :, pos_idx].float()  # [N_refine, H_q, L_q]
 
-                        # Accumulate statistics
-                        # Use scatter_add to accumulate across potentially repeated batch indices
+                    # Skip if no active refinements (can happen due to per-head thresholding)
+                    if not active.any():
+                        pass  # No refinements to apply
+                    else:
+                        # attn_s: attention to summary
+                        attn_s = attn_probs[b_idx, :, :, pos_idx].float()  # [N_refine, H_q, L_q]
+
+                        # ratio_page = Z_page / Z_cover
+                        # Clamp to avoid overflow in subsequent operations
+                        logsumexp_cover_refine = logsumexp_cover[b_idx]  # [N_refine, H_q, L_q]
+                        log_ratio = (logsumexp_page - logsumexp_cover_refine).clamp(min=-80, max=80)
+                        ratio_page = torch.exp(log_ratio)  # [N_refine, H_q, L_q]
+
+                        # Apply active mask BEFORE any multiplication to avoid inf * 0 = nan
                         attn_s_active = attn_s * active
                         ratio_page_active = ratio_page * active
 
-                        # Expand b_bucket for broadcasting: [N_bucket] -> [N_bucket, H_q, L_q]
-                        b_expanded = b_bucket.view(-1, 1, 1).expand(-1, H_q, L_q)
-                        sum_attn_s.scatter_add_(0, b_expanded, attn_s_active)
-                        sum_ratio_page.scatter_add_(0, b_expanded, ratio_page_active)
+                        # Accumulate statistics using scatter_add
+                        b_expanded_3d = b_idx.view(-1, 1, 1).expand(-1, H_q, L_q)
+                        b_expanded_4d = b_idx.view(-1, 1, 1, 1).expand(-1, H_q, L_q, D)
 
-                        # Store for second pass
-                        refinement_data.append((b_bucket, pos_bucket, raw_out, attn_s, v_summary, ratio_page, active))
+                        sum_attn_s = torch.zeros(B, H_q, L_q, device=query_states.device, dtype=torch.float32)
+                        sum_ratio_page = torch.zeros(B, H_q, L_q, device=query_states.device, dtype=torch.float32)
+                        sum_attn_s.scatter_add_(0, b_expanded_3d, attn_s_active)
+                        sum_ratio_page.scatter_add_(0, b_expanded_3d, ratio_page_active)
 
-                    # Scale factor: Z_cover / Z_full = 1 / (1 - sum_attn_s + sum_ratio_page)
-                    # When no refinements, sum_attn_s = sum_ratio_page = 0, so scale = 1
-                    denom = 1.0 - sum_attn_s + sum_ratio_page
-                    scale = (1.0 / denom.clamp(min=1e-8)).to(attn_output.dtype)  # [B, H_q, L_q]
+                        # Accumulate weighted outputs
+                        sum_ratio_raw = torch.zeros(B, H_q, L_q, D, device=query_states.device, dtype=torch.float32)
+                        sum_attn_v = torch.zeros(B, H_q, L_q, D, device=query_states.device, dtype=torch.float32)
+                        ratio_raw = (ratio_page_active.unsqueeze(-1) * raw_out).float()
+                        attn_v = (attn_s_active.unsqueeze(-1) * v_summary.unsqueeze(2)).float()
+                        sum_ratio_raw.scatter_add_(0, b_expanded_4d, ratio_raw)
+                        sum_attn_v.scatter_add_(0, b_expanded_4d, attn_v)
 
-                    # Scale entire output
-                    attn_output = attn_output * scale.unsqueeze(-1)
+                        # Compute scale factor: Z_cover / Z_full = 1 / (1 - sum_attn_s + sum_ratio_page)
+                        # IMPORTANT: Keep all computation in float32 to avoid overflow/underflow
+                        # when ratio_page is huge (Mean compressor case). The huge values cancel
+                        # out mathematically: scale ≈ 1/ratio_page, adjustment ≈ ratio_page * raw_out
+                        # so scale * adjustment ≈ raw_out. But float16 conversion causes inf * 0 = nan.
+                        denom = 1.0 - sum_attn_s + sum_ratio_page
+                        scale = 1.0 / denom.clamp(min=1e-8)  # [B, H_q, L_q], stays float32
 
-                    # Second pass: apply per-summary deltas
-                    # After scaling, summary contribution is scale * attn_s * v_summary
-                    # We want to replace with (ratio_page * scale) * raw_out
-                    # Delta = (ratio_page * scale) * raw_out - (scale * attn_s) * v_summary
-                    for b_bucket, pos_bucket, raw_out, attn_s, v_summary, ratio_page, active in refinement_data:
-                        # Skip if no active refinements in this bucket
-                        if not active.any():
-                            continue
-
-                        # Get scale for this bucket
-                        scale_bucket = scale[b_bucket]  # [N_bucket, H_q, L_q]
-
-                        # Apply active mask early to avoid overflow in inactive positions
-                        # (ratio_page can be huge for inactive positions where we don't refine)
-                        active_f = active.to(scale_bucket.dtype)
-
-                        # Contribution from raw tokens: (ratio_page * scale) * raw_out
-                        # Mask ratio_page to avoid overflow: inactive positions don't contribute
-                        raw_weight = (ratio_page * active_f * scale_bucket).to(raw_out.dtype)  # [N_bucket, H_q, L_q]
-                        raw_contribution = raw_weight.unsqueeze(-1) * raw_out  # [N_bucket, H_q, L_q, D]
-
-                        # Scaled summary contribution: (scale * attn_s) * v_summary
-                        # Also mask to match (attn_s is already small for inactive, but be consistent)
-                        summary_weight = (scale_bucket * attn_s * active_f).to(v_summary.dtype)  # [N_bucket, H_q, L_q]
-                        summary_contribution = summary_weight.unsqueeze(-1) * v_summary.unsqueeze(2)  # [N_bucket, H_q, L_q, D]
-
-                        # Delta = new - old (already masked, no need for active_mask multiply)
-                        delta = raw_contribution - summary_contribution
-
-                        attn_output.scatter_add_(0, b_bucket.view(-1, 1, 1, 1).expand_as(delta), delta)
+                        # Final output: scale * (cover_output - sum_attn_v + sum_ratio_raw)
+                        adjustment = sum_ratio_raw - sum_attn_v  # stays float32
+                        attn_output = (scale.unsqueeze(-1) * (attn_output.float() + adjustment)).to(attn_output.dtype)
 
         self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
         return attn_output.transpose(1, 2).contiguous(), attn_probs

@@ -22,7 +22,7 @@ from experiments.perplexity.utils import (
 )
 
 
-def run(threshold: float = 0.05, max_new_tokens: int = 1024, prompt_name: str = "paragraphs_1"):
+def run(threshold: float = 0.05, max_new_tokens: int = 1024, prompt_name: str = "paragraphs_1", include_log_bias: bool = True):
     device = get_device()
     tokenizer = get_tokenizer()
     prompt = get_prompt(prompt_name)
@@ -40,7 +40,7 @@ def run(threshold: float = 0.05, max_new_tokens: int = 1024, prompt_name: str = 
     print(f"Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
 
     # Get compressor configs
-    compressors = get_compressor_configs(include_trained_encoder=True)
+    compressors = get_compressor_configs(include_trained_encoder=True, include_log_bias=include_log_bias)
 
     # Run each compressor at the fixed threshold
     results = {}
@@ -132,6 +132,8 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.05, help="Refine threshold")
     parser.add_argument("--max-tokens", type=int, default=256, help="Max new tokens to generate")
     parser.add_argument("--prompt", type=str, default="paragraphs_1", help="Prompt name")
+    parser.add_argument("--log-bias", action="store_true", default=True, help="Include log(N) bias variants")
+    parser.add_argument("--no-log-bias", dest="log_bias", action="store_false", help="Exclude log(N) bias variants")
     args = parser.parse_args()
 
-    run(threshold=args.threshold, max_new_tokens=args.max_tokens, prompt_name=args.prompt)
+    run(threshold=args.threshold, max_new_tokens=args.max_tokens, prompt_name=args.prompt, include_log_bias=args.log_bias)
