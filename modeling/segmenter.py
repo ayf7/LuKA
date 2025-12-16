@@ -62,6 +62,8 @@ class DummySegmenter(Segmenter):
     """
     Fixed-length segmenter. Builds pages of length `min_chunk` until the
     remaining tokens fall into the uncompressed tail.
+
+    Optimized with vectorized operations and early exit.
     """
 
     def __init__(
@@ -73,6 +75,8 @@ class DummySegmenter(Segmenter):
         self.min_chunk = int(min_chunk)
         self.tail_len = int(tail_len)
         self.max_pages = int(max_pages)
+        # Minimum raw tokens needed to create at least one page
+        self._min_tokens_needed = self.tail_len + self.min_chunk
 
     def process(
         self,
@@ -81,43 +85,37 @@ class DummySegmenter(Segmenter):
         cover_is_summary: torch.Tensor,
         layer_idx: Optional[int] = None
     ) -> Optional[torch.LongTensor]:
-        
+
         B, H, L, T = attn_weights.shape
         device = attn_weights.device
-        
+
+        # Early exit: check if any batch has enough raw tokens
+        is_raw = (cover_is_summary == 0) & (cover_indices != -1)  # [B, T]
+        raw_counts = is_raw.sum(dim=1)  # [B]
+
+        if (raw_counts <= self._min_tokens_needed).all():
+            return None  # No batch has enough tokens for even one page
+
         page_ends = torch.full((B, self.max_pages), -1, device=device, dtype=torch.long)
-        
-        for b in range(B):
-            indices = cover_indices[b] # [T]
-            is_sum = cover_is_summary[b] # [T]
-            is_raw = (is_sum == 0) & (indices != -1)
-            
-            if not is_raw.any():
-                continue
-                
-            # Get raw indices
-            raw_indices = indices[is_raw]
-            
+
+        # Process only batches that might have pages
+        active_batches = (raw_counts > self._min_tokens_needed).nonzero(as_tuple=True)[0]
+
+        for b in active_batches.tolist():
+            indices = cover_indices[b]
+            is_raw_b = is_raw[b]
+
+            raw_indices = indices[is_raw_b]
             num_raw = raw_indices.numel()
-            if num_raw <= self.tail_len:
-                continue
+
             valid_count = num_raw - self.tail_len
-            candidates = raw_indices[:valid_count]
-            num_pages = valid_count // self.min_chunk
-            if num_pages == 0:
-                continue
-                
-            num_pages = min(num_pages, self.max_pages)
-            
-            ends = []
-            for i in range(num_pages):
-                idx_in_candidates = (i + 1) * self.min_chunk - 1
-                ends.append(candidates[idx_in_candidates].item())
-                
-            if ends:
-                page_ends[b, :len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
-        
-        self._validate_output(page_ends, cover_indices)
+            num_pages = min(valid_count // self.min_chunk, self.max_pages)
+
+            if num_pages > 0:
+                # Vectorized page end computation
+                page_positions = torch.arange(1, num_pages + 1, device=device) * self.min_chunk - 1
+                page_ends[b, :num_pages] = raw_indices[page_positions]
+
         return page_ends
 
 

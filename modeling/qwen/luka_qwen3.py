@@ -49,6 +49,7 @@ def set_luka_kv_params(
     create_pages_in_generation: bool = True,
     use_log_bias: bool = False,
     print_stats_after_generate: bool = False,
+    production_mode: bool = True,
     compressor: object = "mean",
     compressor_kwargs: dict | None = None,
     segmenter: object = "dummy",
@@ -71,6 +72,8 @@ def set_luka_kv_params(
         _kv_params_override["use_log_bias"] = bool(use_log_bias)
     if print_stats_after_generate is not None:
         _kv_params_override["print_stats_after_generate"] = bool(print_stats_after_generate)
+    if production_mode is not None:
+        _kv_params_override["production_mode"] = bool(production_mode)
 
     if compressor is not None:
         if isinstance(compressor, str):
@@ -212,10 +215,10 @@ class LukaQwenAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         
-        # Verify invariants
-        if self.luka_kv is not None:
+        # Verify invariants (only in debug mode)
+        if self.luka_kv is not None and not self.luka_kv.production_mode:
             self.luka_kv.verify_invariants(self.layer_idx)
-            
+
         return attn_output, attn_weights
 
 
@@ -240,6 +243,8 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
             self.luka_kv_controller.create_pages_in_generation = _kv_params_override["create_pages_in_generation"]
         if "use_log_bias" in _kv_params_override:
             self.luka_kv_controller.use_log_bias = _kv_params_override["use_log_bias"]
+        if "production_mode" in _kv_params_override:
+            self.luka_kv_controller.production_mode = _kv_params_override["production_mode"]
 
         for layer in self.layers:
             if hasattr(layer, "self_attn"):

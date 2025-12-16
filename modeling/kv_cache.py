@@ -380,20 +380,30 @@ class SummaryCache:
 
 class CoverView:
 
+    # Default capacity growth settings
+    INITIAL_EXTRA_CAPACITY = 128  # Extra slots to pre-allocate beyond initial size
+    GROWTH_FACTOR = 1.5           # Multiply capacity by this when expanding
+
     def __init__(self):
         """Hybrid view combining summary pages with trailing raw tokens.
 
         The cover view is what top-down attention should run against:
         [ summaries (paged region) ] + [ raw tail ]. It is left indexed to make
         incremental decoding updates cheap when no new pages are formed.
+
+        Uses pre-allocated buffers with capacity tracking for efficient updates
+        during decoding (avoids repeated torch.cat allocations).
         """
-        self.cover_keys = None      # [B, H, max(L_num_pages + L_raw_tokens), D]
-        self.cover_values = None    # [B, H, max(L_num_pages + L_raw_tokens), D]
+        self.cover_keys = None      # [B, H, _capacity, D] pre-allocated buffer
+        self.cover_values = None    # [B, H, _capacity, D] pre-allocated buffer
         self.seq_start = None       # [B] left-padding offset, mirrors raw cache
         self.raw_seq_start = None   # [B] first raw token index within the cover
         # Metadata to map cover positions back to sources
-        self.cover_indices = None   # [B, max(L_num_pages + L_raw_tokens)] raw index or summary idx
-        self.cover_is_summary = None # [B, max(L_num_pages + L_raw_tokens)] 1 if summary, else 0
+        self.cover_indices = None   # [B, _capacity] raw index or summary idx
+        self.cover_is_summary = None # [B, _capacity] 1 if summary, else 0
+        # Capacity tracking for pre-allocation optimization
+        self._capacity = 0          # Total allocated slots in dim 2
+        self._length = 0            # Actually used slots in dim 2
     
     def initialize(self,
         layer_idx: int,
@@ -411,28 +421,75 @@ class CoverView:
         if k_raw is None:
             raise ValueError("CoverView.initialize called before RawCache.update.")
 
-        # Share references initially for efficiency
-        self.cover_keys = k_raw
-        self.cover_values = v_raw
-        self.seq_start = seq_start
-        self.raw_seq_start = raw_seq_start
-        
         B, H, T_raw, D = k_raw.shape
         device = k_raw.device
-        
+        dtype = k_raw.dtype
+
+        # Pre-allocate with extra capacity for future tokens
+        self._length = T_raw
+        self._capacity = T_raw + self.INITIAL_EXTRA_CAPACITY
+
+        # Allocate buffers with extra capacity
+        self.cover_keys = torch.zeros(B, H, self._capacity, D, device=device, dtype=dtype)
+        self.cover_values = torch.zeros(B, H, self._capacity, D, device=device, dtype=dtype)
+        self.cover_indices = torch.full((B, self._capacity), -1, device=device, dtype=torch.long)
+        self.cover_is_summary = torch.zeros(B, self._capacity, dtype=torch.long, device=device)
+
+        # Copy initial data
+        self.cover_keys[:, :, :T_raw, :] = k_raw
+        self.cover_values[:, :, :T_raw, :] = v_raw
+
+        self.seq_start = seq_start
+        self.raw_seq_start = raw_seq_start
+
         # Initialize indices: all raw
         # cover_indices[b, t] = t (absolute raw index)
-        self.cover_indices = torch.arange(T_raw, device=device).unsqueeze(0).expand(B, -1).clone()
-        
+        indices = torch.arange(T_raw, device=device).unsqueeze(0).expand(B, -1)
+        self.cover_indices[:, :T_raw] = indices
+
         # Mask padding with -1
         if seq_start is not None:
             # seq_start: [B]
             # Create mask: t < seq_start[b]
-            t_indices = torch.arange(T_raw, device=device).unsqueeze(0) # [1, T]
-            is_pad = t_indices < seq_start.unsqueeze(1) # [B, T]
-            self.cover_indices[is_pad] = -1
+            t_indices = torch.arange(T_raw, device=device).unsqueeze(0)  # [1, T]
+            is_pad = t_indices < seq_start.unsqueeze(1)  # [B, T]
+            self.cover_indices[:, :T_raw][is_pad] = -1
 
-        self.cover_is_summary = torch.zeros(B, T_raw, dtype=torch.long, device=device)
+    def _ensure_capacity(self, needed: int):
+        """Expand buffer capacity if needed.
+
+        Args:
+            needed: int
+                Minimum required capacity.
+        """
+        if needed <= self._capacity:
+            return
+
+        # Calculate new capacity with growth factor
+        new_capacity = max(needed, int(self._capacity * self.GROWTH_FACTOR))
+
+        B, H, _, D = self.cover_keys.shape
+        device = self.cover_keys.device
+        dtype = self.cover_keys.dtype
+
+        # Allocate new buffers
+        new_keys = torch.zeros(B, H, new_capacity, D, device=device, dtype=dtype)
+        new_values = torch.zeros(B, H, new_capacity, D, device=device, dtype=dtype)
+        new_indices = torch.full((B, new_capacity), -1, device=device, dtype=torch.long)
+        new_is_summary = torch.zeros(B, new_capacity, dtype=torch.long, device=device)
+
+        # Copy existing data
+        new_keys[:, :, :self._length, :] = self.cover_keys[:, :, :self._length, :]
+        new_values[:, :, :self._length, :] = self.cover_values[:, :, :self._length, :]
+        new_indices[:, :self._length] = self.cover_indices[:, :self._length]
+        new_is_summary[:, :self._length] = self.cover_is_summary[:, :self._length]
+
+        # Replace buffers
+        self.cover_keys = new_keys
+        self.cover_values = new_values
+        self.cover_indices = new_indices
+        self.cover_is_summary = new_is_summary
+        self._capacity = new_capacity
 
     def update(self,
         keys: torch.Tensor,
@@ -440,6 +497,9 @@ class CoverView:
         indices: torch.Tensor
     ):
         """Append raw tokens into the cover view during decoding.
+
+        Uses pre-allocated buffers with in-place assignment for efficiency.
+        Only expands capacity when the buffer is full.
 
         Args:
             keys: torch.Tensor
@@ -450,32 +510,27 @@ class CoverView:
                 [B, L_new] raw indices for the new tokens.
 
         Returns:
-            None; should mutate `cover_keys/cover_values` by concatenating the
-            raw tail and adjust `raw_seq_start` as the frontier advances.
+            None; mutates cover_keys/cover_values in-place when possible.
         """
         if self.cover_keys is None:
-            # Should have been initialized.
             raise ValueError("CoverView.update called before initialize()")
 
-        # Invariants:
-        # 1. Keys and Values must match shape [B, H, L_new, D]
-        # 2. Indices must match the length of new tokens L_new
-        assert keys.shape == values.shape, f"Invariant Violation: Keys/Values shape mismatch: {keys.shape} vs {values.shape}"
-        assert indices.shape[1] == keys.shape[2], f"Invariant Violation: Indices length {indices.shape[1]} != keys length {keys.shape[2]}"
-
-
-        # Append
-        self.cover_keys = torch.cat([self.cover_keys, keys], dim=2)
-        self.cover_values = torch.cat([self.cover_values, values], dim=2)
-        
         B, H, L_new, D = keys.shape
-        
-        # Update metadata
-        new_is_summary = torch.zeros(B, L_new, dtype=torch.long, device=keys.device)
-        self.cover_is_summary = torch.cat([self.cover_is_summary, new_is_summary], dim=1)
-        
-        # Update indices
-        self.cover_indices = torch.cat([self.cover_indices, indices], dim=1)
+
+        # Ensure we have enough capacity
+        needed = self._length + L_new
+        if needed > self._capacity:
+            self._ensure_capacity(needed)
+
+        # In-place assignment (fast path - no allocation)
+        start = self._length
+        end = start + L_new
+        self.cover_keys[:, :, start:end, :] = keys
+        self.cover_values[:, :, start:end, :] = values
+        self.cover_indices[:, start:end] = indices
+        # cover_is_summary stays 0 (already initialized to zeros)
+
+        self._length = end
 
 
     def update_cover_view(self,
@@ -575,15 +630,17 @@ class CoverView:
             batched_idx.append(torch.cat([idx_s, idx_r], dim=0))
             batched_is_sum.append(torch.cat([is_sum_s, is_sum_r], dim=0))
             
-        # Pad and Stack
+        # Pad and Stack with extra capacity for future growth
         lengths = [x.shape[1] for x in batched_k]
         max_len = max(lengths) if lengths else 0
-        
-        self.cover_keys = torch.zeros(B, H, max_len, D, device=device, dtype=k_raw.dtype)
-        self.cover_values = torch.zeros(B, H, max_len, D, device=device, dtype=v_raw.dtype)
-        self.cover_indices = torch.full((B, max_len), -1, dtype=torch.long, device=device)
-        self.cover_is_summary = torch.zeros(B, max_len, dtype=torch.long, device=device)
-        
+        self._length = max_len
+        self._capacity = max_len + self.INITIAL_EXTRA_CAPACITY
+
+        self.cover_keys = torch.zeros(B, H, self._capacity, D, device=device, dtype=k_raw.dtype)
+        self.cover_values = torch.zeros(B, H, self._capacity, D, device=device, dtype=v_raw.dtype)
+        self.cover_indices = torch.full((B, self._capacity), -1, dtype=torch.long, device=device)
+        self.cover_is_summary = torch.zeros(B, self._capacity, dtype=torch.long, device=device)
+
         for b in range(B):
             l = lengths[b]
             if l > 0:
@@ -591,18 +648,56 @@ class CoverView:
                 self.cover_values[b, :, :l, :] = batched_v[b]
                 self.cover_indices[b, :l] = batched_idx[b]
                 self.cover_is_summary[b, :l] = batched_is_sum[b]
-        
+
         # Update metadata
         self.seq_start = seq_start
         self.raw_seq_start = raw_seq_start
 
+    @property
+    def length(self) -> int:
+        """Return the valid length (excluding pre-allocated capacity)."""
+        return self._length
+
+    def get_valid_kv(self):
+        """Return only the valid (non-pre-allocated) portions of the cover view.
+
+        Returns:
+            tuple: (cover_keys, cover_values, cover_indices, cover_is_summary)
+                All sliced to [B, H, _length, D] or [B, _length] as appropriate.
+        """
+        if self.cover_keys is None:
+            return None, None, None, None
+        return (
+            self.cover_keys[:, :, :self._length, :],
+            self.cover_values[:, :, :self._length, :],
+            self.cover_indices[:, :self._length],
+            self.cover_is_summary[:, :self._length],
+        )
+
 class AttentionScoreBuffer:
 
-    refinement_counts = None # [B, T_current]
-        
+    # Pre-allocation settings
+    INITIAL_L_CAPACITY = 256   # Pre-allocate for L (query accumulation) dimension
+    INITIAL_T_EXTRA = 128      # Extra capacity for T (cover width) dimension
+    GROWTH_FACTOR = 1.5
+
+    def __init__(self):
+        """Initialize empty buffer with capacity tracking."""
+        self.attention_weights = None  # [B, H, _l_capacity, _t_capacity]
+        self.cover_indices = None
+        self.cover_is_summary = None
+        self.refinement_counts = None
+        self.total_summaries_seen = 0
+        self.total_refinements_made = 0
+        # Capacity tracking
+        self._l_length = 0      # Used length in L dimension (queries)
+        self._l_capacity = 0    # Allocated capacity in L dimension
+        self._t_length = 0      # Used length in T dimension (cover width)
+        self._t_capacity = 0    # Allocated capacity in T dimension
+
     def initialize(self, B: int, H: int, T_init: int, device: torch.device, dtype: torch.dtype):
-        """Initialize the buffer with empty state.
-        
+        """Initialize the buffer with pre-allocated capacity.
+
         Args:
             B: Batch size.
             H: Number of heads.
@@ -610,20 +705,66 @@ class AttentionScoreBuffer:
             device: Tensor device.
             dtype: Tensor dtype.
         """
-        # Start with 0 accumulated length
-        self.attention_weights = torch.zeros(B, H, 0, T_init, device=device, dtype=dtype)
-        # We don't have indices yet, or we assume they match init?
-        # We'll initialize indices to a default "raw" state matching T_init?
-        # Or just None and wait for first push?
-        # Push updates indices.
+        self._l_length = 0
+        self._l_capacity = self.INITIAL_L_CAPACITY
+        self._t_length = T_init
+        self._t_capacity = T_init + self.INITIAL_T_EXTRA
+
+        # Pre-allocate with capacity
+        self.attention_weights = torch.zeros(
+            B, H, self._l_capacity, self._t_capacity,
+            device=device, dtype=dtype
+        )
         self.cover_indices = None
         self.cover_is_summary = None
-        self.refinement_counts = torch.zeros(B, T_init, dtype=torch.long, device=device)
+        self.refinement_counts = torch.zeros(B, self._t_capacity, dtype=torch.long, device=device)
         self.total_summaries_seen = 0
         self.total_refinements_made = 0
 
+    def _ensure_l_capacity(self, needed_l: int):
+        """Expand L (query) dimension capacity if needed."""
+        if needed_l <= self._l_capacity:
+            return
+
+        new_l_cap = max(needed_l, int(self._l_capacity * self.GROWTH_FACTOR))
+        B, H, _, T_cap = self.attention_weights.shape
+
+        new_weights = torch.zeros(B, H, new_l_cap, T_cap,
+                                   device=self.attention_weights.device,
+                                   dtype=self.attention_weights.dtype)
+        new_weights[:, :, :self._l_length, :self._t_length] = \
+            self.attention_weights[:, :, :self._l_length, :self._t_length]
+
+        self.attention_weights = new_weights
+        self._l_capacity = new_l_cap
+
+    def _ensure_t_capacity(self, needed_t: int):
+        """Expand T (cover width) dimension capacity if needed."""
+        if needed_t <= self._t_capacity:
+            return
+
+        new_t_cap = max(needed_t, int(self._t_capacity * self.GROWTH_FACTOR))
+        B, H, L_cap, _ = self.attention_weights.shape
+
+        # Expand attention weights
+        new_weights = torch.zeros(B, H, L_cap, new_t_cap,
+                                   device=self.attention_weights.device,
+                                   dtype=self.attention_weights.dtype)
+        new_weights[:, :, :self._l_length, :self._t_length] = \
+            self.attention_weights[:, :, :self._l_length, :self._t_length]
+        self.attention_weights = new_weights
+
+        # Expand refinement counts
+        new_counts = torch.zeros(B, new_t_cap,
+                                  device=self.refinement_counts.device,
+                                  dtype=self.refinement_counts.dtype)
+        new_counts[:, :self._t_length] = self.refinement_counts[:, :self._t_length]
+        self.refinement_counts = new_counts
+
+        self._t_capacity = new_t_cap
+
     def push(self, attn_weights: torch.Tensor, cover_indices: torch.Tensor, cover_is_summary: torch.Tensor):
-        """Append a new attention score slice.
+        """Append a new attention score slice using pre-allocated buffers.
 
         Args:
             attn_weights: [B, H, L_new, T_new]
@@ -634,68 +775,50 @@ class AttentionScoreBuffer:
         attn_weights = attn_weights.detach()
         cover_indices = cover_indices.detach()
         cover_is_summary = cover_is_summary.detach()
-        
+
         if self.attention_weights is None:
-             raise RuntimeError("AttentionScoreBuffer not initialized. Call initialize() first.")
+            raise RuntimeError("AttentionScoreBuffer not initialized. Call initialize() first.")
 
-        # Invariant:
-        # Attention weights width (T_new) must match cover indices width (T_new)
-        # attn_weights: [B, H, L_new, T_new]
-        # cover_indices: [B, T_new]
-        assert attn_weights.shape[-1] == cover_indices.shape[-1], \
-            f"Invariant Violation: Attn weights width {attn_weights.shape[-1]} != cover indices width {cover_indices.shape[-1]}"
-
-
-        # Pad width if needed
-        B, H, L_curr, T_curr = self.attention_weights.shape
         _, _, L_new, T_new = attn_weights.shape
-        
-        if T_new > T_curr:
-            pad_w = T_new - T_curr
-            # Pad existing weights with zeros
-            padding = torch.zeros(B, H, L_curr, pad_w, device=self.attention_weights.device, dtype=self.attention_weights.dtype)
-            self.attention_weights = torch.cat([self.attention_weights, padding], dim=3)
-            
-            # Pad refinement counts
-            pad_counts = torch.zeros(B, pad_w, device=self.refinement_counts.device, dtype=self.refinement_counts.dtype)
-            self.refinement_counts = torch.cat([self.refinement_counts, pad_counts], dim=1)
-            
-        elif T_curr > T_new:
-             # Pad new weights
-             pad_w = T_curr - T_new
-             padding = torch.zeros(B, H, L_new, pad_w, device=attn_weights.device, dtype=attn_weights.dtype)
-             attn_weights = torch.cat([attn_weights, padding], dim=3)
-             
-        # Concatenate along L (dim 2)
-        self.attention_weights = torch.cat([self.attention_weights, attn_weights], dim=2)
-        
+
+        # Ensure capacity in both dimensions
+        needed_l = self._l_length + L_new
+        if needed_l > self._l_capacity:
+            self._ensure_l_capacity(needed_l)
+
+        if T_new > self._t_capacity:
+            self._ensure_t_capacity(T_new)
+
+        # In-place assignment for L dimension (fast path)
+        l_start = self._l_length
+        l_end = l_start + L_new
+
+        # Handle T dimension: new data may be wider or narrower than current
+        t_write = min(T_new, self._t_capacity)
+        self.attention_weights[:, :, l_start:l_end, :t_write] = attn_weights[:, :, :, :t_write]
+
+        self._l_length = l_end
+        self._t_length = max(self._t_length, T_new)
+
         # Update indices (keep latest)
         self.cover_indices = cover_indices
         self.cover_is_summary = cover_is_summary
-        
-        # Update refinement counts?
-        # We assume T_new matches current cover.
-        # If T_new > T_curr (new tokens added), refinement counts for new tokens start at 0.
-        # This is handled by padding above.
-        
-        if self.refinement_counts is None or self.refinement_counts.shape[1] < T_new:
-             # This should be handled by padding logic above if T_new > T_curr
-             pass
 
     def get_data(self):
-        return self.attention_weights, self.cover_indices, self.cover_is_summary
+        """Return valid (non-pre-allocated) portion of the buffer."""
+        if self.attention_weights is None:
+            return None, None, None
+        valid_weights = self.attention_weights[:, :, :self._l_length, :self._t_length]
+        return valid_weights, self.cover_indices, self.cover_is_summary
 
     def reset(self):
-        # Reset to empty state with 0 length, preserving B/H/device/dtype
-        if self.attention_weights is not None:
-             B, H, _, _ = self.attention_weights.shape
-             device = self.attention_weights.device
-             dtype = self.attention_weights.dtype
-             self.attention_weights = torch.zeros(B, H, 0, 0, device=device, dtype=dtype)
+        """Reset to empty state, keeping pre-allocated buffers."""
+        self._l_length = 0
+        # Keep _t_length as is since cover view size doesn't change on reset
         self.cover_indices = None
         self.cover_is_summary = None
         if self.refinement_counts is not None:
-             self.refinement_counts = torch.zeros_like(self.refinement_counts)
+            self.refinement_counts.zero_()
         self.total_summaries_seen = 0
         self.total_refinements_made = 0
 
@@ -706,6 +829,8 @@ class AttentionScoreBuffer:
     ):
         """Compress attention weights for new pages and trim to new frontier.
 
+        Uses pre-allocated buffers with capacity tracking.
+
         Args:
             new_pages: List of length B. new_pages[b] is a list of (start, end)
                 inclusive raw indices for newly created pages.
@@ -714,67 +839,60 @@ class AttentionScoreBuffer:
         if self.attention_weights is None:
             return
 
-        B, H, L, T = self.attention_weights.shape
+        B, H, _, _ = self.attention_weights.shape
+        L = self._l_length  # Use valid length, not capacity
+        T = self._t_length
         device = self.attention_weights.device
         dtype = self.attention_weights.dtype
-        
+
         batched_weights = []
         batched_indices = []
         batched_is_sum = []
         batched_ref_counts = []
-        
+
         for b in range(B):
-            # Existing state
-            w_b = self.attention_weights[b] # [H, L, T]
+            # Existing state (sliced to valid lengths)
+            w_b = self.attention_weights[b, :, :L, :T]  # [H, L, T]
             idx_b = self.cover_indices[b]   # [T]
-            is_sum_b = self.cover_is_summary[b] # [T]
-            ref_b = self.refinement_counts[b] # [T]
-            
+            is_sum_b = self.cover_is_summary[b]  # [T]
+            ref_b = self.refinement_counts[b, :T]  # [T]
+
             # 1. Keep existing summaries
-            # We assume summaries are at the beginning and marked with is_sum=1
-            # We also need to filter out padding (-1)
             mask_sum = (is_sum_b == 1) & (idx_b != -1)
-            
+
             cols_w = [w_b[:, :, mask_sum]]
             cols_idx = [idx_b[mask_sum]]
             cols_is_sum = [is_sum_b[mask_sum]]
             cols_ref = [ref_b[mask_sum]]
-            
+
             # Determine next summary index
             if mask_sum.any():
-                # Assuming they are sorted and 0-indexed
                 next_sum_idx = idx_b[mask_sum].max().item() + 1
             else:
                 next_sum_idx = 0
 
             # 2. Add new pages (compressed)
-            # new_pages[b] contains (start, end) raw indices
             for start, end in new_pages[b]:
-                # Identify columns corresponding to this page
-                # These must be raw tokens (is_sum=0) and in range [start, end]
                 mask_page = (is_sum_b == 0) & (idx_b >= start) & (idx_b <= end)
-                
+
                 if mask_page.any():
-                    # Sum weights: [H, L, N_page] -> [H, L, 1]
                     w_sum = w_b[:, :, mask_page].sum(dim=-1, keepdim=True)
                     cols_w.append(w_sum)
-                    
-                    # Metadata for new summary
                     cols_idx.append(torch.tensor([next_sum_idx], device=device, dtype=torch.long))
                     next_sum_idx += 1
                     cols_is_sum.append(torch.tensor([1], device=device, dtype=torch.long))
-                    cols_ref.append(torch.tensor([0], device=device, dtype=torch.long)) # New summary, 0 refinements
-            
+                    cols_ref.append(torch.tensor([0], device=device, dtype=torch.long))
+
             # 3. Keep remaining raw tail
             frontier = new_frontiers[b].item()
             mask_tail = (is_sum_b == 0) & (idx_b >= frontier) & (idx_b != -1)
-            
+
             if mask_tail.any():
                 cols_w.append(w_b[:, :, mask_tail])
                 cols_idx.append(idx_b[mask_tail])
                 cols_is_sum.append(is_sum_b[mask_tail])
                 cols_ref.append(ref_b[mask_tail])
-            
+
             # Concatenate for this batch
             if cols_w:
                 batched_weights.append(torch.cat(cols_w, dim=-1))
@@ -782,33 +900,35 @@ class AttentionScoreBuffer:
                 batched_is_sum.append(torch.cat(cols_is_sum, dim=0))
                 batched_ref_counts.append(torch.cat(cols_ref, dim=0))
             else:
-                # Empty batch (shouldn't happen if initialized correctly)
                 batched_weights.append(torch.zeros(H, L, 0, device=device, dtype=dtype))
                 batched_indices.append(torch.zeros(0, device=device, dtype=torch.long))
                 batched_is_sum.append(torch.zeros(0, device=device, dtype=torch.long))
                 batched_ref_counts.append(torch.zeros(0, device=device, dtype=torch.long))
 
-        # Pad and Stack
+        # Pad and Stack with extra capacity
         lengths = [x.shape[-1] for x in batched_weights]
-        max_len = max(lengths) if lengths else 0
-        
-        new_weights = torch.zeros(B, H, L, max_len, device=device, dtype=dtype)
-        new_indices = torch.full((B, max_len), -1, device=device, dtype=torch.long)
-        new_is_sum = torch.zeros(B, max_len, device=device, dtype=torch.long)
-        new_ref_counts = torch.zeros(B, max_len, device=device, dtype=torch.long)
-        
+        new_t_length = max(lengths) if lengths else 0
+        new_t_capacity = new_t_length + self.INITIAL_T_EXTRA
+
+        new_weights = torch.zeros(B, H, self._l_capacity, new_t_capacity, device=device, dtype=dtype)
+        new_indices = torch.full((B, new_t_capacity), -1, device=device, dtype=torch.long)
+        new_is_sum = torch.zeros(B, new_t_capacity, device=device, dtype=torch.long)
+        new_ref_counts = torch.zeros(B, new_t_capacity, device=device, dtype=torch.long)
+
         for b in range(B):
             l = lengths[b]
             if l > 0:
-                new_weights[b, :, :, :l] = batched_weights[b]
+                new_weights[b, :, :L, :l] = batched_weights[b]
                 new_indices[b, :l] = batched_indices[b]
                 new_is_sum[b, :l] = batched_is_sum[b]
                 new_ref_counts[b, :l] = batched_ref_counts[b]
-                
+
         self.attention_weights = new_weights
         self.cover_indices = new_indices
         self.cover_is_summary = new_is_sum
         self.refinement_counts = new_ref_counts
+        self._t_length = new_t_length
+        self._t_capacity = new_t_capacity
 
     def get_stats(self):
         """Get refinement statistics.
@@ -880,6 +1000,8 @@ class LukaKVController:
         # Set to False when using MeanCompressor (arithmetic mean != log-sum-exp assumption)
         self.use_log_bias = False
         self.seg_step_counters = [0 for _ in range(self.num_layers)]
+        # Production mode: skip debug checks (invariants) for better performance
+        self.production_mode = True
     
     def initialize_views(self, layer_idx: int):
         """Initialize cover view and attention buffer for a layer (e.g. after prefill)."""
@@ -982,60 +1104,66 @@ class LukaKVController:
     def try_new_pages(self, layer_idx: int) -> bool:
         """Attempt to segment raw tokens into pages and emit summaries for a layer.
 
+        Optimized with batched compression and reduced tensor allocations.
+
         Args:
             layer_idx: int
                 Transformer layer index.
 
         Returns:
             bool: True if new summary pages were added (i.e., `summary_cache[layer_idx]`
-            grew and `cover_view[layer_idx]` should be rebuilt), False otherwise. The
-            method should orchestrate the segmenter/compressor once they are wired in.
+            grew and `cover_view[layer_idx]` should be rebuilt), False otherwise.
         """
         # Throttle segmentation based on configured interval
         self.seg_step_counters[layer_idx] += 1
         if self.segment_interval > 1 and (self.seg_step_counters[layer_idx] % self.segment_interval) != 0:
             return False
 
-        # 1. Segment
-        # Get buffer data
-        # 1. Segment
-        # Get buffer data
+        # Early exit: check cover view length before expensive operations
+        cover_view = self.cover_view[layer_idx]
+        if cover_view.length < getattr(self.segmenter, '_min_tokens_needed', 32):
+            return False  # Not enough tokens for any pages
+
+        # 1. Segment - Get buffer data
         attn_weights, _, _ = self.attn_buffer[layer_idx].get_data()
-        
-        # Use CoverView indices directly as they are the ground truth
-        cover_indices = self.cover_view[layer_idx].cover_indices
-        cover_is_summary = self.cover_view[layer_idx].cover_is_summary
+
+        # Use CoverView indices directly as they are the ground truth (sliced to valid length)
+        _, _, cover_indices, cover_is_summary = cover_view.get_valid_kv()
         if attn_weights is None:
             return False
-         # 2. Run segmentation
-        # Returns [B, max_pages] of inclusive end indices (raw coordinates)
+
+        # 2. Run segmentation
         page_ends = self.segmenter.process(attn_weights, cover_indices, cover_is_summary, layer_idx=layer_idx)
         if page_ends is None:
             return False
 
         summary_cache = self.summary_cache[layer_idx]
         raw_cache = self.raw_cache
-        
+
         # Get current frontier per batch
         _, _, _, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
         if raw_seq_start is None:
             return False
-            
+
         B = raw_seq_start.shape[0]
         device = raw_seq_start.device
-        
-        # Identify new pages
-        new_frontiers = raw_seq_start.clone()
-        has_updates = False
-        all_new_pages = [[] for _ in range(B)] # List of (start, end) for each batch
-        
-        # Optimization: Get full tensors once
+
+        # Get full tensors once
         k_raw, v_raw, _, _ = raw_cache.get_layer(layer_idx, with_offsets=False)
         if k_raw is None:
             return False
-            
-        # Get number of heads from k_raw for importance weight shape
+
         H_kv = k_raw.shape[1]
+        new_frontiers = raw_seq_start.clone()
+        has_updates = False
+        all_new_pages = [[] for _ in range(B)]
+
+        # Collect all pages across batches for batched compression
+        all_k_slices = []
+        all_v_slices = []
+        all_importance = []
+        page_metadata = []  # (batch_idx, start, end)
+        max_page_len = 0
 
         for b in range(B):
             frontier = raw_seq_start[b].item()
@@ -1046,85 +1174,96 @@ class LukaKVController:
                 continue
 
             valid_ends = p_ends[valid_mask].sort().values
-
-            b_keys = []
-            b_values = []
-            b_starts = []
-            b_ends = []
-
             current_start = frontier
+            cover_idx_b = cover_indices[b] if cover_indices is not None else None
+            is_sum_b = cover_is_summary[b] if cover_is_summary is not None else None
 
             for end_idx in valid_ends.tolist():
                 end_idx = int(end_idx)
                 if end_idx < current_start:
                     continue
 
-                # Slice: [current_start, end_idx] inclusive
-                # k_raw: [B, H, T, D]
-                k_slice = k_raw[b, :, current_start : end_idx + 1, :]
-                v_slice = v_raw[b, :, current_start : end_idx + 1, :]
+                page_len = end_idx - current_start + 1
+                max_page_len = max(max_page_len, page_len)
 
-                # Extract importance weights from attention buffer
-                # Find cover positions that map to raw indices in [current_start, end_idx]
-                importance_weights = None
-                if attn_weights is not None and cover_indices is not None:
-                    cover_idx_b = cover_indices[b]  # [T_cover]
-                    is_sum_b = cover_is_summary[b]  # [T_cover]
+                # Slice raw K/V
+                k_slice = k_raw[b, :, current_start:end_idx + 1, :]
+                v_slice = v_raw[b, :, current_start:end_idx + 1, :]
+                all_k_slices.append(k_slice)
+                all_v_slices.append(v_slice)
 
-                    # Mask for raw tokens in this page's range
-                    page_mask = (
-                        (cover_idx_b >= current_start) &
-                        (cover_idx_b <= end_idx) &
-                        (is_sum_b == 0)
-                    )
-
+                # Extract importance weights
+                importance = None
+                if attn_weights is not None and cover_idx_b is not None:
+                    page_mask = (cover_idx_b >= current_start) & (cover_idx_b <= end_idx) & (is_sum_b == 0)
                     if page_mask.any():
-                        # attn_weights: [B, H_q, L_accum, T_cover]
-                        # Get attention to these positions, aggregate over queries
-                        page_attn = attn_weights[b, :, :, page_mask]  # [H_q, L_accum, page_len]
-
-                        # Sum over queries (L_accum) to get total attention per token
+                        page_attn = attn_weights[b, :, :, page_mask]
                         importance = page_attn.sum(dim=1)  # [H_q, page_len]
-
-                        # Handle GQA: H_q may differ from H_kv
-                        # Average across query head groups to get H_kv importance weights
                         H_q = importance.shape[0]
                         if H_q != H_kv:
                             num_groups = H_q // H_kv
-                            importance = importance.view(H_kv, num_groups, -1).mean(dim=1)  # [H_kv, page_len]
+                            importance = importance.view(H_kv, num_groups, -1).mean(dim=1)
+                all_importance.append(importance)
 
-                        importance_weights = importance.unsqueeze(0)  # [1, H_kv, page_len]
-
-                # Compress: [H, D]
-                k_in = k_slice.unsqueeze(0)
-                v_in = v_slice.unsqueeze(0)
-                k_sum, v_sum = self.compressor(k_in, v_in, importance_weights)  # [1, H, D]
-
-                b_keys.append(k_sum)
-                b_values.append(v_sum)
-                b_starts.append(current_start)
-                b_ends.append(end_idx)
-
-                # Record for buffer update
+                page_metadata.append((b, current_start, end_idx))
                 all_new_pages[b].append((current_start, end_idx))
-
                 current_start = end_idx + 1
-            
-            if b_keys:
-                k_stack = torch.stack(b_keys, dim=2)
-                v_stack = torch.stack(b_values, dim=2)
-                
-                summary_cache.add_pages(
-                    keys=k_stack,
-                    values=v_stack,
-                    batch_nums=torch.tensor([b], device=device),
-                    page_start=torch.tensor([b_starts], device=device),
-                    page_end=torch.tensor([b_ends], device=device),
-                    page_frontier=torch.tensor([current_start], device=device)
-                )
 
+            if current_start > frontier:
                 new_frontiers[b] = current_start
                 has_updates = True
+
+        if not page_metadata:
+            return False
+
+        # Batched compression: pad pages to same length and compress together
+        N_pages = len(all_k_slices)
+        D = k_raw.shape[3]
+
+        # Pad and stack all pages
+        padded_k = torch.zeros(N_pages, H_kv, max_page_len, D, device=device, dtype=k_raw.dtype)
+        padded_v = torch.zeros(N_pages, H_kv, max_page_len, D, device=device, dtype=v_raw.dtype)
+        padded_importance = None
+
+        has_any_importance = any(imp is not None for imp in all_importance)
+        if has_any_importance:
+            padded_importance = torch.zeros(N_pages, H_kv, max_page_len, device=device, dtype=k_raw.dtype)
+
+        for i, (k_s, v_s, imp) in enumerate(zip(all_k_slices, all_v_slices, all_importance)):
+            plen = k_s.shape[1]
+            padded_k[i, :, :plen, :] = k_s
+            padded_v[i, :, :plen, :] = v_s
+            if imp is not None and padded_importance is not None:
+                padded_importance[i, :, :plen] = imp
+
+        # Compress all pages at once
+        k_compressed, v_compressed = self.compressor(padded_k, padded_v, padded_importance)  # [N_pages, H, D]
+
+        # Distribute compressed pages back to batches
+        batch_pages = {}  # batch_idx -> list of (k, v, start, end)
+        for i, (b, start, end) in enumerate(page_metadata):
+            if b not in batch_pages:
+                batch_pages[b] = []
+            batch_pages[b].append((k_compressed[i:i+1], v_compressed[i:i+1], start, end))
+
+        # Add pages to summary cache
+        for b, pages in batch_pages.items():
+            k_list = [p[0] for p in pages]
+            v_list = [p[1] for p in pages]
+            starts = [p[2] for p in pages]
+            ends = [p[3] for p in pages]
+
+            k_stack = torch.cat(k_list, dim=0).unsqueeze(0).transpose(1, 2)  # [1, H, N, D] -> need [1, H, N, D]
+            v_stack = torch.cat(v_list, dim=0).unsqueeze(0).transpose(1, 2)
+
+            summary_cache.add_pages(
+                keys=k_stack,
+                values=v_stack,
+                batch_nums=torch.tensor([b], device=device),
+                page_start=torch.tensor([starts], device=device),
+                page_end=torch.tensor([ends], device=device),
+                page_frontier=torch.tensor([new_frontiers[b].item()], device=device)
+            )
 
         if has_updates:
             # Update raw_seq_start in RawCache
@@ -1189,12 +1328,9 @@ class LukaKVController:
             attn_output = torch.matmul(attn_weights, v_full)
             return attn_output.transpose(1, 2).contiguous(), attn_weights
 
-        # Get cover view
+        # Get cover view (sliced to valid length, excluding pre-allocated capacity)
         cover_view = self.cover_view[layer_idx]
-        cover_k = cover_view.cover_keys
-        cover_v = cover_view.cover_values
-        cover_indices = cover_view.cover_indices
-        cover_is_summary = cover_view.cover_is_summary
+        cover_k, cover_v, cover_indices, cover_is_summary = cover_view.get_valid_kv()
 
         if cover_k is None or cover_v is None:
             raise ValueError(f"Cover view not initialized for layer {layer_idx}.")
@@ -1206,18 +1342,22 @@ class LukaKVController:
         cover_v_full = repeat_kv(cover_v, num_kv_groups)
 
         # Map summary positions to raw indices (using page_end) for mask lookup
-        page_ends = self.summary_cache[layer_idx].page_end
-        if page_ends.shape[0] < B:
-            pad_b = B - page_ends.shape[0]
-            zeros = torch.zeros(pad_b, page_ends.shape[1], device=page_ends.device, dtype=page_ends.dtype)
-            page_ends = torch.cat([page_ends, zeros], dim=0)
-
         summary_mask = (cover_is_summary == 1)
-        cover_raw_indices = cover_indices.clone()
-        if summary_mask.any():
+        has_summaries = summary_mask.any()
+
+        if has_summaries:
+            page_ends = self.summary_cache[layer_idx].page_end
+            if page_ends.shape[0] < B:
+                pad_b = B - page_ends.shape[0]
+                zeros = torch.zeros(pad_b, page_ends.shape[1], device=page_ends.device, dtype=page_ends.dtype)
+                page_ends = torch.cat([page_ends, zeros], dim=0)
+
             clamped_idx = cover_indices.clamp(min=0, max=page_ends.shape[1] - 1)
             summary_raw_pos = page_ends.gather(1, clamped_idx)
             cover_raw_indices = torch.where(summary_mask, summary_raw_pos, cover_indices)
+        else:
+            # No summaries - cover_indices are already raw indices
+            cover_raw_indices = cover_indices
 
         # Compute attention logits
         attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling
@@ -1225,7 +1365,7 @@ class LukaKVController:
         # Optionally add log(N) bias for summaries: makes exp(q·k_s + log(N)) ≈ sum_i exp(q·k_i)
         # Note: This assumes k_summary ≈ log-mean-exp of raw keys. MeanCompressor uses arithmetic
         # mean, so this bias may hurt more than help. Disable with use_log_bias=False.
-        if self.use_log_bias and summary_mask.any():
+        if self.use_log_bias and has_summaries:
             page_start = self.summary_cache[layer_idx].page_start
             page_end_cache = self.summary_cache[layer_idx].page_end
             if page_start.shape[0] < B:
@@ -1255,13 +1395,20 @@ class LukaKVController:
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_probs, cover_v_full)
 
-        # Refinement: descend into pages where attention exceeds threshold
-        if threshold is not None and threshold >= 0:
-            refine_mask = (attn_probs > threshold) & summary_mask.view(B, 1, 1, T_cover)
-
-            # Track stats
+        # Track summaries seen (even when not refining, for accurate summary_frac)
+        if has_summaries:
             num_summaries = summary_mask.sum().item()
             self.attn_buffer[layer_idx].total_summaries_seen += num_summaries * query_states.shape[1] * query_states.shape[2]
+
+        # Refinement: descend into pages where attention exceeds threshold
+        # Skip entirely if threshold >= 1.0 (nothing can exceed 100% attention)
+        # Also skip if no summaries exist yet (has_summaries computed above)
+        needs_refinement = (threshold is not None and 0 <= threshold < 1.0 and has_summaries)
+
+        if needs_refinement:
+            refine_mask = (attn_probs > threshold) & summary_mask.view(B, 1, 1, T_cover)
+
+            # Track refinements
             self.attn_buffer[layer_idx].total_refinements_made += refine_mask.sum().item()
 
             refine_positions = refine_mask.any(dim=(1, 2))  # [B, T_cover]
@@ -1455,21 +1602,22 @@ class LukaKVController:
         if attn_weights is not None:
             # Verify width matches cover view
             # Note: attn_buffer accumulates, cover_view grows. They should match in T dimension.
-            
+
             if cover_view.cover_keys is not None:
-                T_cover = cover_view.cover_keys.shape[2]
+                T_cover = cover_view.length  # Use valid length, not pre-allocated capacity
                 T_attn = attn_weights.shape[-1]
-                
+
                 assert T_attn == T_cover, f"Invariant Violation: Attn buffer width {T_attn} != Cover view length {T_cover}"
-                
-                # Verify indices match
+
+                # Verify indices match (use sliced valid views)
                 if attn_indices is not None:
                      # attn_indices: [B, T]
                      # cover_view.cover_indices: [B, T]
-                     min_b = min(attn_indices.shape[0], cover_view.cover_indices.shape[0])
-                     assert torch.equal(attn_indices[:min_b], cover_view.cover_indices[:min_b]), \
+                     _, _, valid_indices, valid_is_sum = cover_view.get_valid_kv()
+                     min_b = min(attn_indices.shape[0], valid_indices.shape[0])
+                     assert torch.equal(attn_indices[:min_b], valid_indices[:min_b]), \
                          "Invariant Violation: Attn buffer indices mismatch with CoverView indices"
-                     assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
+                     assert torch.equal(attn_is_sum[:min_b], valid_is_sum[:min_b]), \
                          "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
 
     def print_layer_summary(self, layer_idx: int):
