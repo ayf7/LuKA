@@ -153,6 +153,71 @@ class AttentionWeightedCompressor(Compressor):
         return k_summary, v_summary
 
 
+class EvictionCompressor(Compressor):
+    """
+    Eviction-style compressor: attention-weighted keys, zero values.
+
+    The summary key exists for routing/refinement decisions, but contributes
+    no value information. Attention landing on the summary is effectively
+    "wasted" unless refinement kicks in to fetch raw values.
+
+    This tests whether summary keys alone (for attention routing) are sufficient
+    when paired with refinement, without attempting to compress values.
+
+    Args:
+        temperature: Softmax temperature for key weight normalization.
+        fallback_to_mean: If importance_weights is None, fall back to uniform mean for keys.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 1.0,
+        fallback_to_mean: bool = True,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.fallback_to_mean = fallback_to_mean
+
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            k: [B, H, L, D] keys to compress
+            v: [B, H, L, D] values to compress (ignored, output is zeros)
+            importance_weights: [B, H, L] per-token importance scores
+
+        Returns:
+            k_summary: [B, H, D] - attention-weighted
+            v_summary: [B, H, D] - zeros
+        """
+        self._validate_input(k, v)
+        B, H, L, D = k.shape
+
+        # Values: zeros (eviction - no value contribution)
+        v_summary = torch.zeros(B, H, D, device=v.device, dtype=v.dtype)
+
+        # Keys: use attention weighting if available
+        if importance_weights is None:
+            if self.fallback_to_mean:
+                k_summary = k.mean(dim=2)
+            else:
+                raise ValueError("importance_weights required when fallback_to_mean=False")
+        else:
+            assert importance_weights.shape == (B, H, L), \
+                f"importance_weights shape {importance_weights.shape} != expected {(B, H, L)}"
+
+            weights = torch.softmax(importance_weights / self.temperature, dim=-1)
+            weights = weights.unsqueeze(-1)  # [B, H, L, 1]
+            k_summary = (k * weights).sum(dim=2)
+
+        self._validate_output(k_summary, v_summary, B, H, D)
+        return k_summary, v_summary
+
+
 class EncoderCompressor(Compressor):
     """
     Simple encoder-based compressor (see PROJECT.md):

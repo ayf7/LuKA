@@ -50,6 +50,7 @@ def set_luka_kv_params(
     use_log_bias: bool = False,
     print_stats_after_generate: bool = False,
     production_mode: bool = True,
+    async_pages: bool = False,
     compressor: object = "mean",
     compressor_kwargs: dict | None = None,
     segmenter: object = "dummy",
@@ -74,6 +75,8 @@ def set_luka_kv_params(
         _kv_params_override["print_stats_after_generate"] = bool(print_stats_after_generate)
     if production_mode is not None:
         _kv_params_override["production_mode"] = bool(production_mode)
+    if async_pages is not None:
+        _kv_params_override["async_pages"] = bool(async_pages)
 
     if compressor is not None:
         if isinstance(compressor, str):
@@ -245,6 +248,8 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
             self.luka_kv_controller.use_log_bias = _kv_params_override["use_log_bias"]
         if "production_mode" in _kv_params_override:
             self.luka_kv_controller.production_mode = _kv_params_override["production_mode"]
+        if "async_pages" in _kv_params_override:
+            self.luka_kv_controller.async_pages = _kv_params_override["async_pages"]
 
         for layer in self.layers:
             if hasattr(layer, "self_attn"):

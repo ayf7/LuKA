@@ -967,6 +967,276 @@ class AttentionScoreBuffer:
             "refinements_per_query": refinements_per_query,
         }
 
+
+class AsyncPageCreator:
+    """Handles asynchronous page creation using CUDA streams.
+
+    Page compression runs on a background stream while decoding continues
+    on the main stream. Completed updates are applied between decode steps.
+    """
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.stream = None  # Lazily created on first use
+        # Per-layer pending updates: (compressed_pages, metadata, event)
+        self.pending: dict[int, dict] = {}
+
+    def _ensure_stream(self, device: torch.device):
+        """Create CUDA stream if not already created."""
+        if self.stream is None and device.type == "cuda":
+            self.stream = torch.cuda.Stream(device=device)
+
+    def start_async(
+        self,
+        layer_idx: int,
+        controller: "LukaKVController",
+        attn_weights: torch.Tensor,
+        cover_indices: torch.Tensor,
+        cover_is_summary: torch.Tensor,
+    ) -> bool:
+        """Start async page creation on background stream.
+
+        Args:
+            layer_idx: Transformer layer index
+            controller: LukaKVController to get raw cache, segmenter, compressor
+            attn_weights: Attention weights from buffer
+            cover_indices: Cover view indices
+            cover_is_summary: Cover view summary flags
+
+        Returns:
+            True if async work was started, False if nothing to do
+        """
+        device = attn_weights.device
+        self._ensure_stream(device)
+
+        # If no CUDA, fall back to sync
+        if self.stream is None:
+            return False
+
+        # Don't start new work if previous work for this layer is pending
+        if layer_idx in self.pending:
+            return False
+
+        # Run segmentation on main stream first (it's fast and needed for decisions)
+        page_ends = controller.segmenter.process(
+            attn_weights, cover_indices, cover_is_summary, layer_idx=layer_idx
+        )
+        if page_ends is None:
+            return False
+
+        # Get raw cache info
+        raw_cache = controller.raw_cache
+        _, _, _, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
+        if raw_seq_start is None:
+            return False
+
+        k_raw, v_raw, _, _ = raw_cache.get_layer(layer_idx, with_offsets=False)
+        if k_raw is None:
+            return False
+
+        B = raw_seq_start.shape[0]
+        H_kv = k_raw.shape[1]
+        D = k_raw.shape[3]
+
+        # Collect page metadata (this is fast, done on main stream)
+        all_k_slices = []
+        all_v_slices = []
+        all_importance = []
+        page_metadata = []
+        new_frontiers = raw_seq_start.clone()
+        max_page_len = 0
+        all_new_pages = [[] for _ in range(B)]
+        has_updates = False
+
+        for b in range(B):
+            frontier = raw_seq_start[b].item()
+            p_ends = page_ends[b]
+            valid_mask = (p_ends >= frontier) & (p_ends != -1)
+
+            if not valid_mask.any():
+                continue
+
+            valid_ends = p_ends[valid_mask].sort().values
+            current_start = frontier
+            cover_idx_b = cover_indices[b] if cover_indices is not None else None
+            is_sum_b = cover_is_summary[b] if cover_is_summary is not None else None
+
+            for end_idx in valid_ends.tolist():
+                end_idx = int(end_idx)
+                if end_idx < current_start:
+                    continue
+
+                page_len = end_idx - current_start + 1
+                max_page_len = max(max_page_len, page_len)
+
+                # Clone slices to avoid race conditions with background stream
+                k_slice = k_raw[b, :, current_start:end_idx + 1, :].clone()
+                v_slice = v_raw[b, :, current_start:end_idx + 1, :].clone()
+                all_k_slices.append(k_slice)
+                all_v_slices.append(v_slice)
+
+                importance = None
+                if attn_weights is not None and cover_idx_b is not None:
+                    page_mask = (cover_idx_b >= current_start) & (cover_idx_b <= end_idx) & (is_sum_b == 0)
+                    if page_mask.any():
+                        page_attn = attn_weights[b, :, :, page_mask]
+                        importance = page_attn.sum(dim=1).clone()  # Clone importance too
+                        H_q = importance.shape[0]
+                        if H_q != H_kv:
+                            num_groups = H_q // H_kv
+                            importance = importance.view(H_kv, num_groups, -1).mean(dim=1)
+                all_importance.append(importance)
+
+                page_metadata.append((b, current_start, end_idx))
+                all_new_pages[b].append((current_start, end_idx))
+                current_start = end_idx + 1
+
+            if current_start > frontier:
+                new_frontiers[b] = current_start
+                has_updates = True
+
+        if not page_metadata:
+            return False
+
+        # Record event on main stream so background stream can wait for data to be ready
+        main_stream_event = torch.cuda.Event()
+        main_stream_event.record()
+
+        # Now do the heavy lifting on background stream
+        N_pages = len(all_k_slices)
+
+        with torch.cuda.stream(self.stream):
+            # Wait for main stream data to be ready (non-blocking on main stream)
+            main_stream_event.wait()
+            # Pad and stack pages
+            padded_k = torch.zeros(N_pages, H_kv, max_page_len, D, device=device, dtype=k_raw.dtype)
+            padded_v = torch.zeros(N_pages, H_kv, max_page_len, D, device=device, dtype=v_raw.dtype)
+            padded_importance = None
+
+            has_any_importance = any(imp is not None for imp in all_importance)
+            if has_any_importance:
+                padded_importance = torch.zeros(N_pages, H_kv, max_page_len, device=device, dtype=k_raw.dtype)
+
+            for i, (k_s, v_s, imp) in enumerate(zip(all_k_slices, all_v_slices, all_importance)):
+                plen = k_s.shape[1]
+                padded_k[i, :, :plen, :] = k_s
+                padded_v[i, :, :plen, :] = v_s
+                if imp is not None and padded_importance is not None:
+                    padded_importance[i, :, :plen] = imp
+
+            # Compress all pages (the expensive operation)
+            k_compressed, v_compressed = controller.compressor(padded_k, padded_v, padded_importance)
+
+            # Record event when compression is done
+            event = torch.cuda.Event()
+            event.record()
+
+        # Store pending update
+        self.pending[layer_idx] = {
+            "k_compressed": k_compressed,
+            "v_compressed": v_compressed,
+            "page_metadata": page_metadata,
+            "new_frontiers": new_frontiers,
+            "all_new_pages": all_new_pages,
+            "has_updates": has_updates,
+            "event": event,
+        }
+
+        return True
+
+    def try_apply(self, layer_idx: int, controller: "LukaKVController") -> bool:
+        """Check if async work is done and apply updates.
+
+        Args:
+            layer_idx: Transformer layer index
+            controller: LukaKVController to update
+
+        Returns:
+            True if updates were applied, False otherwise
+        """
+        if layer_idx not in self.pending:
+            return False
+
+        pending = self.pending[layer_idx]
+        event = pending["event"]
+
+        # Non-blocking check: is the background work done?
+        if not event.query():
+            return False
+
+        # Work is done, apply updates
+        k_compressed = pending["k_compressed"]
+        v_compressed = pending["v_compressed"]
+        page_metadata = pending["page_metadata"]
+        new_frontiers = pending["new_frontiers"]
+        all_new_pages = pending["all_new_pages"]
+        has_updates = pending["has_updates"]
+
+        device = k_compressed.device
+        summary_cache = controller.summary_cache[layer_idx]
+        raw_cache = controller.raw_cache
+
+        # Distribute compressed pages to batches
+        batch_pages = {}
+        for i, (b, start, end) in enumerate(page_metadata):
+            if b not in batch_pages:
+                batch_pages[b] = []
+            batch_pages[b].append((k_compressed[i:i+1], v_compressed[i:i+1], start, end))
+
+        # Add pages to summary cache
+        for b, pages in batch_pages.items():
+            k_list = [p[0] for p in pages]
+            v_list = [p[1] for p in pages]
+            starts = [p[2] for p in pages]
+            ends = [p[3] for p in pages]
+
+            k_stack = torch.cat(k_list, dim=0).unsqueeze(0).transpose(1, 2)
+            v_stack = torch.cat(v_list, dim=0).unsqueeze(0).transpose(1, 2)
+
+            summary_cache.add_pages(
+                keys=k_stack,
+                values=v_stack,
+                batch_nums=torch.tensor([b], device=device),
+                page_start=torch.tensor([starts], device=device),
+                page_end=torch.tensor([ends], device=device),
+                page_frontier=torch.tensor([new_frontiers[b].item()], device=device)
+            )
+
+        if has_updates:
+            raw_cache.raw_seq_start[layer_idx] = new_frontiers
+            controller.cover_view[layer_idx].update_cover_view(layer_idx, raw_cache, summary_cache)
+            controller.attn_buffer[layer_idx].compress_and_trim(all_new_pages, new_frontiers)
+
+        # Clear pending
+        del self.pending[layer_idx]
+        return True
+
+    def has_pending(self, layer_idx: int) -> bool:
+        """Check if there's pending work for a layer."""
+        return layer_idx in self.pending
+
+    def flush_all(self, controller: "LukaKVController"):
+        """Wait for all pending work to complete and apply updates.
+
+        Call this at the end of generation or when you need to ensure
+        all async updates are applied.
+        """
+        if not self.pending:
+            return
+
+        # Wait for background stream to complete
+        if self.stream is not None:
+            self.stream.synchronize()
+
+        # Apply all pending updates
+        for layer_idx in list(self.pending.keys()):
+            self.try_apply(layer_idx, controller)
+
+    def clear(self):
+        """Clear all pending work (without applying)."""
+        self.pending.clear()
+
+
 class LukaKVController:
 
     def __init__(self, config: PretrainedConfig, num_layers: Optional[int] = None):
@@ -1000,8 +1270,13 @@ class LukaKVController:
         # Set to False when using MeanCompressor (arithmetic mean != log-sum-exp assumption)
         self.use_log_bias = False
         self.seg_step_counters = [0 for _ in range(self.num_layers)]
+        # Track tokens since last page creation (for fast early exit)
+        self.tokens_since_last_page = [0 for _ in range(self.num_layers)]
         # Production mode: skip debug checks (invariants) for better performance
         self.production_mode = True
+        # Async page creation: run compression on background CUDA stream
+        self.async_pages = False
+        self.async_page_creator = AsyncPageCreator(self.num_layers)
     
     def initialize_views(self, layer_idx: int):
         """Initialize cover view and attention buffer for a layer (e.g. after prefill)."""
@@ -1105,6 +1380,7 @@ class LukaKVController:
         """Attempt to segment raw tokens into pages and emit summaries for a layer.
 
         Optimized with batched compression and reduced tensor allocations.
+        Supports async mode where compression runs on a background CUDA stream.
 
         Args:
             layer_idx: int
@@ -1114,9 +1390,26 @@ class LukaKVController:
             bool: True if new summary pages were added (i.e., `summary_cache[layer_idx]`
             grew and `cover_view[layer_idx]` should be rebuilt), False otherwise.
         """
+        # First, try to apply any pending async updates
+        if self.async_pages:
+            applied = self.async_page_creator.try_apply(layer_idx, self)
+            if applied:
+                self.tokens_since_last_page[layer_idx] = 0
+                return True
+
+        # Increment token counter (tracks tokens since last page creation)
+        self.tokens_since_last_page[layer_idx] += 1
+
         # Throttle segmentation based on configured interval
         self.seg_step_counters[layer_idx] += 1
         if self.segment_interval > 1 and (self.seg_step_counters[layer_idx] % self.segment_interval) != 0:
+            return False
+
+        # Fast early exit: skip segmenter if not enough tokens since last page
+        # This avoids the ~0.11ms segmenter overhead per call
+        min_chunk = getattr(self.segmenter, 'min_chunk', 16)
+        tail_len = getattr(self.segmenter, 'tail_len', 16)
+        if self.tokens_since_last_page[layer_idx] < min_chunk:
             return False
 
         # Early exit: check cover view length before expensive operations
@@ -1131,6 +1424,14 @@ class LukaKVController:
         _, _, cover_indices, cover_is_summary = cover_view.get_valid_kv()
         if attn_weights is None:
             return False
+
+        # Async path: start background work and return immediately
+        if self.async_pages:
+            if not self.async_page_creator.has_pending(layer_idx):
+                self.async_page_creator.start_async(
+                    layer_idx, self, attn_weights, cover_indices, cover_is_summary
+                )
+            return False  # Updates will be applied on next call
 
         # 2. Run segmentation
         page_ends = self.segmenter.process(attn_weights, cover_indices, cover_is_summary, layer_idx=layer_idx)
@@ -1274,8 +1575,10 @@ class LukaKVController:
 
             # Compress and trim buffer
             self.attn_buffer[layer_idx].compress_and_trim(all_new_pages, new_frontiers)
+            # Reset token counter since we just created pages
+            self.tokens_since_last_page[layer_idx] = 0
             return True
-            
+
         return False
 
     def top_down_attention(
@@ -1336,7 +1639,7 @@ class LukaKVController:
             raise ValueError(f"Cover view not initialized for layer {layer_idx}.")
 
         B, H_k, T_cover, D = cover_k.shape
-        L_q = query_states.shape[2]
+        H_q, L_q = query_states.shape[1], query_states.shape[2]
 
         cover_k_full = repeat_kv(cover_k, num_kv_groups)
         cover_v_full = repeat_kv(cover_v, num_kv_groups)
@@ -1392,13 +1695,18 @@ class LukaKVController:
         # Mask invalid positions (padding in cover view)
         attn_logits = attn_logits.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value)
 
+        # Save logsumexp for corrected refinement (the softmax denominator in log space)
+        # Shape: [B, H_q, L_q]
+        logsumexp_cover = torch.logsumexp(attn_logits.float(), dim=-1)
+
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_probs, cover_v_full)
 
         # Track summaries seen (even when not refining, for accurate summary_frac)
+        # Note: Defer .item() calls to avoid GPU sync during forward pass
         if has_summaries:
-            num_summaries = summary_mask.sum().item()
-            self.attn_buffer[layer_idx].total_summaries_seen += num_summaries * query_states.shape[1] * query_states.shape[2]
+            num_summaries = summary_mask.sum()  # Keep as tensor, no .item()
+            self.attn_buffer[layer_idx].total_summaries_seen += (num_summaries * query_states.shape[1] * query_states.shape[2]).item()
 
         # Refinement: descend into pages where attention exceeds threshold
         # Skip entirely if threshold >= 1.0 (nothing can exceed 100% attention)
@@ -1406,12 +1714,34 @@ class LukaKVController:
         needs_refinement = (threshold is not None and 0 <= threshold < 1.0 and has_summaries)
 
         if needs_refinement:
-            refine_mask = (attn_probs > threshold) & summary_mask.view(B, 1, 1, T_cover)
+            # Optimized refinement check: only process summary positions
+            # Instead of creating full [B, H, L, T_cover] mask, index into summary positions only
+            sum_indices = summary_mask.nonzero(as_tuple=True)  # (batch_indices, position_indices)
+            if len(sum_indices[0]) > 0:
+                b_sum, t_sum = sum_indices
+                # Extract attention only at summary positions: [N_sum, H, L]
+                attn_at_summaries = attn_probs[b_sum, :, :, t_sum]
+                # Check which summaries have any attention > threshold
+                exceeds_threshold = (attn_at_summaries > threshold).any(dim=(1, 2))  # [N_sum]
 
-            # Track refinements
-            self.attn_buffer[layer_idx].total_refinements_made += refine_mask.sum().item()
+                # Build refine_positions [B, T_cover] from sparse results
+                refine_positions = torch.zeros(B, T_cover, dtype=torch.bool, device=query_states.device)
+                refine_positions[b_sum, t_sum] = exceeds_threshold
 
-            refine_positions = refine_mask.any(dim=(1, 2))  # [B, T_cover]
+                # Build per-(head, query) mask only for positions needing refinement
+                # This is needed for correct delta application
+                if exceeds_threshold.any():
+                    # Create sparse refine_mask for just the summary positions
+                    refine_mask_sparse = attn_at_summaries > threshold  # [N_sum, H, L]
+                    # Expand to full refine_mask only at summary positions
+                    refine_mask = torch.zeros(B, H_q, L_q, T_cover, dtype=torch.bool, device=query_states.device)
+                    # refine_mask[b_sum, :, :, t_sum] has shape [N_sum, H, L], same as refine_mask_sparse
+                    refine_mask[b_sum, :, :, t_sum] = refine_mask_sparse
+                    # Track refinements: count (summary, head, query) combinations that exceeded threshold
+                    # This matches total_summaries_seen which also counts × heads × queries
+                    self.attn_buffer[layer_idx].total_refinements_made += refine_mask_sparse.sum().item()
+            else:
+                refine_positions = torch.zeros(B, T_cover, dtype=torch.bool, device=query_states.device)
 
             if refine_positions.any():
                 summary_cache = self.summary_cache[layer_idx]
@@ -1435,7 +1765,31 @@ class LukaKVController:
                     b_idx, pos_idx = b_idx[valid], pos_idx[valid]
                     starts, lengths = starts[valid], lengths[valid]
 
-                    # Process each unique page length as a batch
+                    # === Corrected refinement with proper normalizer ===
+                    # When we refine summaries, the softmax normalizer changes:
+                    # Z_full = Z_cover - sum(exp(logit_s)) + sum(Z_page_s)
+                    # All attention must be rescaled by Z_cover / Z_full
+                    #
+                    # For numerical stability, we work with ratios instead of absolute values:
+                    # - attn_s = exp(logit_s - logsumexp_cover) = attention to summary
+                    # - ratio_page = exp(logsumexp_page - logsumexp_cover) = Z_page / Z_cover
+                    # - scale = 1 / (1 - sum(attn_s) + sum(ratio_page)) = Z_cover / Z_full
+                    #
+                    # We do two passes:
+                    # 1. Compute raw attention for each page and accumulate statistics
+                    # 2. Apply the global scale and per-summary deltas
+
+                    # Accumulators for computing scale per (b, h, l)
+                    # sum_attn_s: sum of attention to refined summaries
+                    # sum_ratio_page: sum of Z_page / Z_cover for refined pages
+                    sum_attn_s = torch.zeros(B, H_q, L_q, device=query_states.device, dtype=torch.float32)
+                    sum_ratio_page = torch.zeros(B, H_q, L_q, device=query_states.device, dtype=torch.float32)
+
+                    # Store refinement data for second pass
+                    # Each entry: (b_bucket, pos_bucket, raw_out, attn_s, v_summary, ratio_page, active_mask)
+                    refinement_data = []
+
+                    # First pass: compute raw attention and gather statistics
                     for page_len in lengths.unique().tolist():
                         page_len = int(page_len)
                         bucket_mask = (lengths == page_len)
@@ -1456,17 +1810,78 @@ class LukaKVController:
                             mask_gather_idx = raw_idx.view(-1, 1, 1, page_len).expand(-1, 1, attention_mask.shape[2], -1)
                             raw_logits = raw_logits + torch.gather(attention_mask[b_bucket], 3, mask_gather_idx)
 
+                        # Compute logsumexp for page (Z_page in log space)
+                        logsumexp_page = torch.logsumexp(raw_logits.float(), dim=-1)  # [N_bucket, H_q, L_q]
+
                         raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                        raw_out = torch.matmul(raw_probs, v_slice)
+                        raw_out = torch.matmul(raw_probs, v_slice)  # [N_bucket, H_q, L_q, D]
 
-                        # Delta = (refined - summary) * attention_mass
-                        base_value = cover_v_full[b_bucket, :, pos_bucket, :].unsqueeze(2)
-                        attn_mass = attn_probs[b_bucket, :, :, pos_bucket].unsqueeze(-1)
-                        delta = (raw_out - base_value) * attn_mass
+                        # Get value for each summary being refined
+                        v_summary = cover_v_full[b_bucket, :, pos_bucket, :]  # [N_bucket, H_q, D]
 
-                        # Only apply where refine_mask was true
-                        active_mask = refine_mask[b_bucket, :, :, pos_bucket].unsqueeze(-1)
-                        attn_output.index_add_(0, b_bucket, delta * active_mask.to(delta.dtype))
+                        # Active mask: which (bucket, head, query) combos are actually refined
+                        active = refine_mask[b_bucket, :, :, pos_bucket].float()  # [N_bucket, H_q, L_q]
+
+                        # attn_s: attention to summary - already computed in attn_probs (numerically stable)
+                        attn_s = attn_probs[b_bucket, :, :, pos_bucket].float()  # [N_bucket, H_q, L_q]
+
+                        # ratio_page = Z_page / Z_cover = exp(logsumexp_page - logsumexp_cover)
+                        # This is stable since we're subtracting in log space before exp
+                        logsumexp_cover_bucket = logsumexp_cover[b_bucket]  # [N_bucket, H_q, L_q]
+                        log_ratio = (logsumexp_page - logsumexp_cover_bucket).clamp(min=-80, max=80)
+                        ratio_page = torch.exp(log_ratio)  # [N_bucket, H_q, L_q]
+
+                        # Accumulate statistics
+                        # Use scatter_add to accumulate across potentially repeated batch indices
+                        attn_s_active = attn_s * active
+                        ratio_page_active = ratio_page * active
+
+                        # Expand b_bucket for broadcasting: [N_bucket] -> [N_bucket, H_q, L_q]
+                        b_expanded = b_bucket.view(-1, 1, 1).expand(-1, H_q, L_q)
+                        sum_attn_s.scatter_add_(0, b_expanded, attn_s_active)
+                        sum_ratio_page.scatter_add_(0, b_expanded, ratio_page_active)
+
+                        # Store for second pass
+                        refinement_data.append((b_bucket, pos_bucket, raw_out, attn_s, v_summary, ratio_page, active))
+
+                    # Scale factor: Z_cover / Z_full = 1 / (1 - sum_attn_s + sum_ratio_page)
+                    # When no refinements, sum_attn_s = sum_ratio_page = 0, so scale = 1
+                    denom = 1.0 - sum_attn_s + sum_ratio_page
+                    scale = (1.0 / denom.clamp(min=1e-8)).to(attn_output.dtype)  # [B, H_q, L_q]
+
+                    # Scale entire output
+                    attn_output = attn_output * scale.unsqueeze(-1)
+
+                    # Second pass: apply per-summary deltas
+                    # After scaling, summary contribution is scale * attn_s * v_summary
+                    # We want to replace with (ratio_page * scale) * raw_out
+                    # Delta = (ratio_page * scale) * raw_out - (scale * attn_s) * v_summary
+                    for b_bucket, pos_bucket, raw_out, attn_s, v_summary, ratio_page, active in refinement_data:
+                        # Skip if no active refinements in this bucket
+                        if not active.any():
+                            continue
+
+                        # Get scale for this bucket
+                        scale_bucket = scale[b_bucket]  # [N_bucket, H_q, L_q]
+
+                        # Apply active mask early to avoid overflow in inactive positions
+                        # (ratio_page can be huge for inactive positions where we don't refine)
+                        active_f = active.to(scale_bucket.dtype)
+
+                        # Contribution from raw tokens: (ratio_page * scale) * raw_out
+                        # Mask ratio_page to avoid overflow: inactive positions don't contribute
+                        raw_weight = (ratio_page * active_f * scale_bucket).to(raw_out.dtype)  # [N_bucket, H_q, L_q]
+                        raw_contribution = raw_weight.unsqueeze(-1) * raw_out  # [N_bucket, H_q, L_q, D]
+
+                        # Scaled summary contribution: (scale * attn_s) * v_summary
+                        # Also mask to match (attn_s is already small for inactive, but be consistent)
+                        summary_weight = (scale_bucket * attn_s * active_f).to(v_summary.dtype)  # [N_bucket, H_q, L_q]
+                        summary_contribution = summary_weight.unsqueeze(-1) * v_summary.unsqueeze(2)  # [N_bucket, H_q, L_q, D]
+
+                        # Delta = new - old (already masked, no need for active_mask multiply)
+                        delta = raw_contribution - summary_contribution
+
+                        attn_output.scatter_add_(0, b_bucket.view(-1, 1, 1, 1).expand_as(delta), delta)
 
         self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
         return attn_output.transpose(1, 2).contiguous(), attn_probs
