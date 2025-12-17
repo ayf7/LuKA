@@ -24,17 +24,18 @@ from experiments.perplexity.utils import (
     get_prompt,
     get_baseline_perplexity,
     load_eval_text,
+    get_output_dir,
 )
 from modeling.compressor import AttentionWeightedCompressor
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 
 
 # Output paths
-OUTPUT_DIR = Path("experiments/perplexity")
-CSV_PATH = OUTPUT_DIR / "window_sweep.csv"
-PLOT_PATH = OUTPUT_DIR / "window_sweep.png"
-PLOT_LOG_PATH = OUTPUT_DIR / "window_sweep_log.png"
-CURVE_PLOT_PATH = OUTPUT_DIR / "window_sweep_curves.png"
+OUTPUT_DIR = get_output_dir("window_sweep")
+CSV_PATH = OUTPUT_DIR / "results.csv"
+PLOT_PATH = OUTPUT_DIR / "sweep.png"
+PLOT_LOG_PATH = OUTPUT_DIR / "sweep_log.png"
+CURVE_PLOT_PATH = OUTPUT_DIR / "curves.png"
 
 # Sweep values
 WINDOW_SIZES = [8, 16, 32, 64, 128]
@@ -330,8 +331,9 @@ def generate_plots(results, base_ppl, base_tps, base_curve):
 
     plt.title("Window Size vs Performance (Lined Attention)")
     fig.tight_layout()
-    plt.savefig(OUTPUT_DIR / "window_sweep_tradeoff.png", dpi=150)
-    print(f"Saved tradeoff plot to {OUTPUT_DIR / 'window_sweep_tradeoff.png'}")
+    tradeoff_path = OUTPUT_DIR / "tradeoff.png"
+    plt.savefig(tradeoff_path, dpi=150)
+    print(f"Saved tradeoff plot to {tradeoff_path}")
 
     # --- Running average curves ---
     skip_tokens = 100
@@ -366,9 +368,22 @@ def run(
     prompt_name: str = "paragraphs_1",
     eval_dataset: str = None,
     model_name: str = None,
+    allow_skipping: bool = False,
 ):
     if model_name is None:
         model_name = MODEL_NAME
+
+    # Check for existing results if allow_skipping is enabled
+    if allow_skipping and CSV_PATH.exists():
+        print(f"Found existing CSV at {CSV_PATH}, loading cached results...")
+        try:
+            results, base_ppl, base_tps, base_curve, _ = load_csv()
+            print(f"  Loaded results for {len(results)} window sizes")
+            print(f"  Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
+            generate_plots(results, base_ppl, base_tps, base_curve)
+            return results, base_ppl, base_tps, base_curve
+        except Exception as e:
+            print(f"  Failed to load CSV: {e}, running experiments...")
 
     device = get_device()
     tokenizer = get_tokenizer(model_name)
@@ -458,6 +473,8 @@ def main():
                         help="Prompt name if not using dataset")
     parser.add_argument("--plot-only", action="store_true",
                         help="Only generate plots from existing CSV")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
     args = parser.parse_args()
 
     if args.plot_only:
@@ -471,6 +488,7 @@ def main():
             prompt_name=args.prompt,
             eval_dataset=args.dataset,
             model_name=args.model,
+            allow_skipping=args.allow_skipping,
         )
 
 

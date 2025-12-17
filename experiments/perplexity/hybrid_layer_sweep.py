@@ -30,15 +30,46 @@ from experiments.perplexity.utils import (
     get_prompt,
     get_baseline_perplexity,
     load_eval_text,
+    get_output_dir,
 )
 from modeling.compressor import AttentionWeightedCompressor
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 
 
 # Output paths
-OUTPUT_DIR = Path("experiments/perplexity")
-CSV_PATH = OUTPUT_DIR / "hybrid_layer_sweep.csv"
-PLOT_PATH = OUTPUT_DIR / "hybrid_layer_sweep.png"
+OUTPUT_DIR = get_output_dir("hybrid_layer_sweep")
+CSV_PATH = OUTPUT_DIR / "results.csv"
+PLOT_PATH = OUTPUT_DIR / "sweep.png"
+
+
+def load_csv():
+    """Load results from CSV file."""
+    import csv as csv_module
+
+    if not CSV_PATH.exists():
+        raise FileNotFoundError(f"CSV not found: {CSV_PATH}. Run without --allow-skipping first.")
+
+    results = {}
+    base_ppl = None
+    base_tps = None
+    num_layers = 28
+
+    with open(CSV_PATH, "r") as f:
+        reader = csv_module.DictReader(f)
+        for row in reader:
+            name = row["config"]
+            if name == "baseline":
+                base_ppl = float(row["perplexity"])
+                base_tps = float(row["tokens_per_sec"])
+                continue
+
+            results[name] = {
+                "perplexity": float(row["perplexity"]),
+                "tokens_per_sec": float(row["tokens_per_sec"]),
+                "n_lined_per_end": int(row["n_lined_per_end"]),
+            }
+
+    return results, base_ppl, base_tps, num_layers
 
 
 def get_sweep_configs(num_layers: int, sweep_values: list[int] = None):
@@ -231,9 +262,27 @@ def run(
     eval_dataset: str = None,
     model_name: str = None,
     sweep_values: list[int] = None,
+    allow_skipping: bool = False,
 ):
     if model_name is None:
         model_name = MODEL_NAME
+
+    # Check for existing results if allow_skipping is enabled
+    if allow_skipping and CSV_PATH.exists():
+        print(f"Found existing CSV at {CSV_PATH}, loading cached results...")
+        try:
+            results, base_ppl, base_tps, num_layers = load_csv()
+            configs = get_sweep_configs(num_layers, sweep_values)
+            # Merge results with configs for plotting
+            for cfg in configs:
+                if cfg["name"] in results:
+                    results[cfg["name"]].update(cfg)
+            print(f"  Loaded results for {len(results)} configurations")
+            print(f"  Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
+            generate_plot(results, configs, base_ppl, base_tps, num_layers)
+            return results, configs, base_ppl, base_tps
+        except Exception as e:
+            print(f"  Failed to load CSV: {e}, running experiments...")
 
     device = get_device()
     tokenizer = get_tokenizer(model_name)
@@ -370,7 +419,7 @@ def generate_plot(results, configs, base_ppl, base_tps, num_layers):
     plt.close()
 
     # === Log scale plot ===
-    log_plot_path = OUTPUT_DIR / "hybrid_layer_sweep_log.png"
+    log_plot_path = OUTPUT_DIR / "sweep_log.png"
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     # PPL plot (log)
@@ -414,17 +463,32 @@ def main():
                         help="Prompt name if not using dataset")
     parser.add_argument("--sweep", type=str, default="0,4,8,12,16",
                         help="Comma-separated sweep values (layers from each end)")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Only generate plots from existing CSV")
     args = parser.parse_args()
 
     sweep_values = [int(x) for x in args.sweep.split(",")]
 
-    run(
-        max_tokens=args.max_tokens,
-        prompt_name=args.prompt,
-        eval_dataset=args.dataset,
-        model_name=args.model,
-        sweep_values=sweep_values,
-    )
+    if args.plot_only:
+        print("Loading data from CSV...")
+        results, base_ppl, base_tps, num_layers = load_csv()
+        configs = get_sweep_configs(num_layers, sweep_values)
+        for cfg in configs:
+            if cfg["name"] in results:
+                results[cfg["name"]].update(cfg)
+        print(f"Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
+        generate_plot(results, configs, base_ppl, base_tps, num_layers)
+    else:
+        run(
+            max_tokens=args.max_tokens,
+            prompt_name=args.prompt,
+            eval_dataset=args.dataset,
+            model_name=args.model,
+            sweep_values=sweep_values,
+            allow_skipping=args.allow_skipping,
+        )
 
 
 if __name__ == "__main__":

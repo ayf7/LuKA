@@ -26,10 +26,12 @@ from experiments.perplexity.utils import (
     get_baseline_perplexity,
     run_single_config,
     load_eval_text,
+    get_output_dir,
 )
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-1.7B-Base"
+OUTPUT_DIR = get_output_dir("token_position_curves")
 
 
 def load_csv(csv_path, compressors):
@@ -173,9 +175,9 @@ def run(
     if bias_comparison_mode:
         rule_suffix += "_bias_comparison"
 
-    csv_path = Path(f"experiments/perplexity/token_curves_{rule_suffix}.csv")
-    out_path = Path(f"experiments/perplexity/token_curves_{rule_suffix}.png")
-    out_log_path = Path(f"experiments/perplexity/token_curves_{rule_suffix}_log.png")
+    csv_path = OUTPUT_DIR / f"curves_{rule_suffix}.csv"
+    out_path = OUTPUT_DIR / f"curves_{rule_suffix}.png"
+    out_log_path = OUTPUT_DIR / f"curves_{rule_suffix}_log.png"
 
     # Get compressor configs
     compressors = get_compressor_configs(
@@ -331,7 +333,12 @@ if __name__ == "__main__":
     parser.add_argument("--bias-comparison", action="store_true", default=False,
                         help="Bias comparison mode: Mean & Attn-Weighted only, same color per compressor, "
                              "different linestyle per bias mode (adaptive=bold, fixed=dotted, none=solid)")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
     args = parser.parse_args()
+
+    # If --allow-skipping is passed, it acts like --plot-only when CSV exists
+    plot_only = args.plot_only or args.allow_skipping
 
     run(
         refinement_rule=args.rule,
@@ -349,5 +356,5 @@ if __name__ == "__main__":
         include_adaptive_k=args.adaptive_k,
         include_encoder=args.encoder,
         bias_comparison_mode=args.bias_comparison,
-        plot_only=args.plot_only,
+        plot_only=plot_only,
     )

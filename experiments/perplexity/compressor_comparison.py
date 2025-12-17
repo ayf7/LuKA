@@ -26,18 +26,19 @@ from modeling.compressor import (
 )
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
+from experiments.perplexity.utils import get_output_dir
 
 
 # Output paths
-OUTPUT_DIR = Path("experiments/perplexity")
-CSV_PATH = OUTPUT_DIR / "compressor_comparison.csv"
-RETENTION_CSV_PATH = OUTPUT_DIR / "compressor_retention.csv"
-PPL_PLOT_PATH = OUTPUT_DIR / "compressor_ppl_vs_threshold.png"
-PPL_LOG_PLOT_PATH = OUTPUT_DIR / "compressor_ppl_vs_threshold_log.png"
-RETENTION_PLOT_PATH = OUTPUT_DIR / "compressor_retention_vs_ppl.png"
-RETENTION_LOG_PLOT_PATH = OUTPUT_DIR / "compressor_retention_vs_ppl_log.png"
-RETENTION_LOGLOG_PLOT_PATH = OUTPUT_DIR / "compressor_retention_vs_ppl_loglog.png"
-CURVE_PLOT_PATH = OUTPUT_DIR / "compressor_pertoken_curve.png"
+OUTPUT_DIR = get_output_dir("compressor_comparison")
+CSV_PATH = OUTPUT_DIR / "results.csv"
+RETENTION_CSV_PATH = OUTPUT_DIR / "retention.csv"
+PPL_PLOT_PATH = OUTPUT_DIR / "ppl_vs_threshold.png"
+PPL_LOG_PLOT_PATH = OUTPUT_DIR / "ppl_vs_threshold_log.png"
+RETENTION_PLOT_PATH = OUTPUT_DIR / "retention_vs_ppl.png"
+RETENTION_LOG_PLOT_PATH = OUTPUT_DIR / "retention_vs_ppl_log.png"
+RETENTION_LOGLOG_PLOT_PATH = OUTPUT_DIR / "retention_vs_ppl_loglog.png"
+CURVE_PLOT_PATH = OUTPUT_DIR / "pertoken_curve.png"
 
 
 # Compressor configurations
@@ -608,23 +609,33 @@ def main():
                         help="Only generate plots from existing CSVs")
     parser.add_argument("--no-log-bias", action="store_true",
                         help="Exclude log(N) bias variants")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
     args = parser.parse_args()
 
     thresholds = [float(t) for t in args.thresholds.split(",")]
     include_log_bias = not args.no_log_bias
 
-    if args.plot_only:
+    if args.plot_only or (args.allow_skipping and CSV_PATH.exists()):
         print("Loading data from CSVs...")
-        records, compressors, baseline_info = load_csvs(include_log_bias=include_log_bias)
-        print_summary(records, compressors, baseline_info)
-        generate_plots(records, compressors, baseline_info)
-    else:
-        records, compressors, baseline_info = run_experiments(
-            thresholds, args.max_tokens, include_log_bias
-        )
-        print_summary(records, compressors, baseline_info)
-        save_csvs(records, compressors, baseline_info)
-        generate_plots(records, compressors, baseline_info)
+        try:
+            records, compressors, baseline_info = load_csvs(include_log_bias=include_log_bias)
+            print_summary(records, compressors, baseline_info)
+            generate_plots(records, compressors, baseline_info)
+            if args.allow_skipping:
+                print("Skipped experiments - using cached results.")
+            return
+        except Exception as e:
+            if args.plot_only:
+                raise
+            print(f"Failed to load CSV: {e}, running experiments...")
+
+    records, compressors, baseline_info = run_experiments(
+        thresholds, args.max_tokens, include_log_bias
+    )
+    print_summary(records, compressors, baseline_info)
+    save_csvs(records, compressors, baseline_info)
+    generate_plots(records, compressors, baseline_info)
 
 
 if __name__ == "__main__":

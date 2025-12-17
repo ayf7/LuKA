@@ -32,6 +32,7 @@ from experiments.perplexity.utils import (
     run_single_config,
     load_eval_text,
     MODEL_NAME,
+    get_output_dir,
 )
 from modeling.compressor import (
     AttentionWeightedCompressor,
@@ -42,11 +43,11 @@ from modeling.compressor import (
 
 
 # Output paths
-OUTPUT_DIR = Path("experiments/perplexity")
-CSV_PATH = OUTPUT_DIR / "value_ablation_sweep.csv"
-PLOT_PATH = OUTPUT_DIR / "value_ablation_sweep.png"
-PLOT_LOG_PATH = OUTPUT_DIR / "value_ablation_sweep_log.png"
-PLOT_LOGLOG_PATH = OUTPUT_DIR / "value_ablation_sweep_loglog.png"
+OUTPUT_DIR = get_output_dir("value_ablation_sweep")
+CSV_PATH = OUTPUT_DIR / "results.csv"
+PLOT_PATH = OUTPUT_DIR / "sweep.png"
+PLOT_LOG_PATH = OUTPUT_DIR / "sweep_log.png"
+PLOT_LOGLOG_PATH = OUTPUT_DIR / "sweep_loglog.png"
 
 
 def get_compressor_configs():
@@ -98,6 +99,7 @@ def run(
     prompt_name: str = "paragraphs_1",
     eval_dataset: str = None,
     model_name: str = None,
+    allow_skipping: bool = False,
 ):
     if fracs is None:
         fracs = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
@@ -108,11 +110,11 @@ def run(
     # Get compressor configs
     compressors = get_compressor_configs()
 
-    # Load existing results if CSV exists
+    # Load existing results if CSV exists and allow_skipping is enabled
     existing_results = {}
     existing_base_ppl = None
     existing_base_tps = None
-    if CSV_PATH.exists():
+    if allow_skipping and CSV_PATH.exists():
         print(f"Found existing CSV at {CSV_PATH}, loading...")
         existing_results, _, existing_base_ppl, existing_base_tps = load_csv()
         print(f"  Loaded {sum(len(v) for v in existing_results.values())} existing results")
@@ -403,6 +405,8 @@ def main():
                         help="Model name (default: Qwen/Qwen3-1.7B-Base)")
     parser.add_argument("--plot-only", action="store_true",
                         help="Only generate plots from existing CSV")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
     args = parser.parse_args()
 
     if args.plot_only:
@@ -417,6 +421,7 @@ def main():
             prompt_name=args.prompt,
             eval_dataset=args.dataset,
             model_name=args.model,
+            allow_skipping=args.allow_skipping,
         )
 
 

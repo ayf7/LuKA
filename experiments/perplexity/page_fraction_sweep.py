@@ -26,16 +26,17 @@ from experiments.perplexity.utils import (
     run_single_config,
     load_eval_text,
     MODEL_NAME,
+    get_output_dir,
 )
 from modeling.compressor import AttentionWeightedCompressor, MeanCompressor, RandomCompressor
 
 
 # Output paths
-OUTPUT_DIR = Path("experiments/perplexity")
-CSV_PATH = OUTPUT_DIR / "page_fraction_sweep.csv"
-PLOT_PATH = OUTPUT_DIR / "page_fraction_sweep.png"
-PLOT_LOG_PATH = OUTPUT_DIR / "page_fraction_sweep_log.png"
-PLOT_LOGLOG_PATH = OUTPUT_DIR / "page_fraction_sweep_loglog.png"
+OUTPUT_DIR = get_output_dir("page_fraction_sweep")
+CSV_PATH = OUTPUT_DIR / "results.csv"
+PLOT_PATH = OUTPUT_DIR / "sweep.png"
+PLOT_LOG_PATH = OUTPUT_DIR / "sweep_log.png"
+PLOT_LOGLOG_PATH = OUTPUT_DIR / "sweep_loglog.png"
 
 
 def get_compressor_configs():
@@ -74,6 +75,7 @@ def run(
     prompt_name: str = "paragraphs_1",
     eval_dataset: str = None,
     model_name: str = None,
+    allow_skipping: bool = False,
 ):
     if fracs is None:
         fracs = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -84,11 +86,11 @@ def run(
     # Get compressor configs
     compressors = get_compressor_configs()
 
-    # Load existing results if CSV exists
+    # Load existing results if CSV exists and allow_skipping is enabled
     existing_results = {}
     existing_base_ppl = None
     existing_base_tps = None
-    if CSV_PATH.exists():
+    if allow_skipping and CSV_PATH.exists():
         print(f"Found existing CSV at {CSV_PATH}, loading...")
         existing_results, _, existing_base_ppl, existing_base_tps = load_csv()
         print(f"  Loaded {sum(len(v) for v in existing_results.values())} existing results")
@@ -111,21 +113,23 @@ def run(
         device = get_device()
         tokenizer = get_tokenizer(model_name)
 
-        # Load evaluation data
+        # Load evaluation data (teacher-forcing, no generation)
         if eval_dataset:
             print(f"Loading eval text from {eval_dataset} (max {max_tokens} tokens)...")
             _, rollout_ids = load_eval_text(eval_dataset, max_tokens, tokenizer=tokenizer)
             rollout_ids = rollout_ids.to(device)
-            prompt_len = min(64, rollout_ids.shape[1] // 4)
-            print(f"Total tokens: {rollout_ids.shape[1]}, prompt_len: {prompt_len}")
         else:
-            from experiments.perplexity.utils import generate_baseline_rollout
+            # Load prompt text directly for teacher-forcing
             prompt = get_prompt(prompt_name)
-            print("Generating baseline rollout...")
-            rollout_ids, _ = generate_baseline_rollout(tokenizer, prompt, device, max_tokens)
+            print(f"Loading prompt '{prompt_name}' for teacher-forcing evaluation...")
+            rollout_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+            if rollout_ids.shape[1] > max_tokens:
+                rollout_ids = rollout_ids[:, :max_tokens]
             rollout_ids = rollout_ids.to(device)
-            prompt_len = tokenizer(prompt, return_tensors="pt")["input_ids"].size(1)
-            print(f"Rollout: {rollout_ids.shape[1]} tokens, prompt_len={prompt_len}")
+
+        # Use small prompt_len for prefill (teacher-forcing on rest)
+        prompt_len = 1
+        print(f"Total tokens: {rollout_ids.shape[1]}, prompt_len: {prompt_len} (teacher-forcing on {rollout_ids.shape[1] - prompt_len} tokens)")
 
         # Get baseline perplexity
         if need_baseline:
@@ -354,9 +358,9 @@ def load_csv():
 def main():
     parser = argparse.ArgumentParser(description="Page fraction refinement sweep")
     parser.add_argument("--fracs", type=float, nargs="+",
-                        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+                        default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
                         help="Fraction values to sweep")
-    parser.add_argument("--max-tokens", type=int, default=512,
+    parser.add_argument("--max-tokens", type=int, default=1024,
                         help="Max tokens for evaluation")
     parser.add_argument("--prompt", type=str, default="paragraphs_1",
                         help="Prompt name (if not using dataset)")
@@ -367,6 +371,8 @@ def main():
                         help="Model name (default: Qwen/Qwen3-1.7B-Base)")
     parser.add_argument("--plot-only", action="store_true",
                         help="Only generate plots from existing CSV")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
     args = parser.parse_args()
 
     if args.plot_only:
@@ -381,6 +387,7 @@ def main():
             prompt_name=args.prompt,
             eval_dataset=args.dataset,
             model_name=args.model,
+            allow_skipping=args.allow_skipping,
         )
 
 

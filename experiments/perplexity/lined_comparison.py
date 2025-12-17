@@ -25,19 +25,20 @@ from experiments.perplexity.utils import (
     get_baseline_perplexity,
     load_eval_text,
     generate_baseline_rollout,
+    get_output_dir,
 )
 from modeling.compressor import AttentionWeightedCompressor
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 
 
 # Output paths
-OUTPUT_DIR = Path("experiments/perplexity")
-CSV_PATH = OUTPUT_DIR / "lined_comparison.csv"
-PLOT_PATH = OUTPUT_DIR / "lined_comparison.png"
-PLOT_LOG_PATH = OUTPUT_DIR / "lined_comparison_log.png"
-CURVE_PLOT_PATH = OUTPUT_DIR / "lined_comparison_curves.png"
-TOKEN_PLOT_PATH = OUTPUT_DIR / "lined_comparison_token.png"
-TOKEN_LOG_PLOT_PATH = OUTPUT_DIR / "lined_comparison_token_log.png"
+OUTPUT_DIR = get_output_dir("lined_comparison")
+CSV_PATH = OUTPUT_DIR / "results.csv"
+PLOT_PATH = OUTPUT_DIR / "comparison.png"
+PLOT_LOG_PATH = OUTPUT_DIR / "comparison_log.png"
+CURVE_PLOT_PATH = OUTPUT_DIR / "curves.png"
+TOKEN_PLOT_PATH = OUTPUT_DIR / "token.png"
+TOKEN_LOG_PLOT_PATH = OUTPUT_DIR / "token_log.png"
 
 
 def get_attention_configs(num_layers: int):
@@ -470,11 +471,25 @@ def run(
     eval_dataset: str = None,
     model_name: str = None,
     prompt_len_override: int = None,
+    allow_skipping: bool = False,
 ):
     import torch
 
     if model_name is None:
         model_name = MODEL_NAME
+
+    # Check for existing results if allow_skipping is enabled
+    if allow_skipping and CSV_PATH.exists():
+        print(f"Found existing CSV at {CSV_PATH}, loading cached results...")
+        try:
+            results, configs, base_ppl, base_tps, base_curve, num_layers = load_csv()
+            print(f"  Loaded results for {len(results)} configurations")
+            print(f"  Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
+            # Generate plots from cached data
+            generate_plots(results, configs, base_ppl, base_curve, base_token_curve=None)
+            return results, configs, base_ppl, base_tps, base_curve
+        except Exception as e:
+            print(f"  Failed to load CSV: {e}, running experiments...")
 
     device = get_device()
     tokenizer = get_tokenizer(model_name)
@@ -579,6 +594,8 @@ def main():
                         help="Prompt name if not using dataset")
     parser.add_argument("--plot-only", action="store_true",
                         help="Only generate plots from existing CSV")
+    parser.add_argument("--allow-skipping", action="store_true",
+                        help="Skip experiments if results already exist in CSV")
     args = parser.parse_args()
 
     if args.plot_only:
@@ -594,6 +611,7 @@ def main():
             eval_dataset=args.dataset,
             model_name=args.model,
             prompt_len_override=args.prompt_len,
+            allow_skipping=args.allow_skipping,
         )
 
 

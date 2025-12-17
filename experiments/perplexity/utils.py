@@ -8,6 +8,24 @@ from pathlib import Path
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
+
+def get_output_dir(script_name: str) -> Path:
+    """
+    Get the output directory for a script.
+
+    Creates a subdirectory under experiments/perplexity/ named after the script.
+    For example, lined_comparison.py saves to experiments/perplexity/lined_comparison/
+
+    Args:
+        script_name: Name of the script (without .py extension)
+
+    Returns:
+        Path to the output directory (created if it doesn't exist)
+    """
+    output_dir = Path("experiments/perplexity") / script_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
 from modeling.compressor import (
     AttentionWeightedCompressor,
     AttentionWeightedZeroVCompressor,
