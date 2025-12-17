@@ -133,9 +133,6 @@ class DummySegmenter(Segmenter):
             if ends:
                 page_ends[b, :len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
             
-            if ends:
-                page_ends[b, :len(ends)] = torch.tensor(ends, device=device, dtype=torch.long)
-        
         self._validate_output(page_ends, cover_indices)
         return page_ends
 

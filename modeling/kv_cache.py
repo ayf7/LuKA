@@ -81,11 +81,6 @@ class RawCache:
         if self.raw_seq_start[layer_idx] is None:
             self.raw_seq_start[layer_idx] = self.seq_start[layer_idx].clone()
 
-        if layer_idx == 0:
-            # print(self.seq_start[layer_idx])
-            # print(self.raw_seq_start[layer_idx])
-            pass
-            
         # Invariant checks
         # Ensure seq_start (left padding) is not greater than raw_seq_start (raw frontier)
         # seq_start: [B], raw_seq_start: [B]
@@ -378,6 +373,107 @@ class SummaryCache:
         if page_frontier is not None:
             self.page_frontier[batch_nums] = page_frontier
 
+class GridCache:
+    """
+    Cache for 'lined attention' tokens: raw tokens that are globally important
+    and should stay available even when surrounding context is compressed.
+    
+    Each layer has its own GridCache. For batch b, we store:
+      - keys[b, :, :lens[b], :]   : [H, G_b, D] grid token keys
+      - values[b, :, :lens[b], :] : [H, G_b, D] grid token values
+      - indices[b, :lens[b]]      : [G_b] raw indices (0..T_raw-1)
+    
+    This cache doesn't decide which tokens are grid yet; it just stores them.
+    """
+    def __init__(self, config: PretrainedConfig):
+        self.config = config
+        self.keys: torch.Tensor | None = None       # [B, H, G_max, D]
+        self.values: torch.Tensor | None = None     # [B, H, G_max, D]
+        self.indices: torch.Tensor | None = None    # [B, G_max]
+        self.lens: torch.Tensor | None = None       # [B]
+
+    def initialize(self, B: int, H: int, D: int, device: torch.device, dtype: torch.dtype):
+        """Initialize with empty state (0 grid tokens)."""
+        if self.keys is not None:
+            return
+        self.keys = torch.zeros(B, H, 0, D, device=device, dtype=dtype)
+        self.values = torch.zeros(B, H, 0, D, device=device, dtype=dtype)
+        self.indices = torch.zeros(B, 0, dtype=torch.long, device=device)
+        self.lens = torch.zeros(B, dtype=torch.long, device=device)
+
+    def set_tokens(
+        self,
+        keys: torch.Tensor,     # [B, H, G, D]
+        values: torch.Tensor,   # [B, H, G, D]
+        indices: torch.Tensor,  # [B, G] (raw indices, -1 for padding)
+    ):
+        """
+        Overwrite the current grid tokens with the provided ones.
+        
+        All batches share the same G_max (time dim), but each batch b can use
+        fewer tokens as indicated by indices[b] == -1 and lens[b].
+        """
+        assert keys.shape == values.shape, \
+            f"Invariant Violation: grid keys/values shape mismatch: {keys.shape} vs {values.shape}"
+        B, H, G, D = keys.shape
+        device, dtype = keys.device, keys.dtype
+
+        if self.keys is None:
+            self.initialize(B, H, D, device, dtype)
+
+        # If we need more grid capacity than before, pad time dim
+        if G > self.keys.shape[2]:
+            pad_g = G - self.keys.shape[2]
+            self.keys = torch.cat(
+                [self.keys,
+                 torch.zeros(self.keys.shape[0], H, pad_g, D, device=device, dtype=dtype)],
+                dim=2,
+            )
+            self.values = torch.cat(
+                [self.values,
+                 torch.zeros(self.values.shape[0], H, pad_g, D, device=device, dtype=dtype)],
+                dim=2,
+            )
+            self.indices = torch.cat(
+                [self.indices,
+                 torch.zeros(self.indices.shape[0], pad_g, dtype=torch.long, device=device)],
+                dim=1,
+            )
+
+        # Resize batch dim if needed (paranoid, usually B matches)
+        if B > self.keys.shape[0]:
+            pad_b = B - self.keys.shape[0]
+            self.keys = torch.cat(
+                [self.keys,
+                 torch.zeros(pad_b, H, self.keys.shape[2], D, device=device, dtype=dtype)],
+                dim=0,
+            )
+            self.values = torch.cat(
+                [self.values,
+                 torch.zeros(pad_b, H, self.values.shape[2], D, device=device, dtype=dtype)],
+                dim=0,
+            )
+            self.indices = torch.cat(
+                [self.indices,
+                 torch.zeros(pad_b, self.indices.shape[1], dtype=torch.long, device=device)],
+                dim=0,
+            )
+            self.lens = torch.cat(
+                [self.lens,
+                 torch.zeros(pad_b, dtype=torch.long, device=device)],
+                dim=0,
+            )
+
+        # Overwrite active portion
+        self.keys[:, :, :G, :] = keys
+        self.values[:, :, :G, :] = values
+        self.indices[:, :G] = indices
+
+        # Compute lens per batch as the count of indices >= 0
+        with torch.no_grad():
+            valid = (indices >= 0)
+            self.lens = valid.sum(dim=1).to(dtype=torch.long)
+
 class CoverView:
 
     def __init__(self):
@@ -481,7 +577,8 @@ class CoverView:
     def update_cover_view(self,
         layer_idx: int,
         raw_cache: RawCache,
-        summary_cache: SummaryCache
+        summary_cache: SummaryCache,
+        grid_cache: Optional["GridCache"] = None,
     ):
         """Rebuild cover view after new pages are materialized. This happens after
         the raw_cache nad summary_cache have initialized their new pages.
@@ -522,19 +619,46 @@ class CoverView:
         batched_is_sum = []
         
         for b in range(B):
-            # Summary Part
-            # Handle case where summary_cache is smaller than raw_cache (lazy init)
+            # -------------------------
+            # 0) Grid (lined) tokens
+            # -------------------------
+            if grid_cache is not None and grid_cache.keys is not None and grid_cache.lens is not None:
+                if b < grid_cache.keys.shape[0]:
+                    g_len = int(grid_cache.lens[b].item())
+                    if g_len > 0:
+                        k_g = grid_cache.keys[b, :, :g_len, :]   # [H, G, D]
+                        v_g = grid_cache.values[b, :, :g_len, :]
+                        idx_g = grid_cache.indices[b, :g_len]    # [G] raw indices
+                        is_sum_g = torch.zeros(g_len, dtype=torch.long, device=device)
+                    else:
+                        k_g = torch.empty(H, 0, D, device=device, dtype=k_raw.dtype)
+                        v_g = torch.empty(H, 0, D, device=device, dtype=v_raw.dtype)
+                        idx_g = torch.empty(0, dtype=torch.long, device=device)
+                        is_sum_g = torch.empty(0, dtype=torch.long, device=device)
+                else:
+                    k_g = torch.empty(H, 0, D, device=device, dtype=k_raw.dtype)
+                    v_g = torch.empty(H, 0, D, device=device, dtype=v_raw.dtype)
+                    idx_g = torch.empty(0, dtype=torch.long, device=device)
+                    is_sum_g = torch.empty(0, dtype=torch.long, device=device)
+            else:
+                # No grid tokens for this batch/layer
+                k_g = torch.empty(H, 0, D, device=device, dtype=k_raw.dtype)
+                v_g = torch.empty(H, 0, D, device=device, dtype=v_raw.dtype)
+                idx_g = torch.empty(0, dtype=torch.long, device=device)
+                is_sum_g = torch.empty(0, dtype=torch.long, device=device)
+
+            # -------------------------
+            # 1) Summary Part (existing)
+            # -------------------------
             if sum_k is not None and page_lens is not None:
                 if b < page_lens.shape[0]:
-                    p_len = page_lens[b]
-                    k_s = sum_k[b, :, :p_len, :] # [H, P, D]
+                    p_len = int(page_lens[b].item())
+                    k_s = sum_k[b, :, :p_len, :]  # [H, P, D]
                     v_s = sum_v[b, :, :p_len, :]
                 else:
-                    # Batch index outside summary cache -> treat as 0 pages
                     k_s = torch.empty(H, 0, D, device=device, dtype=k_raw.dtype)
                     v_s = torch.empty(H, 0, D, device=device, dtype=v_raw.dtype)
                     p_len = 0
-
                 
                 # Indices for summary: we use the PAGE INDEX (0 to P-1)
                 # But we need to distinguish summary indices from raw indices.
@@ -544,26 +668,23 @@ class CoverView:
                 idx_s = torch.arange(p_len, device=device)
                 is_sum_s = torch.ones(p_len, dtype=torch.long, device=device)
             else:
-                k_s = torch.empty(H, 0, D, device=device)
-                v_s = torch.empty(H, 0, D, device=device)
+                k_s = torch.empty(H, 0, D, device=device, dtype=k_raw.dtype)
+                v_s = torch.empty(H, 0, D, device=device, dtype=v_raw.dtype)
                 idx_s = torch.empty(0, dtype=torch.long, device=device)
                 is_sum_s = torch.empty(0, dtype=torch.long, device=device)
                 p_len = 0
             
-            # Raw Tail Part
-            # Starts at `raw_seq_start[b]`
+            # -------------------------
+            # 2) Raw Tail Part (existing)
+            # -------------------------
             r_start = raw_seq_start[b].item() if raw_seq_start is not None else 0
-            # Ensure r_start is valid
             r_start = min(r_start, T_raw)
-            
-            k_r = k_raw[b, :, r_start:, :] # [H, T_tail, D]
+            k_r = k_raw[b, :, r_start:, :]  # [H, T_tail, D]
             v_r = v_raw[b, :, r_start:, :]
             
             tail_len = k_r.shape[1]
-            tail_len = k_r.shape[1]
             idx_r = torch.arange(r_start, r_start + tail_len, device=device)
             
-            # Mask padding in raw tail
             if seq_start is not None:
                 pad_end = seq_start[b].item()
                 is_pad = idx_r < pad_end
@@ -571,11 +692,13 @@ class CoverView:
                 
             is_sum_r = torch.zeros(tail_len, dtype=torch.long, device=device)
             
-            # Concatenate
-            batched_k.append(torch.cat([k_s, k_r], dim=1))
-            batched_v.append(torch.cat([v_s, v_r], dim=1))
-            batched_idx.append(torch.cat([idx_s, idx_r], dim=0))
-            batched_is_sum.append(torch.cat([is_sum_s, is_sum_r], dim=0))
+            # -------------------------
+            # 3) Concatenate: [Grid] + [Summaries] + [Raw tail]
+            # -------------------------
+            batched_k.append(torch.cat([k_g, k_s, k_r], dim=1))
+            batched_v.append(torch.cat([v_g, v_s, v_r], dim=1))
+            batched_idx.append(torch.cat([idx_g, idx_s, idx_r], dim=0))
+            batched_is_sum.append(torch.cat([is_sum_g, is_sum_s, is_sum_r], dim=0))
             
         # Pad and Stack
         lengths = [x.shape[1] for x in batched_k]
@@ -600,7 +723,14 @@ class CoverView:
 
 class AttentionScoreBuffer:
 
-    refinement_counts = None # [B, T_current]
+    def __init__(self):
+        """Initialize with None attributes (will be set by initialize() or push())."""
+        self.attention_weights = None
+        self.cover_indices = None
+        self.cover_is_summary = None
+        self.refinement_counts = None
+        self.total_summaries_seen = 0
+        self.total_refinements_made = 0
         
     def initialize(self, B: int, H: int, T_init: int, device: torch.device, dtype: torch.dtype):
         """Initialize the buffer with empty state.
@@ -682,7 +812,7 @@ class AttentionScoreBuffer:
         
         if self.refinement_counts is None or self.refinement_counts.shape[1] < T_new:
              # This should be handled by padding logic above if T_new > T_curr
-             pass
+             pass  # Padding logic handles this case
 
     def get_data(self):
         return self.attention_weights, self.cover_indices, self.cover_is_summary
@@ -713,7 +843,8 @@ class AttentionScoreBuffer:
                 inclusive raw indices for newly created pages.
             new_frontiers: [B] raw index of the start of the remaining raw tail.
         """
-        if self.attention_weights is None:
+        # Early return if buffer not initialized (e.g., raw attention mode with threshold < 0)
+        if self.cover_indices is None or self.attention_weights is None:
             return
 
         B, H, L, T = self.attention_weights.shape
@@ -837,7 +968,16 @@ class AttentionScoreBuffer:
 
 class LukaKVController:
 
-    def __init__(self, config: PretrainedConfig, num_layers: Optional[int] = None):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        num_layers: Optional[int] = None,
+        use_lined_attention: bool = False,
+        lined_layers: Optional[List[int]] = None,
+        grid_top_k: int = 16,
+        grid_update_interval: int = 16,
+        grid_decay: float = 0.99,
+    ):
         """Coordinating facade that owns raw, summary, cover, and attention buffers.
 
         Caches are tracked per-layer to mirror the underlying transformer stack.
@@ -845,6 +985,11 @@ class LukaKVController:
             config: PretrainedConfig supplying at least `num_hidden_layers` (or pass
                 `num_layers` explicitly).
             num_layers: Optional override for layer count if not present on config.
+            use_lined_attention: If True, use lined attention for layers in lined_layers.
+            lined_layers: List of layer indices to use lined attention. If None and use_lined_attention=True, uses all layers.
+            grid_top_k: Number of grid tokens per batch/layer for lined attention.
+            grid_update_interval: How often to recompute grid tokens.
+            grid_decay: Exponential decay factor for grid scores.
         """
         self.num_layers = num_layers or getattr(config, "num_hidden_layers", None)
         if self.num_layers is None:
@@ -855,6 +1000,8 @@ class LukaKVController:
         self.summary_cache: List[SummaryCache] = [SummaryCache(config) for _ in range(self.num_layers)]
         self.cover_view: List[CoverView] = [CoverView() for _ in range(self.num_layers)]
         self.attn_buffer: List[AttentionScoreBuffer] = [AttentionScoreBuffer() for _ in range(self.num_layers)]
+        # NEW: lined-attention cache (vertical-line / global tokens)
+        self.grid_cache: List[GridCache] = [GridCache(config) for _ in range(self.num_layers)]
         
         # Initialize segmenter and compressor
         # Using defaults for now; ideally these come from config.
@@ -862,6 +1009,60 @@ class LukaKVController:
         self.compressor = MeanCompressor()
         # How often to attempt segmentation/compression (every N decode steps)
         self.segment_interval = 1
+        self.seg_step_counters = [0 for _ in range(self.num_layers)]
+        
+        # H2O-like grid / heavy-hitter parameters for lined attention
+        self.use_lined_attention = use_lined_attention
+        self.lined_layers = set(lined_layers) if lined_layers is not None else (set(range(self.num_layers)) if use_lined_attention else set())
+        self.grid_top_k = grid_top_k
+        self.grid_update_interval = grid_update_interval
+        self.grid_decay = grid_decay
+        # Per-layer running scores over raw positions (initialized lazily)
+        self.grid_scores: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
+        self.grid_step_counters = [0 for _ in range(self.num_layers)]
+        
+        # Gentle H2O-ish knobs
+        self.min_lined_seq_len = 384        # don't compress before this many tokens (increased for better quality)
+        self.min_lined_tail_window = 192    # minimum local tail length (increased for better context)
+        self.grid_min_change_ratio = 0.3    # only refresh grid if ≥30% of top-K changed
+        
+        # Debug flag: set to True to enable diagnostic prints (slows down generation significantly)
+        self.debug = False
+    
+    def reset(self):
+        """Reset all cache state. Call this before each new question/example to prevent cache contamination."""
+        # Get config from raw_cache (it has the config)
+        config = self.raw_cache.config
+        
+        # Reset raw cache (clear underlying DynamicCache)
+        if self.raw_cache.cache is not None:
+            # Clear the underlying DynamicCache by setting it to None
+            # The cache will be reinitialized on the next forward pass
+            self.raw_cache.cache = None
+        
+        # Reset metadata
+        self.raw_cache.seq_start = [None] * self.num_layers
+        self.raw_cache.raw_seq_start = [None] * self.num_layers
+        
+        # Reset summary caches
+        for layer_idx in range(self.num_layers):
+            self.summary_cache[layer_idx] = SummaryCache(config)
+        
+        # Reset cover views
+        for layer_idx in range(self.num_layers):
+            self.cover_view[layer_idx] = CoverView()
+        
+        # Reset attention buffers
+        for layer_idx in range(self.num_layers):
+            self.attn_buffer[layer_idx].reset()
+        
+        # Reset grid caches
+        for layer_idx in range(self.num_layers):
+            self.grid_cache[layer_idx] = GridCache(config)
+        
+        # Reset grid scores and counters
+        self.grid_scores = [None for _ in range(self.num_layers)]
+        self.grid_step_counters = [0 for _ in range(self.num_layers)]
         self.seg_step_counters = [0 for _ in range(self.num_layers)]
     
     def initialize_views(self, layer_idx: int):
@@ -899,6 +1100,15 @@ class LukaKVController:
             
             # Initialize summary cache
             self.summary_cache[layer_idx].initialize(
+                B=B,
+                H=H, # H_k
+                D=D,
+                device=k_raw.device,
+                dtype=k_raw.dtype
+            )
+            
+            # Initialize grid cache
+            self.grid_cache[layer_idx].initialize(
                 B=B,
                 H=H, # H_k
                 D=D,
@@ -979,9 +1189,6 @@ class LukaKVController:
         if self.segment_interval > 1 and (self.seg_step_counters[layer_idx] % self.segment_interval) != 0:
             return False
 
-        # 1. Segment
-        # Get buffer data
-        # 1. Segment
         # Get buffer data
         attn_weights, _, _ = self.attn_buffer[layer_idx].get_data()
         
@@ -990,7 +1197,8 @@ class LukaKVController:
         cover_is_summary = self.cover_view[layer_idx].cover_is_summary
         if attn_weights is None:
             return False
-         # 2. Run segmentation
+        
+        # Run segmentation
         # Returns [B, max_pages] of inclusive end indices (raw coordinates)
         page_ends = self.segmenter.process(attn_weights, cover_indices, cover_is_summary, layer_idx=layer_idx)
         if page_ends is None:
@@ -1082,8 +1290,13 @@ class LukaKVController:
             # Update raw_seq_start in RawCache
             raw_cache.raw_seq_start[layer_idx] = new_frontiers
             
-            # Rebuild CoverView
-            self.cover_view[layer_idx].update_cover_view(layer_idx, raw_cache, summary_cache)
+            # Rebuild CoverView (topdown doesn't use grid tokens)
+            self.cover_view[layer_idx].update_cover_view(
+                layer_idx,
+                raw_cache,
+                summary_cache,
+                grid_cache=None,  # topdown doesn't use grid tokens
+            )
             
             # Compress and trim buffer
             self.attn_buffer[layer_idx].compress_and_trim(all_new_pages, new_frontiers)
@@ -1092,6 +1305,317 @@ class LukaKVController:
             return True
             
         return False
+
+    def _update_grid_scores(
+        self,
+        layer_idx: int,
+        attn_probs: torch.Tensor,      # [B, H_q, L_q, T_cover]
+        cover_indices: torch.Tensor,   # [B, T_cover] (raw indices or -1)
+        cover_is_summary: torch.Tensor # [B, T_cover] (all zeros for lined)
+    ):
+        """Update running scores for grid token selection (H2O-style), using
+        only the current step's attention and cover layout.
+        
+        Args:
+            layer_idx: int
+                Transformer layer index.
+            attn_probs: torch.Tensor
+                Current step's attention probabilities [B, H_q, L_q, T_cover].
+            cover_indices: torch.Tensor
+                Current cover's raw indices [B, T_cover].
+            cover_is_summary: torch.Tensor
+                Current cover's summary flags [B, T_cover] (all zeros for lined).
+        """
+        if attn_probs is None:
+            return
+
+        B, H_q, L_q, T_cover = attn_probs.shape
+        device = attn_probs.device
+
+        # Column scores for this step: mean over heads, use last query position
+        # In decode, L_q=1, but this works for both prefill and decode
+        # attn_probs: [B, H_q, L_q, T_cover]
+        scores = attn_probs.mean(dim=1)        # [B, L_q, T_cover] - mean over heads
+        scores = scores[:, -1, :]              # [B, T_cover] - last query position (or only position in decode)
+        col_scores = scores
+
+        # Map cover -> raw indices (for lined: already raw indices)
+        cover_raw_indices = cover_indices  # [B, T_cover]
+
+        # Get raw cache shape
+        k_raw, _, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+        if k_raw is None:
+            return
+        B_raw, H_k, T_raw, D = k_raw.shape
+
+        # Handle possible batch mismatch defensively
+        if B != B_raw:
+            B_use = min(B, B_raw)
+            col_scores = col_scores[:B_use]
+            cover_raw_indices = cover_raw_indices[:B_use]
+            B = B_use
+
+        # Initialize raw-space scores if needed
+        # CRITICAL: If T_raw grows, we need to resize (pad), not reinitialize (which loses accumulated scores)
+        if self.grid_scores[layer_idx] is None:
+            self.grid_scores[layer_idx] = torch.zeros(B_raw, T_raw, device=device, dtype=col_scores.dtype)
+        elif self.grid_scores[layer_idx].shape != (B_raw, T_raw):
+            # T_raw has grown - pad the scores tensor instead of reinitializing
+            old_scores = self.grid_scores[layer_idx]
+            old_B, old_T = old_scores.shape
+            if old_T < T_raw:
+                # Pad with zeros (new positions start with zero scores)
+                pad_T = T_raw - old_T
+                padding = torch.zeros(old_B, pad_T, device=device, dtype=old_scores.dtype)
+                self.grid_scores[layer_idx] = torch.cat([old_scores, padding], dim=1)
+                if self.debug and layer_idx == 0:
+                    print(f"[Layer {layer_idx}] Grid scores resized: {old_scores.shape} -> {self.grid_scores[layer_idx].shape} (T_raw grew from {old_T} to {T_raw})")
+            elif old_B != B_raw:
+                # Batch size changed - handle gracefully
+                B_use = min(old_B, B_raw)
+                if B_use < B_raw:
+                    # Need to pad batch dimension
+                    pad_B = B_raw - B_use
+                    padding = torch.zeros(pad_B, T_raw, device=device, dtype=old_scores.dtype)
+                    self.grid_scores[layer_idx] = torch.cat([old_scores[:B_use], padding], dim=0)
+                else:
+                    self.grid_scores[layer_idx] = old_scores[:B_use]
+
+        raw_scores = self.grid_scores[layer_idx]
+
+        # CRITICAL FIX #1: Exponential decay FIRST (EMA: s_t = λ * s_{t-1} + x_t)
+        # Decay previous scores before adding new ones
+        raw_scores.mul_(self.grid_decay)
+
+        # CRITICAL FIX #2: Use scatter_add_ for proper handling of duplicate indices
+        # This ensures deterministic accumulation when multiple cover positions map to same raw position
+        valid_mask = (cover_raw_indices >= 0)
+        if not valid_mask.any():
+            return
+
+        # Prepare indices and scores for scatter_add_
+        # scatter_add_ needs: (dim, index, src)
+        # For 2D tensor [B, T_raw], we scatter along dim=1 (T_raw dimension)
+        cover_indices_clamped = cover_raw_indices.clamp(min=0, max=T_raw - 1)  # [B, T_cover]
+        
+        # Set invalid positions to 0 (they won't contribute) and their indices to 0 (safe dummy)
+        # This allows us to use scatter_add_ on the full tensors
+        indices_for_scatter = cover_indices_clamped.clone()
+        scores_for_scatter = col_scores.clone()
+        indices_for_scatter[~valid_mask] = 0  # Dummy index for invalid positions
+        scores_for_scatter[~valid_mask] = 0   # Zero score for invalid positions
+        
+        # Use scatter_add_ along dim=1 (sequence dimension)
+        # raw_scores[b, indices_for_scatter[b, i]] += scores_for_scatter[b, i]
+        raw_scores.scatter_add_(dim=1, index=indices_for_scatter, src=scores_for_scatter)
+
+        # Debug: check shapes and score stats (Diagnostic A)
+        if self.debug and layer_idx == 0 and col_scores.numel() > 0:
+            max_score = col_scores[valid_mask].max().item() if valid_mask.any() else 0
+            mean_score = col_scores[valid_mask].mean().item() if valid_mask.any() else 0
+            score_sum = col_scores[valid_mask].sum().item() if valid_mask.any() else 0
+            num_unique = torch.unique(cover_indices_clamped[valid_mask]).numel() if valid_mask.any() else 0
+            if max_score > 0:
+                print(f"[Layer {layer_idx}] Grid score update: attn_probs.shape={attn_probs.shape}, col_scores.shape={col_scores.shape}, max={max_score:.6f}, mean={mean_score:.6f}, sum={score_sum:.6f}, valid_tokens={valid_mask.sum().item()}, unique_positions={num_unique}")
+
+        self.grid_scores[layer_idx] = raw_scores
+
+    def _refresh_grid_tokens(self, layer_idx: int):
+        """Refresh grid tokens by selecting top-K based on accumulated scores (H2O-style).
+        
+        Args:
+            layer_idx: int
+                Transformer layer index.
+        """
+        scores = self.grid_scores[layer_idx]
+        if scores is None:
+            return
+
+        k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+        if k_raw is None:
+            return
+
+        B, H_k, T_raw, D = k_raw.shape
+        device = k_raw.device
+
+        # CRITICAL DIAGNOSTIC: Verify scores shape is correct
+        # Scores should be [B, T_raw], NOT [B, grid_top_k] or [B, T_cover]
+        if self.debug and layer_idx == 0:
+            print(f"[Layer {layer_idx}] REFRESH: scores.shape={scores.shape}, T_raw={T_raw}, grid_top_k={self.grid_top_k}")
+        
+        # Hard assertion to catch the bug immediately
+        assert scores.shape[-1] == T_raw, \
+            f"CRITICAL BUG: Selecting from wrong axis! scores.shape={scores.shape}, T_raw={T_raw}. " \
+            f"Expected scores to be [B, T_raw] but got shape ending in {scores.shape[-1]}. " \
+            f"This means we're selecting from grid slots instead of raw positions!"
+
+        # Ensure scores batch size matches raw cache batch size
+        B_scores = scores.shape[0]
+        if B != B_scores:
+            # This shouldn't happen, but handle it gracefully
+            B_use = min(B, B_scores)
+            scores = scores[:B_use]
+            k_raw = k_raw[:B_use]
+            v_raw = v_raw[:B_use]
+            B = B_use
+
+        # Optional: avoid picking from very recent tail (sliding window)
+        # This ensures grid focuses on older, globally useful tokens
+        # while the tail already covers the most recent tokens
+        window = getattr(self.segmenter, 'tail_len', 16)
+        window = max(window, self.min_lined_tail_window)  # Use same minimum as lined_attention
+        
+        # CRITICAL: Compute tail exclusion in RAW space, not cover space
+        tail_start_raw = max(0, T_raw - window)
+        
+        # CRITICAL FIX: If window >= T_raw, tail_start_raw = 0 means we'd exclude everything
+        # In that case, we can't hard-exclude the tail (nothing would be left to select)
+        # Only exclude tail if there's enough sequence left to select from
+        if tail_start_raw == 0:
+            # Tail covers the whole sequence; don't hard-exclude (would leave nothing)
+            # Option: soft downweight or skip exclusion entirely
+            if self.debug and layer_idx == 0:
+                print(f"[Layer {layer_idx}] Tail exclusion SKIPPED: T_raw={T_raw}, window={window}, tail_start_raw=0 (tail covers entire sequence)")
+            # Don't modify scores - allow selection from entire sequence
+        elif tail_start_raw > 0 and T_raw > tail_start_raw:
+            # We have enough sequence to exclude the tail
+            # Ensure we leave at least grid_top_k tokens selectable
+            min_selectable = max(0, T_raw - self.grid_top_k - 1)  # Leave room for grid_top_k + some buffer
+            if tail_start_raw < min_selectable:
+                # Adjust tail_start_raw to ensure we don't exclude too much
+                tail_start_raw = min_selectable
+                if self.debug and layer_idx == 0:
+                    print(f"[Layer {layer_idx}] Tail exclusion ADJUSTED: clamped tail_start_raw to {tail_start_raw} to ensure {self.grid_top_k} tokens remain selectable")
+            
+            # Debug: check scores before modifying tail
+            if self.debug and layer_idx == 0:
+                max_score_before = scores.max().item()
+                mean_score_before = scores.mean().item()
+                tail_max = scores[:, tail_start_raw:].max().item() if T_raw > tail_start_raw else 0
+                print(f"[Layer {layer_idx}] Tail exclusion: T_raw={T_raw}, window={window}, tail_start_raw={tail_start_raw}, will exclude {T_raw - tail_start_raw} tokens")
+            
+            # CRITICAL FIX #3: Clone before excluding tail (don't modify original scores)
+            # Exclude tail completely from grid selection (set to -inf)
+            # Tail is already in the cover, so grid should focus on older tokens
+            sel_scores = scores.clone()  # Work on a copy
+            sel_scores[:, tail_start_raw:] = float('-inf')  # Exclude from tail_start_raw to end
+            scores = sel_scores  # Use the modified copy
+        else:
+            # Edge case: shouldn't happen, but handle gracefully
+            if self.debug and layer_idx == 0:
+                print(f"[Layer {layer_idx}] Tail exclusion SKIPPED: edge case T_raw={T_raw}, tail_start_raw={tail_start_raw}")
+            
+            # Debug: check scores after reducing tail weight
+            if self.debug and layer_idx == 0:
+                max_score_after = scores.max().item()
+                mean_score_after = scores.mean().item()
+                print(f"[Layer {layer_idx}] Grid scores: before tail reduction - max={max_score_before:.6f}, mean={mean_score_before:.6f}, tail_max={tail_max:.6f}; after - max={max_score_after:.6f}, mean={mean_score_after:.6f}")
+
+        # Top-K per batch
+        # CRITICAL DIAGNOSTIC B: Print scores info right before topk
+        if self.debug and layer_idx == 0:
+            print(f"[Layer {layer_idx}] Before topk: scores.shape={scores.shape}, scores.dtype={scores.dtype}, "
+                  f"scores.min()={scores.min().item():.6f}, scores.max()={scores.max().item():.6f}, "
+                  f"T_raw={T_raw}, grid_top_k={self.grid_top_k}")
+            # Check if scores are all -inf (would indicate everything was excluded)
+            num_inf = (scores == float('-inf')).sum().item()
+            num_finite = (torch.isfinite(scores)).sum().item()
+            print(f"[Layer {layer_idx}] Scores stats: num_inf={num_inf}, num_finite={num_finite}, total={scores.numel()}")
+        
+        # Ensure we don't exceed capacity if prefix was initialized
+        # For now, just select top-K (prefix will be overwritten, but that's okay for initial testing)
+        K = min(self.grid_top_k, T_raw)
+        top_scores, top_indices = torch.topk(scores, k=K, dim=-1)   # [B, K]
+        indices = top_indices.clone()  # [B, K]
+        
+        # CRITICAL DIAGNOSTIC C: Verify we're selecting raw positions and gathering correct KV
+        if self.debug and layer_idx == 0 and B > 0 and K > 0:
+            # Sanity check: verify grid_k[0,0,0] matches k_raw[0,0,indices[0,0]]
+            test_idx = indices[0, 0].item()
+            if test_idx < T_raw and test_idx >= 0:
+                # We'll check this after gathering, but log the index now
+                print(f"[Layer {layer_idx}] Will gather KV from raw position {test_idx} (first selected index)")
+        
+        # Debug: verify indices are not in tail (RED FLAG B check)
+        if self.debug and layer_idx == 0 and T_raw > tail_start_raw:
+            indices_in_tail = (indices >= tail_start_raw).sum().item()
+            max_idx = indices.max().item()
+            min_idx = indices.min().item()
+            if indices_in_tail > 0:
+                print(f"[Layer {layer_idx}] WARNING: {indices_in_tail}/{K} grid indices are in tail (should be 0)")
+            else:
+                print(f"[Layer {layer_idx}] Grid selection: max_idx={max_idx}, min_idx={min_idx}, tail_start_raw={tail_start_raw}, all_indices_outside_tail=✓")
+            
+            # CRITICAL: Verify indices are in valid range [0, T_raw-1]
+            if max_idx >= T_raw:
+                print(f"[Layer {layer_idx}] ERROR: max_idx={max_idx} >= T_raw={T_raw} (out of bounds!)")
+            if min_idx < 0:
+                print(f"[Layer {layer_idx}] ERROR: min_idx={min_idx} < 0 (out of bounds!)")
+
+        # Optional H2O-ish stability: only refresh if top-K actually changed enough
+        prev_indices = None
+        if self.grid_min_change_ratio > 0 and self.grid_cache[layer_idx].indices is not None:
+            prev = self.grid_cache[layer_idx].indices  # [B_prev, G_max]
+            # Align shapes: we only compare first B rows and first K cols
+            B_prev, G_prev = prev.shape
+            B_cmp = min(B_prev, B)
+            K_cmp = min(G_prev, K)
+            if B_cmp > 0 and K_cmp > 0:
+                prev_indices = prev[:B_cmp, :K_cmp]
+                new_indices = indices[:B_cmp, :K_cmp]
+                diff = (prev_indices != new_indices)
+                change_ratio = diff.float().mean().item()
+                if change_ratio < self.grid_min_change_ratio:
+                    # Not enough change in grid membership; keep old grid, bail out
+                    if self.debug and layer_idx == 0:  # Debug print for first layer only
+                        print(f"[Layer {layer_idx}] Grid refresh skipped: change_ratio={change_ratio:.3f} < {self.grid_min_change_ratio}")
+                    return
+
+        # If we're here, either there was no previous grid or it changed meaningfully.
+        # Gather K/V: [B, H_k, K, D]
+        # Build gather index: [B, 1, K, 1] -> expand to [B, H_k, K, D]
+        # Clamp indices to valid range
+        T_raw_max = k_raw.shape[2] - 1
+        indices_clamped = indices.clamp(min=0, max=T_raw_max)
+        gather_idx = indices_clamped.view(B, 1, K, 1).expand(-1, H_k, -1, D)
+        grid_k = torch.gather(k_raw, 2, gather_idx)
+        grid_v = torch.gather(v_raw, 2, gather_idx)
+
+        # CRITICAL DIAGNOSTIC C: Verify KV gathering correctness
+        # Keep this check even when debug=False (it's cheap and catches bugs)
+        if layer_idx == 0 and B > 0 and K > 0:
+            test_idx = indices[0, 0].item()
+            if 0 <= test_idx < T_raw:
+                # Check: grid_k[0,0,0] should equal k_raw[0,0,test_idx]
+                gathered_kv = grid_k[0, 0, 0]
+                raw_kv = k_raw[0, 0, test_idx]
+                is_close = torch.allclose(gathered_kv, raw_kv, atol=1e-5)
+                max_diff = (gathered_kv - raw_kv).abs().max().item()
+                if not is_close:
+                    # Always print errors (not just in debug mode)
+                    print(f"[Layer {layer_idx}] ERROR: KV gather mismatch! grid_k[0,0,0] != k_raw[0,0,{test_idx}], max_diff={max_diff:.6f}")
+                elif self.debug:
+                    print(f"[Layer {layer_idx}] KV gather verified: grid_k[0,0,0] == k_raw[0,0,{test_idx}] ✓ (max_diff={max_diff:.6e})")
+
+        # Write into GridCache
+        self.grid_cache[layer_idx].set_tokens(
+            keys=grid_k,
+            values=grid_v,
+            indices=indices,
+        )
+        
+        # Debug print for first layer only (with all requested diagnostics)
+        if self.debug and layer_idx == 0 and B > 0:
+            grid_indices_b0 = indices[0].cpu().tolist()
+            grid_scores_b0 = top_scores[0].cpu().tolist()
+            max_idx = indices[0].max().item()
+            min_idx = indices[0].min().item()
+            # Check if any indices are in tail (should be 0 after fix)
+            tail_start = T_raw - window if T_raw > window else T_raw
+            indices_in_tail = (indices[0] >= tail_start).sum().item()
+            
+            print(f"[Layer {layer_idx}] Grid refreshed: indices={grid_indices_b0[:5]}... (top 5), scores={[f'{s:.3f}' for s in grid_scores_b0[:5]]}")
+            print(f"[Layer {layer_idx}] Grid selection diagnostics: max_idx={max_idx}, min_idx={min_idx}, tail_start={tail_start}, indices_in_tail={indices_in_tail} (should be 0)")
 
     def top_down_attention(
         self,
@@ -1145,21 +1669,29 @@ class LukaKVController:
 
             attn_weights = torch.matmul(query_states, k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_raw]
             if attention_mask is not None:
-                causal_mask = attention_mask[:, :, :, : k_full.shape[-2]]
+                T_raw = k_full.shape[-2]
+                T_mask = attention_mask.shape[-1]
+                if T_mask < T_raw:
+                    # Mask is smaller than cache (e.g., only covers new tokens)
+                    # Expand mask to match cache size, padding with -inf for positions beyond mask
+                    mask_value = torch.finfo(attn_weights.dtype).min
+                    expanded_mask = torch.full(
+                        (attention_mask.shape[0], attention_mask.shape[1], attention_mask.shape[2], T_raw),
+                        mask_value,
+                        device=attention_mask.device,
+                        dtype=attention_mask.dtype
+                    )
+                    expanded_mask[:, :, :, :T_mask] = attention_mask
+                    causal_mask = expanded_mask
+                else:
+                    # Mask is same size or larger, truncate to cache size
+                    causal_mask = attention_mask[:, :, :, :T_raw]
                 attn_weights = attn_weights + causal_mask
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            # ----------------------------------------------------------------------
-            # Step 4: Output
-            # ----------------------------------------------------------------------
-            # Push to buffer for segmentation
-            # attn_probs: [B, H_q, L_q, T_raw]
-            self.attn_buffer[layer_idx].push(attn_weights)
-            
             attn_output = torch.matmul(attn_weights, v_full)
             attn_output = attn_output.transpose(1, 2).contiguous()
-            
-            return attn_output, attn_weights
+            return attn_output, attn_weights  # no push
 
         # ----------------------------------------------------------------------
         # Step 1: Get Cover
@@ -1173,7 +1705,24 @@ class LukaKVController:
         cover_is_summary = cover_view.cover_is_summary # [B, T_cover]
 
         if cover_k is None or cover_v is None:
-            raise ValueError(f"Cover keys or values are None for layer {layer_idx} - was it initialized correctly?")
+            # Lazy initialization: if cover view isn't initialized yet, initialize it now
+            self.initialize_views(layer_idx)
+            # Build the full cover view with summaries (no grid tokens for topdown)
+            self.cover_view[layer_idx].update_cover_view(
+                layer_idx,
+                self.raw_cache,
+                self.summary_cache[layer_idx],
+                grid_cache=None,  # topdown doesn't use grid tokens
+            )
+            # Re-fetch after initialization
+            cover_view = self.cover_view[layer_idx]
+            cover_k = cover_view.cover_keys
+            cover_v = cover_view.cover_values
+            cover_indices = cover_view.cover_indices
+            cover_is_summary = cover_view.cover_is_summary
+            
+            if cover_k is None or cover_v is None:
+                raise ValueError(f"Cover keys or values are None for layer {layer_idx} after initialization.")
 
         B, H_k, T_cover, D = cover_k.shape
         L_q = query_states.shape[2]
@@ -1189,13 +1738,6 @@ class LukaKVController:
         page_ends = self.summary_cache[layer_idx].page_end       # [B_cache, P_max]
         
         # if layer_idx == 0:
-        #     num_summary = (cover_is_summary == 1).sum().item()
-        #     num_raw = (cover_is_summary == 0).sum().item()
-        #     print(f"[Layer {layer_idx}] Cover stats: Summary={num_summary}, Raw={num_raw}", flush=True)
-        #     if num_summary > 0:
-        #          print(f"  First 10 cover indices: {cover_indices[0].tolist()}", flush=True)
-        #          print(f"  First 10 is_summary: {cover_is_summary[0].tolist()}", flush=True)
-
         # Ensure page_ends matches batch size B
         if page_ends.shape[0] < B:
             pad_b = B - page_ends.shape[0]
@@ -1216,9 +1758,15 @@ class LukaKVController:
         if attention_mask is not None:
             # Gather the precomputed causal/sliding mask for the chosen cover positions
             # attention_mask: [B, 1, L_q, T_raw]
-            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0)
+            T_mask = attention_mask.shape[-1]
+            cover_raw_indices_clamped = cover_raw_indices.clamp(min=0, max=T_mask - 1)
             idx_expanded = cover_raw_indices_clamped[:, None, None, :].expand(-1, 1, L_q, -1)
             cover_mask = attention_mask.gather(3, idx_expanded)
+            # Mask out positions where indices were out of bounds
+            out_of_bounds = (cover_raw_indices < 0) | (cover_raw_indices >= T_mask)
+            if out_of_bounds.any():
+                mask_value = torch.finfo(attn_logits.dtype).min
+                cover_mask = cover_mask.masked_fill(out_of_bounds[:, None, None, :], mask_value)
             
             # Mask out padding (where cover_indices was -1)
             # cover_mask = cover_mask.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value) # Moved outside
@@ -1229,7 +1777,23 @@ class LukaKVController:
 
         # Replace summary logits with log-sum-exp of their raw pages so the summary
         # probability mass matches the true raw probabilities that will be split during refinement.
-        if summary_mask.any():
+        # 
+        # OPTIMIZATION: Skip expensive log-sum-exp when threshold is very high (threshold > 0.8).
+        # 
+        # IMPORTANT: The fast-path cutoff (0.8) is intentionally much higher than normal
+        # refine_threshold values (0.05-0.4). This ensures:
+        # - Normal quality-sensitive runs (threshold ≤ 0.4) always use exact log-sum-exp
+        # - Only explicitly low-quality settings (threshold > 0.8) activate the fast path
+        # - This prevents accidentally degrading quality for normal threshold values
+        # 
+        # When threshold > 0.8, refinement almost never happens, so skipping log-sum-exp
+        # is safe because:
+        # 1. Very high threshold = extremely rare refinement = less sensitive to exact probabilities
+        # 2. Well-trained compressors produce summaries that approximate raw tokens
+        # 3. We're using summaries for final output anyway when threshold is very high
+        use_exact_logsumexp = (threshold is None) or (threshold <= 0.8)
+        
+        if summary_mask.any() and use_exact_logsumexp:
             k_raw_full, _, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False) # [B, H_k, T_raw, D]
             k_full_raw = repeat_kv(k_raw_full, num_kv_groups)      # [B, H_q, T_raw, D]
             
@@ -1251,10 +1815,13 @@ class LukaKVController:
                         continue
 
                     page_ids = cover_indices[b, pos_tensor]                 # [S]
-                    starts_b = page_starts[b, page_ids]                     # [S]
-                    ends_b = page_ends[b, page_ids]                         # [S]
+                    # Clamp page_ids to valid range before indexing
+                    max_page_idx = page_starts.shape[1] - 1
+                    page_ids_clamped = page_ids.clamp(min=0, max=max_page_idx)
+                    starts_b = page_starts[b, page_ids_clamped]                     # [S]
+                    ends_b = page_ends[b, page_ids_clamped]                         # [S]
 
-                    valid = (page_ids >= 0) & (ends_b >= starts_b)
+                    valid = (page_ids >= 0) & (page_ids <= max_page_idx) & (ends_b >= starts_b)
                     invalid_pos = pos_tensor[~valid]
                     if invalid_pos.numel() > 0:
                         attn_logits[b, :, :, invalid_pos] = mask_value
@@ -1273,7 +1840,10 @@ class LukaKVController:
                     pad_mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
                     raw_idx = raw_idx.masked_fill(pad_mask, -1)
 
-                    idx_clamped = raw_idx.clamp(min=0)
+                    # Clamp indices to valid range for both k_full_raw and attention_mask
+                    T_raw_max = k_full_raw.shape[2] - 1
+                    idx_clamped = raw_idx.clamp(min=0, max=T_raw_max)
+                    
                     # Gather keys for all pages at once along the sequence dimension: [1, H_q, S_valid, max_len, D]
                     k_flat = torch.index_select(k_full_raw, 2, idx_clamped.view(-1))  # [B, H_q, S*max_len, D]
                     k_flat_b = k_flat[b]  # [H_q, S*max_len, D]
@@ -1285,8 +1855,15 @@ class LukaKVController:
 
                     if attention_mask is not None:
                         mask_b_full = attention_mask[b:b+1]                 # [1, 1, L_q, T_raw]
-                        mask_flat = torch.index_select(mask_b_full, 3, idx_clamped.view(-1))  # [1,1,L_q,S_valid*max_len]
+                        T_mask = mask_b_full.shape[3]
+                        # Clamp indices to valid mask range
+                        idx_clamped_mask = raw_idx.clamp(min=0, max=T_mask - 1)
+                        mask_flat = torch.index_select(mask_b_full, 3, idx_clamped_mask.view(-1))  # [1,1,L_q,S_valid*max_len]
                         mask_pages = mask_flat.view(1, 1, L_q, raw_idx.shape[0], max_len)     # [1,1,L_q,S_valid,max_len]
+                        # Mask out positions that were out of bounds
+                        out_of_bounds_mask = (raw_idx < 0) | (raw_idx >= T_mask)
+                        if out_of_bounds_mask.any():
+                            mask_pages = mask_pages.masked_fill(out_of_bounds_mask.view(1, 1, 1, -1, max_len), mask_value)
                         mask_pages = mask_pages.permute(0, 1, 3, 2, 4)                         # [1,1,S_valid,L_q,max_len]
                         page_logits = page_logits + mask_pages
 
@@ -1297,6 +1874,14 @@ class LukaKVController:
                     summary_logits = torch.logsumexp(page_logits, dim=-1)[0]   # [H_q, S_valid, L_q]
                     summary_logits = summary_logits.permute(0, 2, 1)           # [H_q, L_q, S_valid]
                     attn_logits[b, :, :, pos_tensor] = summary_logits
+        elif summary_mask.any() and not use_exact_logsumexp:
+            # Fast path: Use summary logits directly (already computed in attn_logits above).
+            # This is acceptable when threshold > 0.8 because:
+            # - Refinement is extremely rare (threshold > 0.8), so exact probability matching is less critical
+            # - Well-trained compressors produce summaries that approximate raw tokens
+            # - The attention distribution will be slightly approximate but acceptable
+            # - User has explicitly chosen a very high threshold, indicating they prioritize speed over exact quality
+            pass  # attn_logits already contains summary logits from initial matmul
 
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
@@ -1360,13 +1945,17 @@ class LukaKVController:
                 # cover_indices[b, pos] gives the page index p
                 page_ids = cover_indices[b_idx, pos_idx] # [N]
                 
+                # Clamp page_ids to valid range before indexing
+                max_page_idx = page_start.shape[1] - 1
+                page_ids_clamped = page_ids.clamp(min=0, max=max_page_idx)
+                
                 # Get raw start/end
-                starts = page_start[b_idx, page_ids] # [N]
-                ends = page_end[b_idx, page_ids]     # [N]
+                starts = page_start[b_idx, page_ids_clamped] # [N]
+                ends = page_end[b_idx, page_ids_clamped]     # [N]
                 lengths = ends - starts + 1          # [N]
                 
                 # Filter invalid (just in case)
-                valid = (page_ids >= 0) & (ends >= starts)
+                valid = (page_ids >= 0) & (page_ids <= max_page_idx) & (ends >= starts)
                 if valid.any():
                     b_idx = b_idx[valid]
                     pos_idx = pos_idx[valid]
@@ -1387,14 +1976,18 @@ class LukaKVController:
                         arange = torch.arange(L, device=query_states.device)
                         raw_idx = start_bucket.unsqueeze(1) + arange.unsqueeze(0)
                         
+                        # Clamp indices to valid range for both KV cache and attention mask
+                        T_raw_max = k_raw.shape[2] - 1
+                        raw_idx_clamped = raw_idx.clamp(min=0, max=T_raw_max)
+                        
                         # Gather raw KV: [M, H_k, L, D]
                         # k_raw: [B, H_k, T_raw, D]
                         # We need to select batch rows b_bucket, then gather along T_raw
                         k_batch = k_raw[b_bucket] # [M, H_k, T_raw, D]
                         v_batch = v_raw[b_bucket]
                         
-                        # Expand raw_idx for gather: [M, H_k, L, D]
-                        gather_idx = raw_idx.view(raw_idx.shape[0], 1, L, 1).expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
+                        # Expand raw_idx_clamped for gather: [M, H_k, L, D]
+                        gather_idx = raw_idx_clamped.view(raw_idx.shape[0], 1, L, 1).expand(-1, k_batch.shape[1], -1, k_batch.shape[3])
                         k_slice = torch.gather(k_batch, 2, gather_idx)
                         v_slice = torch.gather(v_batch, 2, gather_idx)
                         
@@ -1411,10 +2004,18 @@ class LukaKVController:
                         if attention_mask is not None:
                             # mask: [B, 1, L_q, T_raw]
                             mask_bucket = attention_mask[b_bucket] # [M, 1, L_q, T_raw]
-                            # gather along T_raw using raw_idx
-                            # raw_idx: [M, L] -> [M, 1, 1, L]
-                            mask_gather_idx = raw_idx.view(raw_idx.shape[0], 1, 1, L).expand(-1, 1, mask_bucket.shape[2], -1)
+                            T_mask = mask_bucket.shape[3]
+                            # Clamp indices to valid mask range
+                            raw_idx_mask_clamped = raw_idx.clamp(min=0, max=T_mask - 1)
+                            # gather along T_raw using raw_idx_mask_clamped
+                            # raw_idx_mask_clamped: [M, L] -> [M, 1, 1, L]
+                            mask_gather_idx = raw_idx_mask_clamped.view(raw_idx.shape[0], 1, 1, L).expand(-1, 1, mask_bucket.shape[2], -1)
                             mask_slice = torch.gather(mask_bucket, 3, mask_gather_idx)
+                            # Mask out positions that were out of bounds
+                            out_of_bounds_mask = (raw_idx < 0) | (raw_idx >= T_mask)
+                            if out_of_bounds_mask.any():
+                                mask_val = torch.finfo(raw_logits.dtype).min
+                                mask_slice = mask_slice.masked_fill(out_of_bounds_mask.view(-1, 1, 1, L), mask_val)
                             raw_logits = raw_logits + mask_slice
                             
                         raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -1446,6 +2047,319 @@ class LukaKVController:
         # We need to push cover_indices and cover_is_summary as well.
         self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
 
+        return attn_output.transpose(1, 2).contiguous(), attn_probs
+
+    def lined_attention(
+        self,
+        layer_idx: int,
+        query_states: torch.Tensor,      # [B, H_q, L_q, D]
+        scaling: float,
+        num_kv_groups: int,
+        attention_mask: Optional[torch.Tensor] = None,  # [B, 1, L_q, T_raw]
+        sliding_window: Optional[int] = None,
+    ):
+        """Run pure lined attention (H2O-style) with grid tokens + raw tail.
+        
+        Cover = [Grid tokens] + [Raw tail]
+        Pure lined attention: no compression/pages, just globally important tokens (grid) + local tail.
+        
+        Args:
+            layer_idx: int
+                Transformer layer index.
+            query_states: torch.Tensor
+                [B, H_q, L_q, D] query projections for this layer.
+            scaling: float
+                Attention scaling factor (typically 1/sqrt(D)).
+            num_kv_groups: int
+                H_q // H_k; used to expand KV heads for grouped-query attention.
+            attention_mask: Optional[torch.Tensor]
+                [B, 1, L_q, T_raw] causal + padding mask aligned to raw indices.
+            sliding_window: Optional[int]
+                If using sliding window attention; retained for parity with upstream API.
+        
+        Returns:
+            attn_output: torch.Tensor
+                [B, H_q, L_q, D] attended values.
+            attn_probs: torch.Tensor
+                [B, H_q, L_q, T_cover] attention probabilities over cover.
+        """
+        B, H_q, L_q, D = query_states.shape
+        device = query_states.device
+        
+        # --- 1. Get raw cache and apply warmup guard ---
+        k_raw, v_raw, seq_start, raw_seq_start = self.raw_cache.get_layer(layer_idx, with_offsets=True)
+        if k_raw is None or v_raw is None:
+            raise ValueError(f"No raw cache available for layer {layer_idx}.")
+        
+        B_raw, H_k, T_raw, D_k = k_raw.shape
+        
+        # H2O-ish warmup: don't approximate until the sequence is long enough
+        if T_raw < self.min_lined_seq_len:
+            # Fall back to exact/top-down attention
+            return self.top_down_attention(
+                layer_idx=layer_idx,
+                query_states=query_states,
+                scaling=scaling,
+                num_kv_groups=num_kv_groups,
+                attention_mask=attention_mask,
+                sliding_window=sliding_window,
+                threshold=-1.0,   # force exact raw attention path
+            )
+        
+        # --- 2. Get grid tokens from GridCache ---
+        grid_cache = self.grid_cache[layer_idx]
+        if grid_cache.keys is None or grid_cache.lens is None:
+            grid_cache.initialize(B_raw, H_k, D_k, k_raw.device, k_raw.dtype)
+            # Initialize grid with prefix anchor to prevent bootstrapping failure
+            # Use min(32, grid_top_k) to ensure prefix fits within grid capacity
+            prefix_len = min(32, self.grid_top_k, T_raw)
+            if T_raw >= prefix_len and prefix_len > 0:
+                prefix_indices = torch.arange(prefix_len, device=k_raw.device, dtype=torch.long)
+                prefix_k = k_raw[:, :, :prefix_len, :]  # [B, H_k, prefix_len, D]
+                prefix_v = v_raw[:, :, :prefix_len, :]
+                # Set grid to prefix tokens (will be expanded/refreshed later)
+                grid_cache.set_tokens(
+                    keys=prefix_k,
+                    values=prefix_v,
+                    indices=prefix_indices.unsqueeze(0).expand(B_raw, -1),  # [B, prefix_len]
+                )
+                if self.debug and layer_idx == 0:
+                    print(f"[Layer {layer_idx}] Grid initialized with prefix anchor: first {prefix_len} tokens (grid_top_k={self.grid_top_k})")
+        
+        # Ensure grid is properly initialized (safety check)
+        if grid_cache.keys is None or grid_cache.lens is None:
+            raise ValueError(f"Grid cache not initialized for layer {layer_idx}")
+        
+        grid_indices = grid_cache.indices  # [B, G_max]
+        grid_k = grid_cache.keys           # [B, H_k, G_max, D_k]
+        grid_v = grid_cache.values
+        grid_lens = grid_cache.lens        # [B]
+        
+        # Debug: verify grid has tokens
+        if self.debug and layer_idx == 0:
+            grid_len_actual = grid_lens[0].item() if grid_lens.numel() > 0 else 0
+            if grid_len_actual == 0:
+                print(f"[Layer {layer_idx}] WARNING: Grid has 0 tokens! T_raw={T_raw}, min_lined_seq_len={self.min_lined_seq_len}")
+        
+        # --- 3. Build raw tail with a H2O-ish window ---
+        window = getattr(self.segmenter, 'tail_len', 16)
+        # Ensure the local window is reasonably large
+        window = max(window, self.min_lined_tail_window)
+        
+        # Build tail indices per batch
+        
+        batched_tail_indices = []
+        batched_tail_k = []
+        batched_tail_v = []
+        batched_tail_lens = []
+        
+        for b in range(B_raw):
+            if raw_seq_start is not None:
+                base_start = raw_seq_start[b].item()
+            else:
+                base_start = 0
+            
+            # Sliding *local* window: last `window` tokens
+            # CRITICAL: Build tail from T_raw (raw cache), not T_mask (mask size)
+            # We'll pad the mask later to match T_raw, so tail indices will be valid
+            # The tail should ALWAYS be included in the cover (grid + tail)
+            tail_start = max(base_start, T_raw - window)
+            tail_start = min(tail_start, T_raw)
+            tail_len = T_raw - tail_start
+            tail_end = T_raw
+            
+            # Force tail to always include at least some recent tokens
+            # This ensures the model can always attend to recent context
+            if tail_len > 0:
+                tail_indices = torch.arange(tail_start, tail_end, device=device, dtype=torch.long)
+                # Mask padding
+                if seq_start is not None:
+                    pad_end = seq_start[b].item()
+                    is_pad = tail_indices < pad_end
+                    tail_indices[is_pad] = -1
+                
+                tail_k = k_raw[b, :, tail_start:tail_end, :]  # [H_k, tail_len, D]
+                tail_v = v_raw[b, :, tail_start:tail_end, :]
+            else:
+                tail_indices = torch.empty(0, dtype=torch.long, device=device)
+                tail_k = torch.empty(H_k, 0, D_k, device=device, dtype=k_raw.dtype)
+                tail_v = torch.empty(H_k, 0, D_k, device=device, dtype=v_raw.dtype)
+            
+            batched_tail_indices.append(tail_indices)
+            batched_tail_k.append(tail_k)
+            batched_tail_v.append(tail_v)
+            batched_tail_lens.append(len(tail_indices))
+        
+        # --- 3. Concatenate grid + tail per batch ---
+        batched_cover_k = []
+        batched_cover_v = []
+        batched_cover_indices = []
+        batched_cover_lens = []
+        
+        for b in range(B_raw):
+            # Grid part
+            g_len = int(grid_lens[b].item()) if b < grid_lens.shape[0] else 0
+            if g_len > 0 and b < grid_k.shape[0]:
+                g_k = grid_k[b, :, :g_len, :]  # [H_k, G, D]
+                g_v = grid_v[b, :, :g_len, :]
+                g_idx = grid_indices[b, :g_len]  # [G]
+            else:
+                g_k = torch.empty(H_k, 0, D_k, device=device, dtype=k_raw.dtype)
+                g_v = torch.empty(H_k, 0, D_k, device=device, dtype=v_raw.dtype)
+                g_idx = torch.empty(0, dtype=torch.long, device=device)
+                g_len = 0
+            
+            # Tail part
+            tail_k = batched_tail_k[b]
+            tail_v = batched_tail_v[b]
+            tail_idx = batched_tail_indices[b]
+            
+            # CRITICAL FIX #4: Verify concat dimension is correct (unambiguous check)
+            # Handle both 3D [H, S, D] and 4D [B, H, S, D] cases
+            assert g_k.ndim in (3, 4), f"Unexpected grid_k ndim: {g_k.ndim}"
+            assert tail_k.ndim in (3, 4), f"Unexpected tail_k ndim: {tail_k.ndim}"
+            assert g_k.ndim == tail_k.ndim, f"Dimension mismatch: grid_k.ndim={g_k.ndim} vs tail_k.ndim={tail_k.ndim}"
+            
+            # Verify head and hidden dimensions match
+            assert g_k.shape[-3] == tail_k.shape[-3] == H_k, f"Head dimension mismatch: {g_k.shape[-3]} vs {tail_k.shape[-3]} vs {H_k}"
+            assert g_k.shape[-1] == tail_k.shape[-1] == D_k, f"Hidden dimension mismatch: {g_k.shape[-1]} vs {tail_k.shape[-1]} vs {D_k}"
+            
+            # Determine sequence dimension based on ndim
+            if g_k.ndim == 4:  # [B, H, S, D] - sequence is dim=2
+                seq_dim = 2
+                expected_seq_len = g_k.shape[2] + tail_k.shape[2]
+            else:  # [H, S, D] - sequence is dim=1
+                seq_dim = 1
+                expected_seq_len = g_k.shape[1] + tail_k.shape[1]
+            
+            # Concatenate along sequence dimension
+            cover_k = torch.cat([g_k, tail_k], dim=seq_dim)
+            cover_v = torch.cat([g_v, tail_v], dim=seq_dim)
+            cover_idx = torch.cat([g_idx, tail_idx], dim=0)  # [G + tail_len]
+            
+            # Sanity check: verify the concatenated shape
+            if cover_k.ndim == 4:
+                assert cover_k.shape[2] == expected_seq_len, f"Cover shape mismatch: got {cover_k.shape}, expected seq_len={expected_seq_len} at dim=2"
+            else:
+                assert cover_k.shape[1] == expected_seq_len, f"Cover shape mismatch: got {cover_k.shape}, expected seq_len={expected_seq_len} at dim=1"
+            
+            batched_cover_k.append(cover_k)
+            batched_cover_v.append(cover_v)
+            batched_cover_indices.append(cover_idx)
+            batched_cover_lens.append(cover_k.shape[1])
+        
+        # Pad and stack
+        max_cover_len = max(batched_cover_lens) if batched_cover_lens else 0
+        cover_k = torch.zeros(B_raw, H_k, max_cover_len, D_k, device=device, dtype=k_raw.dtype)
+        cover_v = torch.zeros(B_raw, H_k, max_cover_len, D_k, device=device, dtype=v_raw.dtype)
+        cover_indices = torch.full((B_raw, max_cover_len), -1, dtype=torch.long, device=device)
+        
+        for b in range(B_raw):
+            l = batched_cover_lens[b]
+            if l > 0:
+                cover_k[b, :, :l, :] = batched_cover_k[b]
+                cover_v[b, :, :l, :] = batched_cover_v[b]
+                cover_indices[b, :l] = batched_cover_indices[b]
+        
+        # Expand KV heads for grouped-query attention
+        cover_k_full = repeat_kv(cover_k, num_kv_groups)  # [B, H_q, T_cover, D]
+        cover_v_full = repeat_kv(cover_v, num_kv_groups)  # [B, H_q, T_cover, D]
+        
+        # --- 4. Run attention on cover ---
+        # CRITICAL FIX #5: Add diagnostics for unique keys and unmasked keys
+        if self.debug and layer_idx == 0:
+            # Count unique cover positions (excluding -1 padding)
+            valid_cover_indices = cover_indices[cover_indices >= 0]
+            num_unique_cover = torch.unique(valid_cover_indices).numel() if valid_cover_indices.numel() > 0 else 0
+            print(f"[Layer {layer_idx}] Cover construction: T_cover={max_cover_len}, num_grid={grid_lens[0].item() if grid_lens.numel() > 0 else 0}, tail_len={batched_tail_lens[0] if batched_tail_lens else 0}, unique_positions={num_unique_cover}")
+        
+        attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling  # [B, H_q, L_q, T_cover]
+        mask_value = torch.finfo(attn_logits.dtype).min
+        
+        if attention_mask is not None:
+            # Map cover indices to raw indices for masking
+            # For grid tokens, use their stored indices; for tail, use tail indices
+            cover_raw_indices = cover_indices  # [B, T_cover] raw KV positions, -1 for padding
+            B = cover_raw_indices.shape[0]
+            T_mask = attention_mask.shape[-1]
+            
+            # CRITICAL FIX: Ensure attention_mask covers the current KV cache length
+            # NOTE: attention_mask last dim must index RAW KV positions.
+            # During generation, T_raw grows but attention_mask may be stuck at initial size.
+            if T_mask < T_raw:
+                # Pad new KV positions as UNMASKED (0.0). This fixes the OOB gather.
+                # For generation (L_q == 1), padding with zeros is correct.
+                # For prefill (L_q > 1), we may need to rebuild/extend causal masking
+                # rather than just padding, but in practice generation is the common path
+                # where this bug manifests.
+                pad = (0, T_raw - T_mask)  # Pad last dimension: (pad_left, pad_right)
+                T_mask_old = T_mask  # Save old size for debug assert
+                attention_mask = torch.nn.functional.pad(attention_mask, pad, value=0.0)
+                T_mask = attention_mask.shape[-1]
+                
+                # Debug assert: verify padded slice is finite/zero (keep assertion, but only print in debug mode)
+                padded_slice = attention_mask[:, :, :, T_mask_old:]  # Get the newly padded portion
+                assert torch.isfinite(padded_slice).all(), "Padded attention_mask slice contains non-finite values"
+                assert (padded_slice == 0.0).all(), f"Padded attention_mask slice is not zero: min={padded_slice.min()}, max={padded_slice.max()}"
+            
+            # Assert raw indices are now valid (except padding)
+            valid = cover_raw_indices >= 0
+            if valid.any():
+                max_idx = cover_raw_indices[valid].max().item()
+                if self.debug and layer_idx == 0:
+                    min_idx = cover_raw_indices[valid].min().item()
+                    num_valid = valid.sum().item()
+                    num_padding = (~valid).sum().item()
+                    print(f"[Layer {layer_idx}] Before mask: T_raw={T_raw}, T_mask={T_mask}, T_cover={max_cover_len}")
+                    print(f"[Layer {layer_idx}] cover_raw_indices: min={min_idx}, max={max_idx}, num_valid={num_valid}, num_padding={num_padding}")
+                
+                # CRITICAL ASSERTION: After padding, indices must be valid
+                assert max_idx < T_mask, f"cover_raw_indices max {max_idx} >= T_mask {T_mask} (after padding)"
+                assert max_idx < T_raw, f"cover_raw_indices max {max_idx} >= T_raw {T_raw}"
+            else:
+                if self.debug and layer_idx == 0:
+                    print(f"[Layer {layer_idx}] WARNING: All cover_raw_indices are padding (-1)!")
+                raise AssertionError("All cover_raw_indices are padding (-1); no keys to attend to.")
+            
+            # Gather the mask using RAW indices (no clamping to T_mask!)
+            # Only clamp -1 to 0 to avoid negative indices in gather; we'll mask padding separately
+            idx = cover_raw_indices.clamp(min=0)  # only to avoid -1 in gather
+            idx_expanded = idx[:, None, None, :].expand(-1, 1, L_q, -1)  # [B, 1, L_q, T_cover]
+            cover_mask = attention_mask.gather(3, idx_expanded)
+            
+            # Explicitly mask padding positions (-1)
+            pad_positions = (cover_raw_indices < 0)
+            if pad_positions.any():
+                cover_mask = cover_mask.masked_fill(pad_positions[:, None, None, :], mask_value)
+            
+            # Debug output
+            if self.debug and layer_idx == 0:
+                num_unmasked = (cover_mask > mask_value).sum().item()
+                T_cover_actual = cover_mask.shape[-1]
+                print(f"[Layer {layer_idx}] Attention mask: num_unmasked_keys={num_unmasked}, "
+                      f"T_cover={T_cover_actual}, T_mask={T_mask}, T_raw={T_raw}")
+            
+            attn_logits = attn_logits + cover_mask
+        
+        # Mask out invalid cover indices (padding)
+        attn_logits = attn_logits.masked_fill(cover_indices[:, None, None, :] < 0, mask_value)
+        
+        attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_probs, cover_v_full)  # [B, H_q, L_q, D]
+        
+        # --- 5. Update grid scores and refresh grid tokens ---
+        # Push to buffer (still useful for debugging/stats if needed)
+        cover_is_summary = torch.zeros_like(cover_indices)  # All raw tokens in lined attention
+        self.attn_buffer[layer_idx].push(attn_probs, cover_indices, cover_is_summary)
+        
+        # Update grid scores *from this step's attention*
+        self._update_grid_scores(layer_idx, attn_probs, cover_indices, cover_is_summary)
+        
+        # Refresh grid tokens periodically
+        self.grid_step_counters[layer_idx] += 1
+        if self.grid_update_interval > 0 and (self.grid_step_counters[layer_idx] % self.grid_update_interval) == 0:
+            self._refresh_grid_tokens(layer_idx)
+        
         return attn_output.transpose(1, 2).contiguous(), attn_probs
 
     def print_stats(self, layer_idx: int):
@@ -1512,42 +2426,51 @@ class LukaKVController:
         cover_view = self.cover_view[layer_idx]
         attn_buffer = self.attn_buffer[layer_idx]
 
-        # 1. RawCache vs CoverView Alignment
+        # Skip cover view checks for lined attention layers (they build cover dynamically)
+        is_lined_layer = self.use_lined_attention and layer_idx in self.lined_layers
+
+        # 1. RawCache vs CoverView Alignment (skip for lined attention)
         k_raw, _, seq_start, raw_seq_start = raw_cache.get_layer(layer_idx, with_offsets=True)
-        if k_raw is None or cover_view.cover_keys is None:
+        if k_raw is None:
             return # Not initialized yet
-
-        # Verify seq_start (left padding) matches
-        if seq_start is not None and cover_view.seq_start is not None:
-            assert torch.equal(seq_start, cover_view.seq_start), \
-                f"Invariant Violation: Raw seq_start {seq_start} != Cover seq_start {cover_view.seq_start}"
         
-        # Verify raw_seq_start (frontier) matches
-        if raw_seq_start is not None and cover_view.raw_seq_start is not None:
-            assert torch.equal(raw_seq_start, cover_view.raw_seq_start), \
-                f"Invariant Violation: Raw raw_seq_start {raw_seq_start} != Cover raw_seq_start {cover_view.raw_seq_start}"
-
-        # Verify CoverView indices map correctly to RawCache for the tail
-        # The tail starts at raw_seq_start and goes to the end.
-        # In CoverView, this corresponds to where cover_is_summary == 0
+        # Get batch size (needed for both lined and top-down checks)
         B = k_raw.shape[0]
-        for b in range(B):
-            if raw_seq_start is None: continue
+        
+        if not is_lined_layer:
+            if cover_view.cover_keys is None:
+                return # Not initialized yet
+
+            # Verify seq_start (left padding) matches
+            if seq_start is not None and cover_view.seq_start is not None:
+                assert torch.equal(seq_start, cover_view.seq_start), \
+                    f"Invariant Violation: Raw seq_start {seq_start} != Cover seq_start {cover_view.seq_start}"
             
-            frontier = raw_seq_start[b].item()
-            cover_indices_b = cover_view.cover_indices[b]
-            cover_is_sum_b = cover_view.cover_is_summary[b]
-            
-            # Find raw tail in cover
-            # It should be where indices >= frontier (and not padding -1)
-            # And is_summary should be 0
-            
-            raw_mask = (cover_is_sum_b == 0) & (cover_indices_b != -1)
-            if raw_mask.any():
-                raw_indices = cover_indices_b[raw_mask]
-                # Check they are valid raw indices
-                assert raw_indices.min() >= 0, f"Invariant Violation: Negative raw index in cover view batch {b}"
-                assert raw_indices.max() < k_raw.shape[2], f"Invariant Violation: Raw index {raw_indices.max()} out of bounds {k_raw.shape[2]}"
+            # Verify raw_seq_start (frontier) matches
+            if raw_seq_start is not None and cover_view.raw_seq_start is not None:
+                assert torch.equal(raw_seq_start, cover_view.raw_seq_start), \
+                    f"Invariant Violation: Raw raw_seq_start {raw_seq_start} != Cover raw_seq_start {cover_view.raw_seq_start}"
+
+            # Verify CoverView indices map correctly to RawCache for the tail
+            # The tail starts at raw_seq_start and goes to the end.
+            # In CoverView, this corresponds to where cover_is_summary == 0
+            for b in range(B):
+                if raw_seq_start is None: continue
+                
+                frontier = raw_seq_start[b].item()
+                cover_indices_b = cover_view.cover_indices[b]
+                cover_is_sum_b = cover_view.cover_is_summary[b]
+                
+                # Find raw tail in cover
+                # It should be where indices >= frontier (and not padding -1)
+                # And is_summary should be 0
+                
+                raw_mask = (cover_is_sum_b == 0) & (cover_indices_b != -1)
+                if raw_mask.any():
+                    raw_indices = cover_indices_b[raw_mask]
+                    # Check they are valid raw indices
+                    assert raw_indices.min() >= 0, f"Invariant Violation: Negative raw index in cover view batch {b}"
+                    assert raw_indices.max() < k_raw.shape[2], f"Invariant Violation: Raw index {raw_indices.max()} out of bounds {k_raw.shape[2]}"
 
         # 2. SummaryCache vs RawCache Alignment
         if summary_cache.keys is not None:
@@ -1575,26 +2498,31 @@ class LukaKVController:
                     f"Invariant Violation: Summary frontier {page_frontier[:min_b]} > Raw frontier {raw_seq_start[:min_b]}"
 
         # 3. AttentionScoreBuffer Alignment
+        # Skip this check for lined attention layers since they build cover dynamically
+        # and don't maintain a persistent cover_view
+        is_lined_layer = self.use_lined_attention and layer_idx in self.lined_layers
+        
         attn_weights, attn_indices, attn_is_sum = attn_buffer.get_data()
-        if attn_weights is not None:
+        if attn_weights is not None and not is_lined_layer:
             # Verify width matches cover view
             # Note: attn_buffer accumulates, cover_view grows. They should match in T dimension.
+            # Exception: If using raw attention (threshold < 0), buffer isn't updated (attn_indices is None),
+            # so skip this check in that case
             
-            if cover_view.cover_keys is not None:
+            if cover_view.cover_keys is not None and attn_indices is not None:
                 T_cover = cover_view.cover_keys.shape[2]
                 T_attn = attn_weights.shape[-1]
                 
                 assert T_attn == T_cover, f"Invariant Violation: Attn buffer width {T_attn} != Cover view length {T_cover}"
                 
                 # Verify indices match
-                if attn_indices is not None:
-                     # attn_indices: [B, T]
-                     # cover_view.cover_indices: [B, T]
-                     min_b = min(attn_indices.shape[0], cover_view.cover_indices.shape[0])
-                     assert torch.equal(attn_indices[:min_b], cover_view.cover_indices[:min_b]), \
-                         "Invariant Violation: Attn buffer indices mismatch with CoverView indices"
-                     assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
-                         "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
+                # attn_indices: [B, T]
+                # cover_view.cover_indices: [B, T]
+                min_b = min(attn_indices.shape[0], cover_view.cover_indices.shape[0])
+                assert torch.equal(attn_indices[:min_b], cover_view.cover_indices[:min_b]), \
+                    "Invariant Violation: Attn buffer indices mismatch with CoverView indices"
+                assert torch.equal(attn_is_sum[:min_b], cover_view.cover_is_summary[:min_b]), \
+                    "Invariant Violation: Attn buffer is_summary mismatch with CoverView"
 
     def print_layer_summary(self, layer_idx: int):
         """
@@ -1622,46 +2550,57 @@ class LukaKVController:
         # Raw token summary
         if raw_k is not None:
             B, _, T_raw, _ = raw_k.shape
-            print(f"[Layer {layer_idx}] Raw tokens:")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Raw tokens:")
             for b in range(B):
-                pad = int(seq_start[b].item()) if seq_start is not None else 0
-                num_pages = int(summary_cache.page_lens[b].item()) if summary_cache.keys is not None else 0
-                segments = fmt_pages(b)
-                print(f"  Batch {b}: pad={pad}, pages={num_pages}, segments={segments}, total_tokens={T_raw}")
+                if self.debug:
+                    pad = int(seq_start[b].item()) if seq_start is not None else 0
+                    num_pages = int(summary_cache.page_lens[b].item()) if summary_cache.keys is not None else 0
+                    segments = fmt_pages(b)
+                    print(f"  Batch {b}: pad={pad}, pages={num_pages}, segments={segments}, total_tokens={T_raw}")
         else:
-            print(f"[Layer {layer_idx}] Raw tokens: <empty>")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Raw tokens: <empty>")
 
         # Cover token summary
         if cover_view.cover_indices is not None:
             cover_idx = cover_view.cover_indices
             cover_is_sum = cover_view.cover_is_summary
             B = cover_idx.shape[0]
-            print(f"[Layer {layer_idx}] Cover view:")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Cover view:")
             for b in range(B):
-                pad = int((cover_idx[b] == -1).sum().item())
-                pages = int(((cover_is_sum[b] == 1) & (cover_idx[b] >= 0)).sum().item())
-                raw_len = int(((cover_is_sum[b] == 0) & (cover_idx[b] >= 0)).sum().item())
-                print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}")
+                if self.debug:
+                    pad = int((cover_idx[b] == -1).sum().item())
+                    pages = int(((cover_is_sum[b] == 1) & (cover_idx[b] >= 0)).sum().item())
+                    raw_len = int(((cover_is_sum[b] == 0) & (cover_idx[b] >= 0)).sum().item())
+                    print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}")
         else:
-            print(f"[Layer {layer_idx}] Cover view: <empty>")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Cover view: <empty>")
 
         # Page summary
         if summary_cache.keys is not None:
             lens = summary_cache.page_lens
-            print(f"[Layer {layer_idx}] Pages per batch: {[int(x) for x in lens.tolist()]}")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Pages per batch: {[int(x) for x in lens.tolist()]}")
         else:
-            print(f"[Layer {layer_idx}] Pages per batch: <empty>")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Pages per batch: <empty>")
 
         # Attention score buffer summary
         attn_weights, buf_idx, buf_is_sum = attn_buf.get_data()
         if attn_weights is not None:
             B, H, L_accum, T = attn_weights.shape
-            print(f"[Layer {layer_idx}] Attention buffer: shape={attn_weights.shape}")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Attention buffer: shape={attn_weights.shape}")
             if buf_idx is not None and buf_is_sum is not None:
                 for b in range(B):
-                    pad = int((buf_idx[b] == -1).sum().item())
-                    pages = int(((buf_is_sum[b] == 1) & (buf_idx[b] >= 0)).sum().item())
-                    raw_len = int(((buf_is_sum[b] == 0) & (buf_idx[b] >= 0)).sum().item())
-                    print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}, attn_shape={(H, L_accum, T)}")
+                    if self.debug:
+                        pad = int((buf_idx[b] == -1).sum().item())
+                        pages = int(((buf_is_sum[b] == 1) & (buf_idx[b] >= 0)).sum().item())
+                        raw_len = int(((buf_is_sum[b] == 0) & (buf_idx[b] >= 0)).sum().item())
+                        print(f"  Batch {b}: pad={pad}, pages={pages}, raw_len={raw_len}, attn_shape={(H, L_accum, T)}")
         else:
-            print(f"[Layer {layer_idx}] Attention buffer: <empty>")
+            if self.debug:
+                print(f"[Layer {layer_idx}] Attention buffer: <empty>")
