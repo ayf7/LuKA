@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from modeling.segmenter import Segmenter, DummySegmenter
 from modeling.compressor import Compressor, MeanCompressor
+from modeling.refinement import RefinementRule, FixedThresholdRule, NoRefinementRule, get_refinement_rule
 from transformers.cache_utils import Cache, DynamicCache
 from transformers import PretrainedConfig
 
@@ -81,11 +82,6 @@ class RawCache:
         if self.raw_seq_start[layer_idx] is None:
             self.raw_seq_start[layer_idx] = self.seq_start[layer_idx].clone()
 
-        if layer_idx == 0:
-            # print(self.seq_start[layer_idx])
-            # print(self.raw_seq_start[layer_idx])
-            pass
-            
         # Invariant checks
         # Ensure seq_start (left padding) is not greater than raw_seq_start (raw frontier)
         # seq_start: [B], raw_seq_start: [B]
@@ -250,6 +246,8 @@ class SummaryCache:
         self.page_start: torch.Tensor = None    # [B, max(L_num_pages)] start idx (inclusive) in raw cache
         self.page_end: torch.Tensor = None      # [B, max(L_num_pages)] end idx (inclusive) in raw cache
         self.page_frontier: torch.Tensor = None # [B] first raw index not covered by any page
+        # Adaptive log bias: log(k_eff) where k_eff = exp(entropy) is effective support
+        self.log_effective_support: torch.Tensor = None  # [B, max(L_num_pages)] entropy per page
 
     def initialize(self, B: int, H: int, D: int, device: torch.device, dtype: torch.dtype):
         """Initialize with empty state."""
@@ -262,6 +260,7 @@ class SummaryCache:
         self.page_start = torch.zeros(B, 0, dtype=torch.long, device=device)
         self.page_end = torch.zeros(B, 0, dtype=torch.long, device=device)
         self.page_frontier = torch.zeros(B, dtype=torch.long, device=device)
+        self.log_effective_support = torch.zeros(B, 0, device=device, dtype=torch.float32)
 
     def add_pages(self,
         keys: torch.Tensor,
@@ -270,6 +269,7 @@ class SummaryCache:
         page_start: torch.Tensor,
         page_end: torch.Tensor,
         page_frontier: Optional[torch.Tensor] = None,
+        log_effective_support: Optional[torch.Tensor] = None,
     ):
         """Insert newly-computed summary pages.
 
@@ -289,6 +289,9 @@ class SummaryCache:
             page_frontier: Optional[torch.Tensor]
                 [B_new] updated frontier (first raw index not covered) for the
                 affected batch rows.
+            log_effective_support: Optional[torch.Tensor]
+                [B_new, L_new] log of effective support (entropy) for each page.
+                Used for adaptive log(k) bias. If None, falls back to log(N).
 
         Returns:
             None; should update `self.keys`, `self.values`, and `self.page_lens`
@@ -321,6 +324,7 @@ class SummaryCache:
             self.page_start = torch.zeros(max_b, L_new, dtype=torch.long, device=device)
             self.page_end = torch.zeros(max_b, L_new, dtype=torch.long, device=device)
             self.page_frontier = torch.zeros(max_b, dtype=torch.long, device=device)
+            self.log_effective_support = torch.zeros(max_b, L_new, device=device, dtype=torch.float32)
         
         # Expand batch dim if needed
         current_B = self.keys.shape[0]
@@ -333,6 +337,7 @@ class SummaryCache:
             self.page_start = torch.cat([self.page_start, torch.zeros(pad_b, self.page_start.shape[1], dtype=torch.long, device=device)], dim=0)
             self.page_end = torch.cat([self.page_end, torch.zeros(pad_b, self.page_end.shape[1], dtype=torch.long, device=device)], dim=0)
             self.page_frontier = torch.cat([self.page_frontier, torch.zeros(pad_b, dtype=torch.long, device=device)], dim=0)
+            self.log_effective_support = torch.cat([self.log_effective_support, torch.zeros(pad_b, self.log_effective_support.shape[1], device=device, dtype=torch.float32)], dim=0)
 
         # Expand time dim if needed
         # We need to fit `current_len + L_new` pages.
@@ -353,6 +358,7 @@ class SummaryCache:
             self.values = torch.cat([self.values, torch.zeros(self.values.shape[0], H, pad_t, D, device=device, dtype=values.dtype)], dim=2)
             self.page_start = torch.cat([self.page_start, torch.zeros(self.page_start.shape[0], pad_t, dtype=torch.long, device=device)], dim=1)
             self.page_end = torch.cat([self.page_end, torch.zeros(self.page_end.shape[0], pad_t, dtype=torch.long, device=device)], dim=1)
+            self.log_effective_support = torch.cat([self.log_effective_support, torch.zeros(self.log_effective_support.shape[0], pad_t, device=device, dtype=torch.float32)], dim=1)
 
         # Insert new pages
         # We can't do a simple slice assignment because `current_lens` varies per batch.
@@ -363,18 +369,25 @@ class SummaryCache:
         # We want to place `keys[i]` at `self.keys[batch_nums[i], :, current_lens[i]:current_lens[i]+L_new, :]`.
         
         # Let's loop for safety and readability for now.
+        # If log_effective_support not provided, compute fallback: log(page_length)
+        if log_effective_support is None:
+            # Fallback to log(N) for compressors without importance weights
+            page_lengths = (page_end - page_start + 1).float()  # [B_new, L_new]
+            log_effective_support = page_lengths.clamp(min=1).log()  # [B_new, L_new]
+
         for i, b_idx in enumerate(batch_nums.tolist()):
             start_col = int(current_lens[i].item())
             end_col = start_col + L_new
-            
+
             self.keys[b_idx, :, start_col:end_col, :] = keys[i]
             self.values[b_idx, :, start_col:end_col, :] = values[i]
             self.page_start[b_idx, start_col:end_col] = page_start[i]
             self.page_end[b_idx, start_col:end_col] = page_end[i]
-            
+            self.log_effective_support[b_idx, start_col:end_col] = log_effective_support[i]
+
         # Update lengths and frontier
         self.page_lens.index_add_(0, batch_nums, torch.full((B_new,), L_new, dtype=torch.long, device=device))
-        
+
         if page_frontier is not None:
             self.page_frontier[batch_nums] = page_frontier
 
@@ -687,8 +700,10 @@ class AttentionScoreBuffer:
         self.cover_indices = None
         self.cover_is_summary = None
         self.refinement_counts = None
-        self.total_summaries_seen = 0
-        self.total_refinements_made = 0
+        # Use tensors for stats to avoid GPU sync during forward pass
+        # Call .item() only when stats are requested (lazy evaluation)
+        self._total_summaries_seen = None  # Tensor on device, or Python int 0
+        self._total_refinements_made = None  # Tensor on device, or Python int 0
         # Capacity tracking
         self._l_length = 0      # Used length in L dimension (queries)
         self._l_capacity = 0    # Allocated capacity in L dimension
@@ -718,8 +733,9 @@ class AttentionScoreBuffer:
         self.cover_indices = None
         self.cover_is_summary = None
         self.refinement_counts = torch.zeros(B, self._t_capacity, dtype=torch.long, device=device)
-        self.total_summaries_seen = 0
-        self.total_refinements_made = 0
+        # Initialize stats as tensors on device to avoid GPU sync during accumulation
+        self._total_summaries_seen = torch.tensor(0, dtype=torch.long, device=device)
+        self._total_refinements_made = torch.tensor(0, dtype=torch.long, device=device)
 
     def _ensure_l_capacity(self, needed_l: int):
         """Expand L (query) dimension capacity if needed."""
@@ -819,8 +835,83 @@ class AttentionScoreBuffer:
         self.cover_is_summary = None
         if self.refinement_counts is not None:
             self.refinement_counts.zero_()
-        self.total_summaries_seen = 0
-        self.total_refinements_made = 0
+        # Reset stats tensors in-place if they exist, otherwise set to 0
+        if self._total_summaries_seen is not None and torch.is_tensor(self._total_summaries_seen):
+            self._total_summaries_seen.zero_()
+        else:
+            self._total_summaries_seen = None
+        if self._total_refinements_made is not None and torch.is_tensor(self._total_refinements_made):
+            self._total_refinements_made.zero_()
+        else:
+            self._total_refinements_made = None
+
+    @property
+    def total_summaries_seen(self) -> int:
+        """Get total summaries seen (triggers GPU sync if tensor)."""
+        if self._total_summaries_seen is None:
+            return 0
+        if torch.is_tensor(self._total_summaries_seen):
+            return self._total_summaries_seen.item()
+        return self._total_summaries_seen
+
+    @total_summaries_seen.setter
+    def total_summaries_seen(self, value):
+        """Set total summaries seen (for backwards compatibility)."""
+        if torch.is_tensor(self._total_summaries_seen):
+            self._total_summaries_seen.fill_(value)
+        else:
+            self._total_summaries_seen = value
+
+    @property
+    def total_refinements_made(self) -> int:
+        """Get total refinements made (triggers GPU sync if tensor)."""
+        if self._total_refinements_made is None:
+            return 0
+        if torch.is_tensor(self._total_refinements_made):
+            return self._total_refinements_made.item()
+        return self._total_refinements_made
+
+    @total_refinements_made.setter
+    def total_refinements_made(self, value):
+        """Set total refinements made (for backwards compatibility)."""
+        if torch.is_tensor(self._total_refinements_made):
+            self._total_refinements_made.fill_(value)
+        else:
+            self._total_refinements_made = value
+
+    def add_summaries_seen(self, count: torch.Tensor):
+        """Add to summaries seen counter without GPU sync.
+
+        Args:
+            count: Tensor containing the count to add (stays on GPU).
+        """
+        if self._total_summaries_seen is None:
+            self._total_summaries_seen = count.clone().to(dtype=torch.long)
+        elif torch.is_tensor(self._total_summaries_seen):
+            self._total_summaries_seen += count.to(dtype=torch.long)
+        else:
+            # Fallback: was set to a Python int, convert to tensor
+            device = count.device
+            self._total_summaries_seen = torch.tensor(
+                self._total_summaries_seen, dtype=torch.long, device=device
+            ) + count.to(dtype=torch.long)
+
+    def add_refinements_made(self, count: torch.Tensor):
+        """Add to refinements made counter without GPU sync.
+
+        Args:
+            count: Tensor containing the count to add (stays on GPU).
+        """
+        if self._total_refinements_made is None:
+            self._total_refinements_made = count.clone().to(dtype=torch.long)
+        elif torch.is_tensor(self._total_refinements_made):
+            self._total_refinements_made += count.to(dtype=torch.long)
+        else:
+            # Fallback: was set to a Python int, convert to tensor
+            device = count.device
+            self._total_refinements_made = torch.tensor(
+                self._total_refinements_made, dtype=torch.long, device=device
+            ) + count.to(dtype=torch.long)
 
     def compress_and_trim(
         self,
@@ -1199,7 +1290,8 @@ class AsyncPageCreator:
                 batch_nums=torch.tensor([b], device=device),
                 page_start=torch.tensor([starts], device=device),
                 page_end=torch.tensor([ends], device=device),
-                page_frontier=torch.tensor([new_frontiers[b].item()], device=device)
+                # Use slice to avoid .item() GPU sync
+                page_frontier=new_frontiers[b:b+1].clone()
             )
 
         if has_updates:
@@ -1258,10 +1350,11 @@ class LukaKVController:
         self.cover_view: List[CoverView] = [CoverView() for _ in range(self.num_layers)]
         self.attn_buffer: List[AttentionScoreBuffer] = [AttentionScoreBuffer() for _ in range(self.num_layers)]
         
-        # Initialize segmenter and compressor
+        # Initialize segmenter, compressor, and refinement rule
         # Using defaults for now; ideally these come from config.
         self.segmenter = DummySegmenter(min_chunk=16, tail_len=16, max_pages=15)
         self.compressor = MeanCompressor()
+        self.refinement_rule: RefinementRule = FixedThresholdRule(threshold=0.2)
         # How often to attempt segmentation/compression (every N decode steps)
         self.segment_interval = 1
         # Whether to create pages during generation (decode) or only during prefill
@@ -1269,6 +1362,8 @@ class LukaKVController:
         # Whether to add log(N) bias to summary attention logits
         # Set to False when using MeanCompressor (arithmetic mean != log-sum-exp assumption)
         self.use_log_bias = False
+        # Log bias mode: "none", "fixed_n" (log(N)), or "adaptive_k" (log(k_eff) from entropy)
+        self.log_bias_mode = 'none'
         self.seg_step_counters = [0 for _ in range(self.num_layers)]
         # Track tokens since last page creation (for fast early exit)
         self.tokens_since_last_page = [0 for _ in range(self.num_layers)]
@@ -1466,20 +1561,25 @@ class LukaKVController:
         page_metadata = []  # (batch_idx, start, end)
         max_page_len = 0
 
+        # Batch the .item() calls - get all frontiers at once to minimize syncs
+        # This is a single sync instead of B syncs in the loop
+        frontiers_list = raw_seq_start.tolist()
+
         for b in range(B):
-            frontier = raw_seq_start[b].item()
+            frontier = frontiers_list[b]
             p_ends = page_ends[b]
             valid_mask = (p_ends >= frontier) & (p_ends != -1)
 
-            if not valid_mask.any():
+            # Get valid ends as list - single sync per batch instead of checking .any() first
+            valid_ends_sorted = p_ends[valid_mask].sort().values.tolist()
+            if not valid_ends_sorted:
                 continue
 
-            valid_ends = p_ends[valid_mask].sort().values
             current_start = frontier
             cover_idx_b = cover_indices[b] if cover_indices is not None else None
             is_sum_b = cover_is_summary[b] if cover_is_summary is not None else None
 
-            for end_idx in valid_ends.tolist():
+            for end_idx in valid_ends_sorted:
                 end_idx = int(end_idx)
                 if end_idx < current_start:
                     continue
@@ -1540,12 +1640,49 @@ class LukaKVController:
         # Compress all pages at once
         k_compressed, v_compressed = self.compressor(padded_k, padded_v, padded_importance)  # [N_pages, H, D]
 
+        # Compute log effective support (entropy) for adaptive log(k) bias
+        # log_k_eff[i] = H = -sum(p * log(p)) where p is normalized importance
+        # For uniform distribution: H = log(N), for peaked: H -> 0
+        log_k_eff = None
+        if padded_importance is not None:
+            # Build mask for valid (non-padded) positions
+            page_lens = torch.tensor(
+                [pm[2] - pm[1] + 1 for pm in page_metadata],  # end - start + 1
+                device=device, dtype=torch.long
+            )  # [N_pages]
+            # Create mask: [N_pages, max_page_len]
+            pos_indices = torch.arange(max_page_len, device=device).unsqueeze(0)  # [1, max_page_len]
+            valid_mask = pos_indices < page_lens.unsqueeze(1)  # [N_pages, max_page_len]
+
+            # Compute entropy per page, averaged across heads
+            # padded_importance: [N_pages, H_kv, max_page_len]
+            # Mask out invalid positions with -inf for softmax
+            masked_importance = padded_importance.clone()
+            masked_importance[:, :, :][~valid_mask.unsqueeze(1).expand_as(masked_importance)] = float('-inf')
+
+            # log_softmax for numerical stability
+            log_probs = torch.nn.functional.log_softmax(masked_importance, dim=-1)  # [N_pages, H_kv, max_page_len]
+            probs = log_probs.exp()
+
+            # Entropy: H = -sum(p * log(p)), handling 0*-inf = 0
+            # Where p=0 (masked), log_p=-inf, but p*log_p should be 0
+            entropy_terms = torch.where(
+                probs > 0,
+                -probs * log_probs,
+                torch.zeros_like(probs)
+            )
+            entropy_per_head = entropy_terms.sum(dim=-1)  # [N_pages, H_kv]
+            entropy_avg = entropy_per_head.mean(dim=-1)  # [N_pages]
+
+            log_k_eff = entropy_avg  # This is log(k_eff) since k_eff = exp(H)
+
         # Distribute compressed pages back to batches
-        batch_pages = {}  # batch_idx -> list of (k, v, start, end)
+        batch_pages = {}  # batch_idx -> list of (k, v, start, end, log_k)
         for i, (b, start, end) in enumerate(page_metadata):
             if b not in batch_pages:
                 batch_pages[b] = []
-            batch_pages[b].append((k_compressed[i:i+1], v_compressed[i:i+1], start, end))
+            log_k_val = log_k_eff[i].item() if log_k_eff is not None else None
+            batch_pages[b].append((k_compressed[i:i+1], v_compressed[i:i+1], start, end, log_k_val))
 
         # Add pages to summary cache
         for b, pages in batch_pages.items():
@@ -1553,9 +1690,15 @@ class LukaKVController:
             v_list = [p[1] for p in pages]
             starts = [p[2] for p in pages]
             ends = [p[3] for p in pages]
+            log_k_vals = [p[4] for p in pages]
 
             k_stack = torch.cat(k_list, dim=0).unsqueeze(0).transpose(1, 2)  # [1, H, N, D] -> need [1, H, N, D]
             v_stack = torch.cat(v_list, dim=0).unsqueeze(0).transpose(1, 2)
+
+            # Build log_effective_support tensor if available
+            log_eff_supp = None
+            if log_k_vals[0] is not None:
+                log_eff_supp = torch.tensor([log_k_vals], device=device, dtype=torch.float32)  # [1, N_pages]
 
             summary_cache.add_pages(
                 keys=k_stack,
@@ -1563,7 +1706,9 @@ class LukaKVController:
                 batch_nums=torch.tensor([b], device=device),
                 page_start=torch.tensor([starts], device=device),
                 page_end=torch.tensor([ends], device=device),
-                page_frontier=torch.tensor([new_frontiers[b].item()], device=device)
+                # Use slice to avoid .item() GPU sync
+                page_frontier=new_frontiers[b:b+1].clone(),
+                log_effective_support=log_eff_supp,
             )
 
         if has_updates:
@@ -1589,7 +1734,8 @@ class LukaKVController:
         num_kv_groups: int,
         attention_mask: Optional[torch.Tensor] = None,  # [B, 1, L_q, T_raw]
         sliding_window: Optional[int] = None,
-        threshold: float = 0.2,
+        threshold: Optional[float] = None,  # Deprecated: use self.refinement_rule instead
+        use_exact_attention: bool = False,  # If True, skip cover view and use raw attention
     ):
         """Run attention over cover view (summaries + raw tail) with optional refinement.
 
@@ -1600,15 +1746,20 @@ class LukaKVController:
             num_kv_groups: H_q // H_k for grouped-query attention.
             attention_mask: [B, 1, L_q, T_raw] causal + padding mask.
             sliding_window: Unused, kept for API compatibility.
-            threshold: Refinement threshold. If <0, use exact raw attention.
-                       If >=0, refine summaries with attn_prob > threshold.
+            threshold: DEPRECATED. Use self.refinement_rule instead.
+                       For backwards compatibility: if <0, use exact raw attention.
+            use_exact_attention: If True, bypass cover view and use full raw attention.
 
         Returns:
             attn_output: [B, L_q, H_q, D] attended values.
             attn_probs: [B, H_q, L_q, T_cover] attention probabilities.
         """
-        # Exact path: skip cover view and run full raw attention
+        # Backwards compatibility: threshold < 0 means exact attention
         if threshold is not None and threshold < 0:
+            use_exact_attention = True
+
+        # Exact path: skip cover view and run full raw attention
+        if use_exact_attention:
             k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
             if k_raw is None or v_raw is None:
                 raise ValueError(f"No raw cache available for layer {layer_idx}.")
@@ -1665,21 +1816,48 @@ class LukaKVController:
         # Compute attention logits
         attn_logits = torch.matmul(query_states, cover_k_full.transpose(2, 3)) * scaling
 
-        # Optionally add log(N) bias for summaries: makes exp(q·k_s + log(N)) ≈ sum_i exp(q·k_i)
-        # Note: This assumes k_summary ≈ log-mean-exp of raw keys. MeanCompressor uses arithmetic
-        # mean, so this bias may hurt more than help. Disable with use_log_bias=False.
-        if self.use_log_bias and has_summaries:
-            page_start = self.summary_cache[layer_idx].page_start
-            page_end_cache = self.summary_cache[layer_idx].page_end
+        # Save unbiased logits for refinement selection (before bias is added)
+        attn_logits_unbiased = attn_logits.clone()
+
+        # Optionally add log bias for summaries to compensate for compression
+        # Modes:
+        #   - "none": No bias (default)
+        #   - "fixed_n": log(N) where N = page length (assumes uniform attention)
+        #   - "adaptive_k": log(k_eff) where k_eff = exp(entropy) is effective support
+        #                   This adapts to the actual attention distribution at compression time
+        log_bias_mode = getattr(self, 'log_bias_mode', 'none')
+        # Backwards compat: use_log_bias=True -> "fixed_n"
+        if self.use_log_bias and log_bias_mode == 'none':
+            log_bias_mode = 'fixed_n'
+
+        if log_bias_mode != 'none' and has_summaries:
+            summary_cache = self.summary_cache[layer_idx]
+            page_start = summary_cache.page_start
+            page_end_cache = summary_cache.page_end
+
             if page_start.shape[0] < B:
                 pad_b = B - page_start.shape[0]
                 page_start = torch.cat([page_start, torch.zeros(pad_b, page_start.shape[1], device=page_start.device, dtype=page_start.dtype)], dim=0)
                 page_end_cache = torch.cat([page_end_cache, torch.zeros(pad_b, page_end_cache.shape[1], device=page_end_cache.device, dtype=page_end_cache.dtype)], dim=0)
 
-            page_lengths = (page_end_cache - page_start + 1).float()
-            page_idx = cover_indices.clamp(min=0, max=page_lengths.shape[1] - 1)
-            token_lengths = page_lengths.gather(1, page_idx)
-            log_bias = torch.where(summary_mask, token_lengths.clamp(min=1).log(), torch.zeros_like(token_lengths))
+            page_idx = cover_indices.clamp(min=0, max=page_start.shape[1] - 1)
+
+            if log_bias_mode == 'fixed_n':
+                # Original: log(N) where N = page length
+                page_lengths = (page_end_cache - page_start + 1).float()
+                log_bias_values = page_lengths.clamp(min=1).log()
+            elif log_bias_mode == 'adaptive_k':
+                # Adaptive: use stored log(k_eff) = entropy computed at compression time
+                log_eff_support = summary_cache.log_effective_support
+                if log_eff_support.shape[0] < B:
+                    pad_b = B - log_eff_support.shape[0]
+                    log_eff_support = torch.cat([log_eff_support, torch.zeros(pad_b, log_eff_support.shape[1], device=log_eff_support.device, dtype=log_eff_support.dtype)], dim=0)
+                log_bias_values = log_eff_support
+            else:
+                raise ValueError(f"Unknown log_bias_mode: {log_bias_mode}")
+
+            gathered_log_bias = log_bias_values.gather(1, page_idx)
+            log_bias = torch.where(summary_mask, gathered_log_bias, torch.zeros_like(gathered_log_bias))
             attn_logits = attn_logits + log_bias[:, None, None, :].to(attn_logits.dtype)
 
         # Apply causal/padding mask
@@ -1695,133 +1873,140 @@ class LukaKVController:
         # Mask invalid positions (padding in cover view)
         attn_logits = attn_logits.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value)
 
+        # Also apply masks to unbiased logits (for refinement selection)
+        if attention_mask is not None:
+            attn_logits_unbiased = attn_logits_unbiased + cover_mask
+        attn_logits_unbiased = attn_logits_unbiased.masked_fill(cover_raw_indices[:, None, None, :] < 0, mask_value)
+
         # Save logsumexp for corrected refinement (the softmax denominator in log space)
         # Shape: [B, H_q, L_q]
         logsumexp_cover = torch.logsumexp(attn_logits.float(), dim=-1)
 
         attn_probs = torch.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # Compute unbiased probs for refinement selection (EXPERIMENTAL: bias affects output but not selection)
+        attn_probs_unbiased = torch.softmax(attn_logits_unbiased, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_probs, cover_v_full)
 
         # Track summaries seen (even when not refining, for accurate summary_frac)
-        # Note: Defer .item() calls to avoid GPU sync during forward pass
+        # Use tensor accumulation to avoid GPU sync during forward pass
         if has_summaries:
             num_summaries = summary_mask.sum()  # Keep as tensor, no .item()
-            self.attn_buffer[layer_idx].total_summaries_seen += (num_summaries * query_states.shape[1] * query_states.shape[2]).item()
+            self.attn_buffer[layer_idx].add_summaries_seen(num_summaries * query_states.shape[1] * query_states.shape[2])
 
-        # Refinement: descend into pages where attention exceeds threshold
-        # Skip entirely if threshold >= 1.0 (nothing can exceed 100% attention)
-        # Also skip if no summaries exist yet (has_summaries computed above)
-        needs_refinement = (threshold is not None and 0 <= threshold < 1.0 and has_summaries)
+        # Refinement: descend into pages based on refinement rule
+        # Skip if no summaries exist yet, or if refinement rule is NoRefinementRule
+        needs_refinement = has_summaries and not isinstance(self.refinement_rule, NoRefinementRule)
 
         if needs_refinement:
             # Optimized refinement check: only process summary positions
             # Instead of creating full [B, H, L, T_cover] mask, index into summary positions only
-            sum_indices = summary_mask.nonzero(as_tuple=True)  # (batch_indices, position_indices)
-            if len(sum_indices[0]) > 0:
+            sum_indices = summary_mask.nonzero(as_tuple=True)  # (batch_indices, position_indices) - syncs here
+            if len(sum_indices[0]) > 0:  # no additional sync - uses len from nonzero
                 b_sum, t_sum = sum_indices
                 # Extract attention only at summary positions: [N_sum, H, L]
-                attn_at_summaries = attn_probs[b_sum, :, :, t_sum]
-                # Check which summaries have any attention > threshold
-                exceeds_threshold = (attn_at_summaries > threshold).any(dim=(1, 2))  # [N_sum]
+                # EXPERIMENTAL: Use unbiased probs for selection, so log(k) bias doesn't affect which pages get refined
+                attn_at_summaries = attn_probs_unbiased[b_sum, :, :, t_sum]
+
+                # Use refinement rule to select which summaries to refine
+                # Pass page_ids so rule can apply always_refine_first_n if configured
+                page_ids_at_summaries = cover_indices[b_sum, t_sum]  # [N_sum]
+                summary_refine_mask, detail_refine_mask = self.refinement_rule.select(
+                    attn_at_summaries, page_ids=page_ids_at_summaries
+                )
 
                 # Build refine_positions [B, T_cover] from sparse results
                 refine_positions = torch.zeros(B, T_cover, dtype=torch.bool, device=query_states.device)
-                refine_positions[b_sum, t_sum] = exceeds_threshold
+                refine_positions[b_sum, t_sum] = summary_refine_mask
 
-                # Build per-(head, query) mask only for positions needing refinement
-                # This is needed for correct delta application
-                if exceeds_threshold.any():
-                    # Create sparse refine_mask for just the summary positions
-                    refine_mask_sparse = attn_at_summaries > threshold  # [N_sum, H, L]
-                    # Expand to full refine_mask only at summary positions
-                    refine_mask = torch.zeros(B, H_q, L_q, T_cover, dtype=torch.bool, device=query_states.device)
-                    # refine_mask[b_sum, :, :, t_sum] has shape [N_sum, H, L], same as refine_mask_sparse
-                    refine_mask[b_sum, :, :, t_sum] = refine_mask_sparse
-                    # Track refinements: count (summary, head, query) combinations that exceeded threshold
-                    # This matches total_summaries_seen which also counts × heads × queries
-                    self.attn_buffer[layer_idx].total_refinements_made += refine_mask_sparse.sum().item()
-            else:
-                refine_positions = torch.zeros(B, T_cover, dtype=torch.bool, device=query_states.device)
+                # Build per-(head, query) mask from detail mask
+                refine_mask = torch.zeros(B, H_q, L_q, T_cover, dtype=torch.bool, device=query_states.device)
+                refine_mask[b_sum, :, :, t_sum] = detail_refine_mask
+                # Track refinements using tensor accumulation (no GPU sync)
+                self.attn_buffer[layer_idx].add_refinements_made(detail_refine_mask.sum())
 
-            if refine_positions.any():
-                summary_cache = self.summary_cache[layer_idx]
-                page_start = summary_cache.page_start
-                page_end = summary_cache.page_end
-                if page_start.shape[0] < B:
-                    pad_b = B - page_start.shape[0]
-                    zeros = torch.zeros(pad_b, page_start.shape[1], device=page_start.device, dtype=page_start.dtype)
-                    page_start = torch.cat([page_start, zeros], dim=0)
-                    page_end = torch.cat([page_end, zeros], dim=0)
-
-                k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+                # Get positions needing refinement - nonzero syncs, then check len
                 b_idx, pos_idx = refine_positions.nonzero(as_tuple=True)
-                page_ids = cover_indices[b_idx, pos_idx]
-                starts = page_start[b_idx, page_ids]
-                ends = page_end[b_idx, page_ids]
-                lengths = ends - starts + 1
+                if len(b_idx) > 0:  # no additional sync - uses len from nonzero
+                    summary_cache = self.summary_cache[layer_idx]
+                    page_start = summary_cache.page_start
+                    page_end = summary_cache.page_end
+                    if page_start.shape[0] < B:
+                        pad_b = B - page_start.shape[0]
+                        zeros = torch.zeros(pad_b, page_start.shape[1], device=page_start.device, dtype=page_start.dtype)
+                        page_start = torch.cat([page_start, zeros], dim=0)
+                        page_end = torch.cat([page_end, zeros], dim=0)
 
-                valid = (page_ids >= 0) & (ends >= starts)
-                if valid.any():
+                    k_raw, v_raw, _, _ = self.raw_cache.get_layer(layer_idx, with_offsets=False)
+                    page_ids = cover_indices[b_idx, pos_idx]
+                    starts = page_start[b_idx, page_ids]
+                    ends = page_end[b_idx, page_ids]
+                    lengths = ends - starts + 1
+
+                    # Filter valid entries and check length (no additional sync)
+                    valid = (page_ids >= 0) & (ends >= starts)
                     b_idx, pos_idx = b_idx[valid], pos_idx[valid]
                     starts, lengths = starts[valid], lengths[valid]
+                    page_ids = page_ids[valid]
 
-                    # === Corrected refinement with proper normalizer (batched) ===
-                    # When we refine summaries, the softmax normalizer changes:
-                    # Z_full = Z_cover - sum(exp(logit_s)) + sum(Z_page_s)
-                    # All attention must be rescaled by Z_cover / Z_full
-                    #
-                    # Final output formula:
-                    # output = scale * (cover_output - sum(attn_s * v_summary) + sum(ratio_page * raw_out))
-                    # where scale = 1 / (1 - sum(attn_s) + sum(ratio_page))
+                    if len(b_idx) > 0:  # check after filtering
+                        # === Corrected refinement with proper normalizer (batched) ===
+                        # When we refine summaries, the softmax normalizer changes:
+                        # Z_full = Z_cover - sum(exp(logit_s)) + sum(Z_page_s)
+                        # All attention must be rescaled by Z_cover / Z_full
+                        #
+                        # Final output formula:
+                        # output = scale * (cover_output - sum(attn_s * v_summary) + sum(ratio_page * raw_out))
+                        # where scale = 1 / (1 - sum(attn_s) + sum(ratio_page))
 
-                    N_refine = b_idx.shape[0]
-                    max_page_len = lengths.max().item()
+                        N_refine = b_idx.shape[0]
+                        # Keep max_page_len as tensor to avoid GPU sync
+                        # torch.arange accepts 0-dim tensors in PyTorch 2.x
+                        max_page_len = lengths.max()
 
-                    # Gather raw KV for all refined pages (padded to max_page_len)
-                    # Build indices: [N_refine, max_page_len]
-                    page_offsets = torch.arange(max_page_len, device=query_states.device).unsqueeze(0)  # [1, max_page_len]
-                    raw_idx = starts.unsqueeze(1) + page_offsets  # [N_refine, max_page_len]
-                    # Clamp to valid range (padding will be masked out)
-                    raw_idx = raw_idx.clamp(max=k_raw.shape[2] - 1)
+                        # Gather raw KV for all refined pages (padded to max_page_len)
+                        # Build indices: [N_refine, max_page_len]
+                        page_offsets = torch.arange(max_page_len, device=query_states.device).unsqueeze(0)  # [1, max_page_len]
+                        raw_idx = starts.unsqueeze(1) + page_offsets  # [N_refine, max_page_len]
+                        # Clamp to valid range (padding will be masked out)
+                        raw_idx = raw_idx.clamp(max=k_raw.shape[2] - 1)
 
-                    # Create padding mask: True where valid, False where padded
-                    valid_mask = page_offsets < lengths.unsqueeze(1)  # [N_refine, max_page_len]
+                        # Create padding mask: True where valid, False where padded
+                        valid_mask = page_offsets < lengths.unsqueeze(1)  # [N_refine, max_page_len]
 
-                    # Gather K/V: [N_refine, H_k, max_page_len, D]
-                    gather_idx = raw_idx.view(N_refine, 1, max_page_len, 1).expand(-1, k_raw.shape[1], -1, k_raw.shape[3])
-                    k_slice = repeat_kv(torch.gather(k_raw[b_idx], 2, gather_idx), num_kv_groups)
-                    v_slice = repeat_kv(torch.gather(v_raw[b_idx], 2, gather_idx), num_kv_groups)
+                        # Gather K/V: [N_refine, H_k, max_page_len, D]
+                        # Use unsqueeze/expand pattern to avoid needing explicit shape in view()
+                        gather_idx = raw_idx.unsqueeze(1).unsqueeze(-1).expand(-1, k_raw.shape[1], -1, k_raw.shape[3])
+                        k_slice = repeat_kv(torch.gather(k_raw[b_idx], 2, gather_idx), num_kv_groups)
+                        v_slice = repeat_kv(torch.gather(v_raw[b_idx], 2, gather_idx), num_kv_groups)
 
-                    # Compute raw attention logits: [N_refine, H_q, L_q, max_page_len]
-                    q_refine = query_states[b_idx]  # [N_refine, H_q, L_q, D]
-                    raw_logits = torch.matmul(q_refine, k_slice.transpose(2, 3)) * scaling
+                        # Compute raw attention logits: [N_refine, H_q, L_q, max_page_len]
+                        q_refine = query_states[b_idx]  # [N_refine, H_q, L_q, D]
+                        raw_logits = torch.matmul(q_refine, k_slice.transpose(2, 3)) * scaling
 
-                    # Apply attention mask if present
-                    if attention_mask is not None:
-                        mask_gather_idx = raw_idx.view(N_refine, 1, 1, max_page_len).expand(-1, 1, attention_mask.shape[2], -1)
-                        raw_logits = raw_logits + torch.gather(attention_mask[b_idx], 3, mask_gather_idx)
+                        # Apply attention mask if present
+                        if attention_mask is not None:
+                            mask_gather_idx = raw_idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, attention_mask.shape[2], -1)
+                            raw_logits = raw_logits + torch.gather(attention_mask[b_idx], 3, mask_gather_idx)
 
-                    # Mask out padded positions before softmax
-                    mask_value = torch.finfo(raw_logits.dtype).min
-                    raw_logits = raw_logits.masked_fill(~valid_mask[:, None, None, :], mask_value)
+                        # Mask out padded positions before softmax
+                        mask_value = torch.finfo(raw_logits.dtype).min
+                        raw_logits = raw_logits.masked_fill(~valid_mask[:, None, None, :], mask_value)
 
-                    # Compute logsumexp for page (Z_page in log space)
-                    logsumexp_page = torch.logsumexp(raw_logits.float(), dim=-1)  # [N_refine, H_q, L_q]
+                        # Compute logsumexp for page (Z_page in log space)
+                        logsumexp_page = torch.logsumexp(raw_logits.float(), dim=-1)  # [N_refine, H_q, L_q]
 
-                    # Softmax and weighted sum
-                    raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                    raw_out = torch.matmul(raw_probs, v_slice)  # [N_refine, H_q, L_q, D]
+                        # Softmax and weighted sum
+                        raw_probs = torch.softmax(raw_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                        raw_out = torch.matmul(raw_probs, v_slice)  # [N_refine, H_q, L_q, D]
 
-                    # Get values for summaries being refined
-                    v_summary = cover_v_full[b_idx, :, pos_idx, :]  # [N_refine, H_q, D]
+                        # Get values for summaries being refined
+                        v_summary = cover_v_full[b_idx, :, pos_idx, :]  # [N_refine, H_q, D]
 
-                    # Active mask: which (refine_idx, head, query) combos are actually refined
-                    active = refine_mask[b_idx, :, :, pos_idx].float()  # [N_refine, H_q, L_q]
+                        # Active mask: which (refine_idx, head, query) combos are actually refined
+                        active = refine_mask[b_idx, :, :, pos_idx].float()  # [N_refine, H_q, L_q]
 
-                    # Skip if no active refinements (can happen due to per-head thresholding)
-                    if not active.any():
-                        pass  # No refinements to apply
-                    else:
+                        # Proceed with refinement computation - active.any() check removed to avoid GPU sync
+                        # If active is all zeros, the computation still produces correct results (no change)
                         # attn_s: attention to summary
                         attn_s = attn_probs[b_idx, :, :, pos_idx].float()  # [N_refine, H_q, L_q]
 

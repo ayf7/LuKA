@@ -1,62 +1,48 @@
 """
 Test script for LuKA with HuggingFace Transformers (new controller path).
 Simple script to test boundary detection during generation.
+
+Usage:
+    python scripts/run_batch.py --compressor attention_weighted --log-bias adaptive_k
+    python scripts/run_batch.py --compressor mean --log-bias adaptive_k
+    python scripts/run_batch.py --compressor mean --log-bias fixed_n
 """
 
+import argparse
 import torch
 from transformers import AutoTokenizer
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
 
+parser = argparse.ArgumentParser(description="Test LuKA with different compressors")
+parser.add_argument("--compressor", type=str, default="attention_weighted",
+                    choices=["attention_weighted", "mean"],
+                    help="Compressor type (default: attention_weighted)")
+parser.add_argument("--log-bias", type=str, default="adaptive_k",
+                    choices=["none", "fixed_n", "adaptive_k"],
+                    help="Log bias mode (default: adaptive_k)")
+parser.add_argument("--max-tokens", type=int, default=256,
+                    help="Max new tokens to generate (default: 256)")
+args = parser.parse_args()
+
 # Configuration
-model_name = "Qwen/Qwen3-1.7B-Base"
+model_name = "Qwen/Qwen3-8B"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Option 1: Attention-Weighted Compressor (Recommended)
-# Uses accumulated attention history to weight tokens. Best quality.
+print(f"Compressor: {args.compressor}")
+print(f"Log bias mode: {args.log_bias}")
+
+# Active config (from CLI args)
+compressor_kwargs = {"temperature": 7.0} if args.compressor == "attention_weighted" else {}
 set_luka_kv_params(
-    compressor="attention_weighted",
-    compressor_kwargs={"temperature": 1.0},  # Lower = sharper weighting
-    use_log_bias=True,  # Not needed for attention-weighted
+    compressor=args.compressor,
+    compressor_kwargs=compressor_kwargs,
     segmenter="dummy",
-    refine_threshold=0.01,
+    refinement_rule="top_k",
+    refinement_rule_kwargs={"k": 3},
+    log_bias_mode=args.log_bias,
     segment_interval=16,
 )
-
-# Option 2: Mean Compressor (Baseline)
-# Simple averaging. Fast but dilutes important tokens.
-# set_luka_kv_params(
-#     compressor="mean",
-#     use_log_bias=True,  # log(N) bias doesn't help with arithmetic mean
-#     segmenter="dummy",
-#     refine_threshold=0.01,  # May need higher threshold due to worse summaries
-#     segment_interval=16,
-# )
-
-# # Option 3: Trained Encoder Compressor
-# # Load a trained compressor checkpoint for learned compression.
-# from modeling.compressor import EncoderCompressor
-# trained_compressor = EncoderCompressor(
-#     checkpoint_path="train_1/step_1000.pt"
-# )
-# set_luka_kv_params(
-#     compressor=trained_compressor,
-#     use_log_bias=False,
-#     segmenter="dummy",
-#     refine_threshold=0.05,
-#     segment_interval=16,
-# )
-
-# # Option 4: Attention-Weighted with Sharp Temperature
-# # More aggressive weighting toward highest-attention tokens.
-# set_luka_kv_params(
-#     compressor="attention_weighted",
-#     compressor_kwargs={"temperature": 0.5},  # Sharper = more weight on top token
-#     use_log_bias=False,
-#     segmenter="dummy",
-#     refine_threshold=0.01,
-#     segment_interval=16,
-# )
 
 # Load model and tokenizer
 model = load_luka_model(
@@ -81,7 +67,7 @@ if device == "cuda":
 # Generate
 outputs = model.generate(
     **inputs,
-    max_new_tokens=256,
+    max_new_tokens=args.max_tokens,
     temperature=0.7,
     top_p=0.9,
     do_sample=True,
@@ -110,6 +96,7 @@ if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
     print("\n" + "=" * 60)
     print("LuKA Refinement Statistics")
     print("=" * 60)
+    print(f"  Refinement rule:          {controller.refinement_rule}")
     print(f"  Layers:                   {stats['num_layers']}")
     print(f"  Pages (per layer avg):    {stats['avg_pages_per_layer']:.1f}")
     print(f"  Summary tokens (per layer): {stats['avg_summaries_per_layer']:.1f}")
@@ -117,4 +104,45 @@ if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
     print(f"  Total refinements:        {stats['total_refinements_made']}")
     print(f"  Refinement rate:          {stats['refinement_rate']:.4f} ({stats['refinement_rate']*100:.2f}%)")
     print(f"  Refinements per query:    {stats['refinements_per_query']:.2f}")
+    print("=" * 60 + "\n")
+
+    # Print log(k_eff) entropy statistics per layer
+    print("=" * 60)
+    print("Log Effective Support (Entropy) Statistics")
+    print("=" * 60)
+    print(f"  {'Layer':<8} {'Pages':<8} {'Mean':<10} {'Min':<10} {'Max':<10} {'Std':<10}")
+    print("-" * 60)
+
+    all_log_k = []
+    for layer_idx, layer_cache in enumerate(controller.summary_cache):
+        if layer_cache is not None and layer_cache.log_effective_support is not None:
+            log_k = layer_cache.log_effective_support
+            # Only consider non-zero entries (actual pages)
+            num_pages = layer_cache.page_lens.sum().item()
+            if num_pages > 0:
+                # Flatten and get valid entries
+                valid_log_k = []
+                for b in range(log_k.shape[0]):
+                    n_pages = layer_cache.page_lens[b].item()
+                    if n_pages > 0:
+                        valid_log_k.append(log_k[b, :n_pages])
+                if valid_log_k:
+                    valid_log_k = torch.cat(valid_log_k)
+                    all_log_k.append(valid_log_k)
+                    mean_val = valid_log_k.mean().item()
+                    min_val = valid_log_k.min().item()
+                    max_val = valid_log_k.max().item()
+                    std_val = valid_log_k.std().item() if len(valid_log_k) > 1 else 0.0
+                    print(f"  {layer_idx:<8} {int(num_pages):<8} {mean_val:<10.3f} {min_val:<10.3f} {max_val:<10.3f} {std_val:<10.3f}")
+
+    if all_log_k:
+        all_log_k = torch.cat(all_log_k)
+        print("-" * 60)
+        print(f"  {'TOTAL':<8} {len(all_log_k):<8} {all_log_k.mean().item():<10.3f} {all_log_k.min().item():<10.3f} {all_log_k.max().item():<10.3f} {all_log_k.std().item():<10.3f}")
+
+        # Also show what this means in terms of k_eff = exp(log_k)
+        k_eff = all_log_k.exp()
+        print("\n  Effective support k_eff = exp(entropy):")
+        print(f"    Mean: {k_eff.mean().item():.2f}, Min: {k_eff.min().item():.2f}, Max: {k_eff.max().item():.2f}")
+        print(f"    (For reference: page_size=16 → uniform would give k_eff=16)")
     print("=" * 60 + "\n")

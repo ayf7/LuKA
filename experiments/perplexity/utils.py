@@ -6,18 +6,77 @@ import time
 import torch
 from pathlib import Path
 from transformers import AutoTokenizer
+from datasets import load_dataset
 
 from modeling.compressor import (
     AttentionWeightedCompressor,
+    AttentionWeightedZeroVCompressor,
     EncoderCompressor,
-    EvictionCompressor,
     MeanCompressor,
+    MeanZeroVCompressor,
 )
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
 
 
 MODEL_NAME = "Qwen/Qwen3-1.7B-Base"
+
+
+def load_eval_text(dataset_name: str = "wikitext", max_tokens: int = 2048, tokenizer=None) -> tuple[str, torch.Tensor]:
+    """
+    Load evaluation text from a standard dataset.
+
+    Args:
+        dataset_name: Dataset to load ("wikitext", "pg19", "c4")
+        max_tokens: Maximum number of tokens to include
+        tokenizer: Tokenizer to use for counting tokens
+
+    Returns:
+        (text, token_ids) - the text and its tokenized form
+    """
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
+
+    if dataset_name == "wikitext":
+        # WikiText-103 test set - long Wikipedia articles
+        dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+        # Concatenate articles until we have enough tokens
+        text = ""
+        for item in dataset:
+            if item["text"].strip():
+                text += item["text"] + "\n"
+            # Tokenize to check length
+            tokens = tokenizer(text, return_tensors="pt")["input_ids"]
+            if tokens.shape[1] >= max_tokens:
+                break
+
+    elif dataset_name == "pg19":
+        # PG-19: Long books from Project Gutenberg
+        dataset = load_dataset("pg19", split="test")
+        # Take first book, it's usually long enough
+        text = dataset[0]["text"]
+
+    elif dataset_name == "c4":
+        # C4 validation set
+        dataset = load_dataset("c4", "en", split="validation", streaming=True)
+        text = ""
+        for item in dataset:
+            text += item["text"] + "\n"
+            tokens = tokenizer(text, return_tensors="pt")["input_ids"]
+            if tokens.shape[1] >= max_tokens:
+                break
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Use 'wikitext', 'pg19', or 'c4'.")
+
+    # Tokenize and truncate to max_tokens
+    token_ids = tokenizer(text, return_tensors="pt")["input_ids"]
+    if token_ids.shape[1] > max_tokens:
+        token_ids = token_ids[:, :max_tokens]
+        # Decode back to get the truncated text
+        text = tokenizer.decode(token_ids[0], skip_special_tokens=True)
+
+    return text, token_ids
 
 CHECKPOINT_PATHS = [
     Path("train_1/step_1000.pt"),
@@ -29,8 +88,10 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def get_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+def get_tokenizer(model_name: str = None):
+    if model_name is None:
+        model_name = MODEL_NAME
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
@@ -50,58 +111,172 @@ def find_encoder_checkpoint():
     return None
 
 
-def get_compressor_configs(include_trained_encoder: bool = True, include_log_bias: bool = True):
+def get_compressor_configs(
+    include_trained_encoder: bool = True,
+    include_log_bias: bool = True,
+    include_adaptive_k: bool = True,
+    bias_comparison_mode: bool = False,
+):
     """
     Get list of compressor configurations to test.
 
-    Returns list of dicts with keys: name, label, compressor, use_log_bias, color
+    Returns list of dicts with keys: name, label, compressor, log_bias_mode, color, linestyle, linewidth
+
+    Args:
+        include_trained_encoder: Include trained encoder compressor if checkpoint found.
+        include_log_bias: Include fixed log(N) bias variants.
+        include_adaptive_k: Include adaptive log(k_eff) bias variants.
+        bias_comparison_mode: If True, only include Mean and Attn-Weighted with all 3 bias modes.
+            Same color per compressor, different linestyles per bias mode:
+            - adaptive_k: bold solid
+            - fixed_n: dotted
+            - none: solid (normal weight)
     """
+    if bias_comparison_mode:
+        # Focused comparison: same compressor = same color, different bias = different linestyle
+        compressors = [
+            # Mean variants (orange)
+            {
+                "name": "mean_logk",
+                "label": "Mean + log(k)",
+                "compressor": MeanCompressor(),
+                "log_bias_mode": "adaptive_k",
+                "color": "tab:orange",
+                "linestyle": "-",
+                "linewidth": 3.0,  # bold
+            },
+            {
+                "name": "mean_logn",
+                "label": "Mean + log(N)",
+                "compressor": MeanCompressor(),
+                "log_bias_mode": "fixed_n",
+                "color": "tab:orange",
+                "linestyle": ":",
+                "linewidth": 1.5,
+            },
+            {
+                "name": "mean",
+                "label": "Mean",
+                "compressor": MeanCompressor(),
+                "log_bias_mode": "none",
+                "color": "tab:orange",
+                "linestyle": "-",
+                "linewidth": 1.5,
+            },
+            # Attention-Weighted variants (blue)
+            {
+                "name": "attn_weighted_logk",
+                "label": "Attn-Weighted + log(k)",
+                "compressor": AttentionWeightedCompressor(temperature=1.0),
+                "log_bias_mode": "adaptive_k",
+                "color": "tab:blue",
+                "linestyle": "-",
+                "linewidth": 3.0,  # bold
+            },
+            {
+                "name": "attn_weighted_logn",
+                "label": "Attn-Weighted + log(N)",
+                "compressor": AttentionWeightedCompressor(temperature=1.0),
+                "log_bias_mode": "fixed_n",
+                "color": "tab:blue",
+                "linestyle": ":",
+                "linewidth": 1.5,
+            },
+            {
+                "name": "attn_weighted",
+                "label": "Attn-Weighted",
+                "compressor": AttentionWeightedCompressor(temperature=1.0),
+                "log_bias_mode": "none",
+                "color": "tab:blue",
+                "linestyle": "-",
+                "linewidth": 1.5,
+            },
+        ]
+        return compressors
+
+    # Original behavior
     compressors = [
         {
             "name": "attn_weighted",
             "label": "Attn-Weighted",
             "compressor": AttentionWeightedCompressor(temperature=1.0),
-            "use_log_bias": False,
+            "log_bias_mode": "none",
             "color": "tab:blue",
+            "linestyle": "-",
+            "linewidth": 1.5,
         },
         {
             "name": "mean",
             "label": "Mean",
             "compressor": MeanCompressor(),
-            "use_log_bias": False,
+            "log_bias_mode": "none",
             "color": "tab:orange",
+            "linestyle": "-",
+            "linewidth": 1.5,
         },
         {
-            "name": "eviction",
-            "label": "Eviction (attn-K, zero-V)",
-            "compressor": EvictionCompressor(temperature=1.0),
-            "use_log_bias": False,
+            "name": "attn_weighted_zero_v",
+            "label": "Attn-K, Zero-V",
+            "compressor": AttentionWeightedZeroVCompressor(temperature=1.0),
+            "log_bias_mode": "none",
             "color": "tab:purple",
+            "linestyle": "-",
+            "linewidth": 1.5,
+        },
+        {
+            "name": "mean_zero_v",
+            "label": "Mean-K, Zero-V",
+            "compressor": MeanZeroVCompressor(),
+            "log_bias_mode": "none",
+            "color": "tab:brown",
+            "linestyle": "-",
+            "linewidth": 1.5,
         },
     ]
 
     if include_log_bias:
         compressors.extend([
             {
-                "name": "attn_weighted_logbias",
+                "name": "attn_weighted_logn",
                 "label": "Attn-Weighted + log(N)",
                 "compressor": AttentionWeightedCompressor(temperature=1.0),
-                "use_log_bias": True,
+                "log_bias_mode": "fixed_n",
                 "color": "tab:cyan",
+                "linestyle": "-",
+                "linewidth": 1.5,
             },
             {
-                "name": "mean_logbias",
+                "name": "mean_logn",
                 "label": "Mean + log(N)",
                 "compressor": MeanCompressor(),
-                "use_log_bias": True,
+                "log_bias_mode": "fixed_n",
                 "color": "tab:red",
+                "linestyle": "-",
+                "linewidth": 1.5,
             },
+        ])
+
+    if include_adaptive_k:
+        compressors.extend([
             {
-                "name": "eviction_logbias",
-                "label": "Eviction + log(N)",
-                "compressor": EvictionCompressor(temperature=1.0),
-                "use_log_bias": True,
+                "name": "attn_weighted_logk",
+                "label": "Attn-Weighted + log(k)",
+                "compressor": AttentionWeightedCompressor(temperature=1.0),
+                "log_bias_mode": "adaptive_k",
+                "color": "tab:green",
+                "linestyle": "-",
+                "linewidth": 1.5,
+            },
+            # Note: Mean doesn't have importance weights, so adaptive_k falls back to log(N)
+            # Still useful to test to verify fallback behavior
+            {
+                "name": "mean_logk",
+                "label": "Mean + log(k)",
+                "compressor": MeanCompressor(),
+                "log_bias_mode": "adaptive_k",
                 "color": "tab:pink",
+                "linestyle": "-",
+                "linewidth": 1.5,
             },
         ])
 
@@ -112,8 +287,10 @@ def get_compressor_configs(include_trained_encoder: bool = True, include_log_bia
                 "name": "trained_encoder",
                 "label": "Trained Encoder",
                 "compressor": EncoderCompressor(checkpoint_path=str(checkpoint_path)),
-                "use_log_bias": False,
-                "color": "tab:green",
+                "log_bias_mode": "none",
+                "color": "tab:gray",
+                "linestyle": "-",
+                "linewidth": 1.5,
             })
             # Note: log(N) bias is catastrophic with trained encoder, not included
             print(f"Found trained encoder at {checkpoint_path}")
@@ -127,12 +304,16 @@ def generate_baseline_rollout(
     tokenizer,
     prompt: str,
     device: str,
-    max_new_tokens: int = 128
+    max_new_tokens: int = 128,
+    model_name: str = None,
 ):
     """
     Generate a greedy rollout using raw attention (no compression).
     Returns token ids (including prompt) and decoded text.
     """
+    if model_name is None:
+        model_name = MODEL_NAME
+
     set_luka_kv_params(
         default_tail_len=16,
         min_compress_chunk=16,
@@ -144,7 +325,7 @@ def generate_baseline_rollout(
     )
 
     model = load_luka_model(
-        MODEL_NAME,
+        model_name,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
     ).to(device)
@@ -193,11 +374,15 @@ def prefill_then_decode_perplexity(model, rollout_ids: torch.Tensor, prompt_len:
     nll_list = []
     total_tokens = T - prompt_len
     start_time = time.perf_counter()
+    has_nan = False
 
     # First prediction: use prefill logits (no extra forward pass needed)
     logits = pre_out.logits[:, -1, :]
     target = rollout_ids[:, prompt_len]
-    log_probs = torch.log_softmax(logits, dim=-1)
+    # Check for NaN/Inf in logits
+    if logits.isnan().any() or logits.isinf().any():
+        has_nan = True
+    log_probs = torch.log_softmax(logits.float(), dim=-1)  # float32 for stability
     nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
     nll_list.append(nll)
 
@@ -214,7 +399,10 @@ def prefill_then_decode_perplexity(model, rollout_ids: torch.Tensor, prompt_len:
             )
         logits = out.logits[:, -1, :]
         target = rollout_ids[:, t + 1]
-        log_probs = torch.log_softmax(logits, dim=-1)
+        # Check for NaN/Inf in logits
+        if logits.isnan().any() or logits.isinf().any():
+            has_nan = True
+        log_probs = torch.log_softmax(logits.float(), dim=-1)  # float32 for stability
         nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
         nll_list.append(nll)
         past_key_values = out.past_key_values
@@ -225,6 +413,12 @@ def prefill_then_decode_perplexity(model, rollout_ids: torch.Tensor, prompt_len:
     tps = total_tokens / max(elapsed, 1e-8)
 
     nll_tensor = torch.stack(nll_list, dim=1)
+
+    # If we detected NaN/Inf during forward pass, return inf perplexity
+    if has_nan or nll_tensor.isnan().any() or nll_tensor.isinf().any():
+        print("  [WARNING: NaN/Inf detected in logits, returning inf perplexity]")
+        return float('inf'), [float('inf')] * total_tokens, tps
+
     total_tokens_tensor = torch.tensor([[total_tokens]], device=device, dtype=nll_tensor.dtype)
     total_nll = nll_tensor.sum(dim=1, keepdim=True) / total_tokens_tensor
     ppl = torch.exp(total_nll)[0, 0].item()
@@ -237,8 +431,11 @@ def prefill_then_decode_perplexity(model, rollout_ids: torch.Tensor, prompt_len:
     return ppl, curve, tps
 
 
-def get_baseline_perplexity(rollout_ids: torch.Tensor, prompt_len: int, device: str):
+def get_baseline_perplexity(rollout_ids: torch.Tensor, prompt_len: int, device: str, model_name: str = None):
     """Run baseline (raw attention, no compression) perplexity evaluation."""
+    if model_name is None:
+        model_name = MODEL_NAME
+
     set_luka_kv_params(
         default_tail_len=16,
         min_compress_chunk=16,
@@ -251,7 +448,7 @@ def get_baseline_perplexity(rollout_ids: torch.Tensor, prompt_len: int, device: 
     )
 
     model = load_luka_model(
-        MODEL_NAME,
+        model_name,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
     ).to(device)
@@ -288,21 +485,59 @@ def run_single_config(
     prompt_len: int,
     device: str,
     compressor,
-    use_log_bias: bool,
-    threshold: float,
+    use_log_bias: bool = None,  # DEPRECATED: use log_bias_mode
+    log_bias_mode: str = None,  # "none", "fixed_n", or "adaptive_k"
+    threshold: float = None,
+    refinement_rule: str = "threshold",
+    refinement_rule_kwargs: dict = None,
+    model_name: str = None,
 ):
     """
     Run perplexity evaluation with a single compressor configuration.
 
+    Args:
+        rollout_ids: Token IDs to evaluate
+        prompt_len: Length of prompt (prefix)
+        device: Device to run on
+        compressor: Compressor instance or string
+        use_log_bias: DEPRECATED. Use log_bias_mode instead.
+        log_bias_mode: Log bias mode ("none", "fixed_n", or "adaptive_k")
+        threshold: (Deprecated) Threshold for refinement, use refinement_rule instead
+        refinement_rule: Refinement rule name ("threshold", "top_k", "top_p", etc.)
+        refinement_rule_kwargs: Kwargs for refinement rule.
+            e.g. {"k": 3, "always_refine_first_n": 1} for top_k with attention sinks
+
     Returns dict with: perplexity, curve, tokens_per_sec, summary_frac, pages
     """
+    # Build refinement kwargs
+    if refinement_rule_kwargs is None:
+        refinement_rule_kwargs = {}
+
+    # Backwards compat: if threshold provided and rule is threshold, use it
+    if threshold is not None and refinement_rule == "threshold" and "threshold" not in refinement_rule_kwargs:
+        refinement_rule_kwargs["threshold"] = threshold
+
+    # Handle log_bias_mode vs use_log_bias (backwards compat)
+    effective_log_bias_mode = log_bias_mode
+    if effective_log_bias_mode is None:
+        if use_log_bias is True:
+            effective_log_bias_mode = "fixed_n"
+        elif use_log_bias is False:
+            effective_log_bias_mode = "none"
+        else:
+            effective_log_bias_mode = "none"  # default
+
+    if model_name is None:
+        model_name = MODEL_NAME
+
     set_luka_kv_params(
         default_tail_len=16,
         min_compress_chunk=16,
         max_pages=15,
-        refine_threshold=threshold,
+        refinement_rule=refinement_rule,
+        refinement_rule_kwargs=refinement_rule_kwargs,
         compressor=compressor,
-        use_log_bias=use_log_bias,
+        log_bias_mode=effective_log_bias_mode,
         segmenter="dummy",
         segment_interval=16,
         create_pages_in_generation=True,
@@ -310,7 +545,7 @@ def run_single_config(
     )
 
     model = load_luka_model(
-        MODEL_NAME,
+        model_name,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
     ).to(device)
@@ -330,4 +565,5 @@ def run_single_config(
         "tokens_per_sec": tps,
         "summary_frac": summary_frac,
         "pages": stats.get("avg_pages_per_layer", 0),
+        "page_selection_counts": stats.get("page_selection_counts", {}),
     }

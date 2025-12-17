@@ -71,3 +71,4 @@ logs/
 artifacts/attention_plots
 artifacts/attention_plots_*
 *.png
+*.csv

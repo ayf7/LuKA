@@ -23,6 +23,16 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from modeling.compressor import AttentionWeightedCompressor, EncoderCompressor, MeanCompressor
 from modeling.kv_cache import LukaKVController
 from modeling.segmenter import DummySegmenter, KLSegmenter, GaussianSegmenter
+from modeling.refinement import (
+    RefinementRule,
+    NoRefinementRule,
+    FixedThresholdRule,
+    TopKRule,
+    TopPRule,
+    TopFracRule,
+    TopKTopPRule,
+    get_refinement_rule,
+)
 
 # Optional global overrides for KV cache params, settable by callers (e.g., scripts/test.py)
 _kv_params_override: dict[str, float | int | object] = {}
@@ -39,15 +49,27 @@ COMPRESSOR_REGISTRY = {
     "attention_weighted": AttentionWeightedCompressor,
 }
 
+REFINEMENT_RULE_REGISTRY = {
+    "none": NoRefinementRule,
+    "threshold": FixedThresholdRule,
+    "top_k": TopKRule,
+    "top_p": TopPRule,
+    "top_frac": TopFracRule,
+    "top_k_top_p": TopKTopPRule,
+}
+
 def set_luka_kv_params(
     *,
     default_tail_len: int = 16,
     min_compress_chunk: int = 16,
     max_pages: int = 15,
-    refine_threshold: float = 0.05,
+    refine_threshold: float | None = None,  # DEPRECATED: use refinement_rule instead
+    refinement_rule: object = "threshold",  # str, RefinementRule, float, or None
+    refinement_rule_kwargs: dict | None = None,  # includes always_refine_first_n
     segment_interval: int = 1,
     create_pages_in_generation: bool = True,
-    use_log_bias: bool = False,
+    use_log_bias: bool = False,  # DEPRECATED: use log_bias_mode instead
+    log_bias_mode: str | None = None,  # "none", "fixed_n", or "adaptive_k"
     print_stats_after_generate: bool = False,
     production_mode: bool = True,
     async_pages: bool = False,
@@ -56,6 +78,38 @@ def set_luka_kv_params(
     segmenter: object = "dummy",
     segmenter_kwargs: dict | None = None,
 ) -> None:
+    """Configure LuKA KV cache parameters.
+
+    Args:
+        default_tail_len: Number of raw tokens to keep uncompressed at the end.
+        min_compress_chunk: Minimum number of tokens per page.
+        max_pages: Maximum number of summary pages to create.
+        refine_threshold: DEPRECATED. Use refinement_rule instead.
+            For backwards compatibility, if set, creates FixedThresholdRule.
+        refinement_rule: Refinement rule for selecting which summaries to expand.
+            Can be:
+            - str: Name from registry ("none", "threshold", "top_k", "top_p", "top_k_top_p")
+            - RefinementRule instance
+            - float: Interpreted as threshold for FixedThresholdRule
+            - None: Disables refinement (NoRefinementRule)
+        refinement_rule_kwargs: Kwargs for refinement rule if using string name.
+            Can include always_refine_first_n for attention sinks (e.g. {"k": 3, "always_refine_first_n": 1}).
+        segment_interval: How often to attempt page creation (every N decode steps).
+        create_pages_in_generation: Whether to create pages during generation.
+        use_log_bias: DEPRECATED. Use log_bias_mode instead. If True, sets log_bias_mode="fixed_n".
+        log_bias_mode: Log bias mode for summary attention logits:
+            - "none": No bias (default)
+            - "fixed_n": log(N) where N = page length (assumes uniform attention)
+            - "adaptive_k": log(k_eff) where k_eff = exp(entropy) is effective support
+                           This adapts to the actual attention distribution at compression time.
+        print_stats_after_generate: Print refinement stats after generate().
+        production_mode: Skip debug checks for better performance.
+        async_pages: Run compression on background CUDA stream.
+        compressor: Compressor for page creation ("mean", "attention_weighted", etc.).
+        compressor_kwargs: Kwargs for compressor if using string name.
+        segmenter: Segmenter for page boundaries ("dummy", "kl", "gaussian").
+        segmenter_kwargs: Kwargs for segmenter if using string name.
+    """
     global _kv_params_override
     if default_tail_len is not None:
         _kv_params_override["default_tail_len"] = int(default_tail_len)
@@ -63,20 +117,57 @@ def set_luka_kv_params(
         _kv_params_override["min_compress_chunk"] = int(min_compress_chunk)
     if max_pages is not None:
         _kv_params_override["max_pages"] = int(max_pages)
-    if refine_threshold is not None:
-        _kv_params_override["refine_threshold"] = float(refine_threshold)
     if segment_interval is not None:
         _kv_params_override["segment_interval"] = int(segment_interval)
     if create_pages_in_generation is not None:
         _kv_params_override["create_pages_in_generation"] = bool(create_pages_in_generation)
     if use_log_bias is not None:
         _kv_params_override["use_log_bias"] = bool(use_log_bias)
+    if log_bias_mode is not None:
+        if log_bias_mode not in ("none", "fixed_n", "adaptive_k"):
+            raise ValueError(f"Invalid log_bias_mode: {log_bias_mode}. Must be 'none', 'fixed_n', or 'adaptive_k'.")
+        _kv_params_override["log_bias_mode"] = log_bias_mode
     if print_stats_after_generate is not None:
         _kv_params_override["print_stats_after_generate"] = bool(print_stats_after_generate)
     if production_mode is not None:
         _kv_params_override["production_mode"] = bool(production_mode)
     if async_pages is not None:
         _kv_params_override["async_pages"] = bool(async_pages)
+
+    # Handle refinement rule configuration
+    # Backwards compatibility: refine_threshold takes precedence if explicitly set
+    if refine_threshold is not None:
+        # Deprecated path: convert threshold to FixedThresholdRule
+        if refine_threshold < 0:
+            _kv_params_override["refinement_rule"] = NoRefinementRule()
+        else:
+            _kv_params_override["refinement_rule"] = FixedThresholdRule(threshold=float(refine_threshold))
+    elif refinement_rule is not None:
+        if isinstance(refinement_rule, RefinementRule):
+            if refinement_rule_kwargs:
+                raise ValueError("Cannot provide refinement_rule_kwargs when passing a RefinementRule instance.")
+            _kv_params_override["refinement_rule"] = refinement_rule
+        elif isinstance(refinement_rule, (int, float)):
+            # Interpret as threshold
+            if refinement_rule < 0:
+                _kv_params_override["refinement_rule"] = NoRefinementRule()
+            else:
+                _kv_params_override["refinement_rule"] = FixedThresholdRule(threshold=float(refinement_rule))
+        elif isinstance(refinement_rule, str):
+            if refinement_rule.lower() not in REFINEMENT_RULE_REGISTRY:
+                raise ValueError(
+                    f"Refinement rule '{refinement_rule}' not found in registry. "
+                    f"Available: {list(REFINEMENT_RULE_REGISTRY.keys())}"
+                )
+            kwargs = refinement_rule_kwargs or {}
+            _kv_params_override["refinement_rule"] = REFINEMENT_RULE_REGISTRY[refinement_rule.lower()](**kwargs)
+        elif refinement_rule is None:
+            _kv_params_override["refinement_rule"] = NoRefinementRule()
+        else:
+            raise TypeError(
+                f"refinement_rule must be str, RefinementRule, float, or None, "
+                f"got {type(refinement_rule).__name__}"
+            )
 
     if compressor is not None:
         if isinstance(compressor, str):
@@ -205,7 +296,7 @@ class LukaQwenAttention(nn.Module):
                 num_kv_groups=self.num_key_value_groups,
                 attention_mask=attention_mask,
                 sliding_window=self.sliding_window,
-                threshold=_kv_params_override.get("refine_threshold", 0.05)
+                # Note: refinement is controlled by self.luka_kv.refinement_rule
             )
 
         # Try to create new pages (segmentation & compression)
@@ -240,12 +331,16 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
             self.luka_kv_controller.segmenter = _kv_params_override["segmenter"]
         if "compressor" in _kv_params_override:
             self.luka_kv_controller.compressor = _kv_params_override["compressor"]
+        if "refinement_rule" in _kv_params_override:
+            self.luka_kv_controller.refinement_rule = _kv_params_override["refinement_rule"]
         if "segment_interval" in _kv_params_override:
             self.luka_kv_controller.segment_interval = _kv_params_override["segment_interval"]
         if "create_pages_in_generation" in _kv_params_override:
             self.luka_kv_controller.create_pages_in_generation = _kv_params_override["create_pages_in_generation"]
         if "use_log_bias" in _kv_params_override:
             self.luka_kv_controller.use_log_bias = _kv_params_override["use_log_bias"]
+        if "log_bias_mode" in _kv_params_override:
+            self.luka_kv_controller.log_bias_mode = _kv_params_override["log_bias_mode"]
         if "production_mode" in _kv_params_override:
             self.luka_kv_controller.production_mode = _kv_params_override["production_mode"]
         if "async_pages" in _kv_params_override:

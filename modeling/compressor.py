@@ -84,6 +84,41 @@ class MeanCompressor(Compressor):
         return k_summary, v_summary
 
 
+class RandomCompressor(Compressor):
+    """
+    Random baseline compressor that randomly selects one token from the page.
+
+    Instead of synthesizing random values (which can cause numerical issues),
+    this compressor randomly picks one token's k/v as the summary. This tests
+    whether informed selection (attention-weighted, mean) matters vs arbitrary
+    selection.
+
+    Ignores importance_weights.
+    """
+
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._validate_input(k, v)
+        B, H, L, D = k.shape
+
+        # Randomly select one position per batch (same position for all heads)
+        rand_idx = torch.randint(0, L, (B,), device=k.device)
+
+        # Index into sequence dimension: k[b, h, rand_idx[b], d]
+        # Expand rand_idx to [B, H, 1, D] for gathering
+        idx_expanded = rand_idx.view(B, 1, 1, 1).expand(B, H, 1, D)
+
+        k_summary = k.gather(2, idx_expanded).squeeze(2)  # [B, H, D]
+        v_summary = v.gather(2, idx_expanded).squeeze(2)  # [B, H, D]
+
+        self._validate_output(k_summary, v_summary, B, H, D)
+        return k_summary, v_summary
+
+
 class AttentionWeightedCompressor(Compressor):
     """
     Compressor that weights tokens by their accumulated attention (importance).
@@ -101,7 +136,7 @@ class AttentionWeightedCompressor(Compressor):
     def __init__(
         self,
         temperature: float = 1.0,
-        fallback_to_mean: bool = True,
+        fallback_to_mean: bool = False,
     ):
         super().__init__()
         self.temperature = temperature
@@ -128,13 +163,7 @@ class AttentionWeightedCompressor(Compressor):
         B, H, L, D = k.shape
 
         if importance_weights is None:
-            if self.fallback_to_mean:
-                k_summary = k.mean(dim=2)
-                v_summary = v.mean(dim=2)
-                self._validate_output(k_summary, v_summary, B, H, D)
-                return k_summary, v_summary
-            else:
-                raise ValueError("importance_weights required when fallback_to_mean=False")
+            raise ValueError("importance_weights required")
 
         # importance_weights: [B, H, L]
         assert importance_weights.shape == (B, H, L), \
@@ -153,9 +182,9 @@ class AttentionWeightedCompressor(Compressor):
         return k_summary, v_summary
 
 
-class EvictionCompressor(Compressor):
+class AttentionWeightedZeroVCompressor(Compressor):
     """
-    Eviction-style compressor: attention-weighted keys, zero values.
+    Attention-weighted keys, zero values.
 
     The summary key exists for routing/refinement decisions, but contributes
     no value information. Attention landing on the summary is effectively
@@ -197,7 +226,7 @@ class EvictionCompressor(Compressor):
         self._validate_input(k, v)
         B, H, L, D = k.shape
 
-        # Values: zeros (eviction - no value contribution)
+        # Values: zeros (no value contribution)
         v_summary = torch.zeros(B, H, D, device=v.device, dtype=v.dtype)
 
         # Keys: use attention weighting if available
@@ -216,6 +245,50 @@ class EvictionCompressor(Compressor):
 
         self._validate_output(k_summary, v_summary, B, H, D)
         return k_summary, v_summary
+
+
+class MeanZeroVCompressor(Compressor):
+    """
+    Mean keys, zero values.
+
+    Like AttentionWeightedZeroVCompressor but uses uniform mean for keys
+    instead of attention-weighted. This isolates the effect of key compression
+    method when values contribute nothing.
+
+    Ignores importance_weights (uniform weighting for keys).
+    """
+
+    def forward(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        importance_weights: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            k: [B, H, L, D] keys to compress
+            v: [B, H, L, D] values to compress (ignored, output is zeros)
+            importance_weights: ignored
+
+        Returns:
+            k_summary: [B, H, D] - mean
+            v_summary: [B, H, D] - zeros
+        """
+        self._validate_input(k, v)
+        B, H, L, D = k.shape
+
+        # Keys: uniform mean
+        k_summary = k.mean(dim=2)
+
+        # Values: zeros (no value contribution)
+        v_summary = torch.zeros(B, H, D, device=v.device, dtype=v.dtype)
+
+        self._validate_output(k_summary, v_summary, B, H, D)
+        return k_summary, v_summary
+
+
+# Backwards compatibility alias
+EvictionCompressor = AttentionWeightedZeroVCompressor
 
 
 class EncoderCompressor(Compressor):
