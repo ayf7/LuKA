@@ -247,3 +247,69 @@ class QAEvaluator:
             json.dump(result.to_dict(), f, indent=2)
 
         print(f"\nResults saved to {output_path}")
+
+    def score_predictions(self, result: EvaluationResult) -> Dict:
+        """
+        Score predictions against ground truth.
+
+        Args:
+            result: EvaluationResult with predictions
+
+        Returns:
+            Dict with aggregate and per-example scores
+        """
+        from evaluation.metrics import compute_exact_match, compute_f1, compute_qa_accuracy
+        import numpy as np
+
+        gt_lookup = {ex['example_id']: ex for ex in self.dataset}
+
+        scores = []
+        per_example = []
+
+        for pred in result.predictions:
+            example_id = pred['example_id']
+            example = gt_lookup.get(example_id)
+            if example is None:
+                continue
+
+            questions = example['questions']
+            example_scores = []
+
+            for i, (pred_answer, q_data) in enumerate(zip(pred['answers'], questions)):
+                answers_data = q_data['answers']
+                if isinstance(answers_data, dict) and 'text' in answers_data:
+                    true_answers = answers_data['text']
+                else:
+                    true_answers = answers_data
+                if not isinstance(true_answers, list):
+                    true_answers = [true_answers]
+
+                em = compute_exact_match(pred_answer, true_answers)
+                f1 = compute_f1(pred_answer, true_answers)
+                qa = compute_qa_accuracy(pred_answer, true_answers)
+
+                example_scores.append({
+                    'question_idx': i,
+                    'exact_match': em,
+                    'f1': f1,
+                    'qa_accuracy': qa,
+                })
+                scores.append({'em': em, 'f1': f1, 'qa': qa})
+
+            per_example.append({
+                'example_id': example_id,
+                'scores': example_scores,
+                'avg_em': float(np.mean([s['exact_match'] for s in example_scores])),
+                'avg_f1': float(np.mean([s['f1'] for s in example_scores])),
+                'avg_qa': float(np.mean([s['qa_accuracy'] for s in example_scores])),
+            })
+
+        aggregate = {
+            'exact_match': float(np.mean([s['em'] for s in scores])) if scores else 0.0,
+            'f1_score': float(np.mean([s['f1'] for s in scores])) if scores else 0.0,
+            'qa_accuracy': float(np.mean([s['qa'] for s in scores])) if scores else 0.0,
+            'num_questions': len(scores),
+            'num_examples': len(per_example),
+        }
+
+        return {'aggregate': aggregate, 'per_example': per_example}
