@@ -29,7 +29,6 @@ MODELS = {
     'qwen-1.5b': 'Qwen/Qwen2.5-1.5B-Instruct',
     'qwen-3b': 'Qwen/Qwen2.5-3B-Instruct',
     'qwen-7b': 'Qwen/Qwen2.5-7B-Instruct',
-    'qwen-base': 'Qwen/Qwen3-1.7B-Base'
 }
 
 def main():

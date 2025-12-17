@@ -20,12 +20,21 @@ from transformers.models.qwen3.modeling_qwen3 import (
     rotate_half,
 )
 
-from modeling.compressor import EncoderCompressor, MeanCompressor
+from modeling.compressor import AttentionWeightedCompressor, EncoderCompressor, MeanCompressor
 from modeling.kv_cache import LukaKVController
 from modeling.segmenter import DummySegmenter, KLSegmenter, GaussianSegmenter
+from modeling.refinement import (
+    RefinementRule,
+    NoRefinementRule,
+    FixedThresholdRule,
+    TopKRule,
+    TopPRule,
+    TopFracRule,
+    TopKTopPRule,
+    get_refinement_rule,
+)
 
 # Optional global overrides for KV cache params, settable by callers (e.g., scripts/test.py)
-_segmenter_override = None
 _kv_params_override: dict[str, float | int | object] = {}
 
 SEGMENTER_REGISTRY = {
@@ -37,6 +46,16 @@ SEGMENTER_REGISTRY = {
 COMPRESSOR_REGISTRY = {
     "mean": MeanCompressor,
     "encoder": EncoderCompressor,
+    "attention_weighted": AttentionWeightedCompressor,
+}
+
+REFINEMENT_RULE_REGISTRY = {
+    "none": NoRefinementRule,
+    "threshold": FixedThresholdRule,
+    "top_k": TopKRule,
+    "top_p": TopPRule,
+    "top_frac": TopFracRule,
+    "top_k_top_p": TopKTopPRule,
 }
 
 def set_luka_kv_params(
@@ -44,13 +63,52 @@ def set_luka_kv_params(
     default_tail_len: int = 16,
     min_compress_chunk: int = 16,
     max_pages: int = 15,
-    refine_threshold: float = 0.05,
+    refinement_rule: object = "threshold",  # str, RefinementRule, or None
+    refinement_rule_kwargs: dict | None = None,  # includes always_refine_first_n
     segment_interval: int = 1,
+    create_pages_in_generation: bool = True,
+    use_exact_attention: bool = False,
+    use_log_bias: bool = False,
+    log_bias_mode: str | None = None,  # "none", "fixed_n", or "adaptive_k"
+    print_stats_after_generate: bool = False,
+    production_mode: bool = True,
+    async_pages: bool = False,
     compressor: object = "mean",
     compressor_kwargs: dict | None = None,
     segmenter: object = "dummy",
     segmenter_kwargs: dict | None = None,
 ) -> None:
+    """Configure LuKA KV cache parameters.
+
+    Args:
+        default_tail_len: Number of raw tokens to keep uncompressed at the end.
+        min_compress_chunk: Minimum number of tokens per page.
+        max_pages: Maximum number of summary pages to create.
+        refinement_rule: Refinement rule for selecting which summaries to expand.
+            Can be:
+            - str: Name from registry ("none", "threshold", "top_k", "top_p", "top_frac", "top_k_top_p")
+            - RefinementRule instance
+            - None: Disables refinement (NoRefinementRule)
+        refinement_rule_kwargs: Kwargs for refinement rule if using string name.
+            Can include always_refine_first_n for attention sinks (e.g. {"k": 3, "always_refine_first_n": 1}).
+        segment_interval: How often to attempt page creation (every N decode steps).
+        create_pages_in_generation: Whether to create pages during generation.
+        use_exact_attention: If True, bypass cover view entirely and use raw attention.
+            Use this for baseline evaluation. Ignores refinement_rule and pages.
+        use_log_bias: If True, sets log_bias_mode="fixed_n" for backwards compatibility.
+        log_bias_mode: Log bias mode for summary attention logits:
+            - "none": No bias (default)
+            - "fixed_n": log(N) where N = page length (assumes uniform attention)
+            - "adaptive_k": log(k_eff) where k_eff = exp(entropy) is effective support
+                           This adapts to the actual attention distribution at compression time.
+        print_stats_after_generate: Print refinement stats after generate().
+        production_mode: Skip debug checks for better performance.
+        async_pages: Run compression on background CUDA stream.
+        compressor: Compressor for page creation ("mean", "attention_weighted", etc.).
+        compressor_kwargs: Kwargs for compressor if using string name.
+        segmenter: Segmenter for page boundaries ("dummy", "kl", "gaussian").
+        segmenter_kwargs: Kwargs for segmenter if using string name.
+    """
     global _kv_params_override
     if default_tail_len is not None:
         _kv_params_override["default_tail_len"] = int(default_tail_len)
@@ -58,17 +116,52 @@ def set_luka_kv_params(
         _kv_params_override["min_compress_chunk"] = int(min_compress_chunk)
     if max_pages is not None:
         _kv_params_override["max_pages"] = int(max_pages)
-    if refine_threshold is not None:
-        _kv_params_override["refine_threshold"] = float(refine_threshold)
     if segment_interval is not None:
         _kv_params_override["segment_interval"] = int(segment_interval)
-    
+    if create_pages_in_generation is not None:
+        _kv_params_override["create_pages_in_generation"] = bool(create_pages_in_generation)
+    if use_exact_attention is not None:
+        _kv_params_override["use_exact_attention"] = bool(use_exact_attention)
+    if use_log_bias is not None:
+        _kv_params_override["use_log_bias"] = bool(use_log_bias)
+    if log_bias_mode is not None:
+        if log_bias_mode not in ("none", "fixed_n", "adaptive_k"):
+            raise ValueError(f"Invalid log_bias_mode: {log_bias_mode}. Must be 'none', 'fixed_n', or 'adaptive_k'.")
+        _kv_params_override["log_bias_mode"] = log_bias_mode
+    if print_stats_after_generate is not None:
+        _kv_params_override["print_stats_after_generate"] = bool(print_stats_after_generate)
+    if production_mode is not None:
+        _kv_params_override["production_mode"] = bool(production_mode)
+    if async_pages is not None:
+        _kv_params_override["async_pages"] = bool(async_pages)
+
+    # Handle refinement rule configuration
+    if refinement_rule is not None:
+        if isinstance(refinement_rule, RefinementRule):
+            if refinement_rule_kwargs:
+                raise ValueError("Cannot provide refinement_rule_kwargs when passing a RefinementRule instance.")
+            _kv_params_override["refinement_rule"] = refinement_rule
+        elif isinstance(refinement_rule, str):
+            if refinement_rule.lower() not in REFINEMENT_RULE_REGISTRY:
+                raise ValueError(
+                    f"Refinement rule '{refinement_rule}' not found in registry. "
+                    f"Available: {list(REFINEMENT_RULE_REGISTRY.keys())}"
+                )
+            kwargs = refinement_rule_kwargs or {}
+            _kv_params_override["refinement_rule"] = REFINEMENT_RULE_REGISTRY[refinement_rule.lower()](**kwargs)
+        elif refinement_rule is None:
+            _kv_params_override["refinement_rule"] = NoRefinementRule()
+        else:
+            raise TypeError(
+                f"refinement_rule must be str, RefinementRule, or None, "
+                f"got {type(refinement_rule).__name__}"
+            )
+
     if compressor is not None:
         if isinstance(compressor, str):
             if compressor not in COMPRESSOR_REGISTRY:
                 raise ValueError(f"Compressor {compressor} not found in registry. Available: {list(COMPRESSOR_REGISTRY.keys())}")
             kwargs = compressor_kwargs or {}
-            print(COMPRESSOR_REGISTRY[compressor], flush=True)
             _kv_params_override["compressor"] = COMPRESSOR_REGISTRY[compressor](**kwargs)
         else:
             if compressor_kwargs:
@@ -80,7 +173,6 @@ def set_luka_kv_params(
             if segmenter not in SEGMENTER_REGISTRY:
                 raise ValueError(f"Segmenter {segmenter} not found in registry. Available: {list(SEGMENTER_REGISTRY.keys())}")
             kwargs = segmenter_kwargs or {}
-            print(SEGMENTER_REGISTRY[segmenter], flush=True)
             _kv_params_override["segmenter"] = SEGMENTER_REGISTRY[segmenter](**kwargs)
         else:
             if segmenter_kwargs:
@@ -127,9 +219,6 @@ class LukaQwenAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None, # [L]
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        if self.layer_idx == 0:
-            print(cache_position, flush=True)
-            pass
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -160,78 +249,52 @@ class LukaQwenAttention(nn.Module):
             )
 
         ####  ATTENTION
-        # Replace eager_attention_forward with top_down_attention or lined_attention
-        
+        # Choose between lined attention (H2O-style) and top-down attention (LuKA paging)
         # attn_output: [B, H_q, L, D]
-        # attn_probs: [B, H_q, L, T_raw]
-        
-        if False:
-            # Eager attention (Vanilla)
-            attention_interface: Callable = eager_attention_forward
-            if self.config._attn_implementation != "eager":
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # attn_weights: [B, H_q, L, T_raw]
 
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states, # [B, H_q, L, D]
-                key_states, # [B, H_k, L + L_past, D]
-                value_states, # [B, H_k, L + L_past, D]
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
+        use_lined = (
+            self.luka_kv.use_lined_attention and
+            self.layer_idx in self.luka_kv.lined_layers
+        )
+
+        if use_lined:
+            # Lined attention (H2O-style: grid tokens + raw tail)
+            attn_output, attn_weights = self.luka_kv.lined_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
                 scaling=self.scaling,
-                sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
+                num_kv_groups=self.num_key_value_groups,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
             )
-            
+            # Lined attention doesn't use paging, so skip try_new_pages
         else:
-            # Choose between lined attention and topdown attention
-            use_lined = (
-                self.luka_kv.use_lined_attention and 
-                self.layer_idx in self.luka_kv.lined_layers
+            # Top-down attention (LuKA: pages + raw tail)
+            use_exact = _kv_params_override.get("use_exact_attention", False)
+            attn_output, attn_weights = self.luka_kv.top_down_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
+                scaling=self.scaling,
+                num_kv_groups=self.num_key_value_groups,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                use_exact_attention=use_exact,
             )
-            
-            if use_lined:
-                # Lined attention (H2O-style: grid tokens + raw tail)
-                attn_output, attn_weights = self.luka_kv.lined_attention(
-                    layer_idx=self.layer_idx,
-                    query_states=query_states,
-                    scaling=self.scaling,
-                    num_kv_groups=self.num_key_value_groups,
-                    attention_mask=attention_mask,
-                    sliding_window=self.sliding_window,
-                )
-                # Lined attention doesn't use paging, so skip try_new_pages
-            else:
-                # Top-down attention (LuKA: pages + raw tail)
-                threshold = _kv_params_override.get("refine_threshold", 0.05)
-                attn_output, attn_weights = self.luka_kv.top_down_attention(
-                    layer_idx=self.layer_idx,
-                    query_states=query_states,
-                    scaling=self.scaling,
-                    num_kv_groups=self.num_key_value_groups,
-                    attention_mask=attention_mask,
-                    sliding_window=self.sliding_window,
-                    threshold=threshold
-                )
-                
-                # Try to create new pages (segmentation & compression)
-                # Skip if using raw attention (threshold < 0) since buffer isn't updated
-                if threshold is None or threshold >= 0:
-                    # This uses the buffer populated by top_down_attention
-                    self.luka_kv.try_new_pages(self.layer_idx)
 
-        if self.layer_idx == 0:
-            # self.luka_kv.print_stats(0)
-            pass
+            # Try to create new pages (segmentation & compression)
+            # Skip if using exact attention (baseline mode)
+            if not use_exact and self.luka_kv.create_pages_in_generation:
+                self.luka_kv.try_new_pages(self.layer_idx)
 
         # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         
-        # Verify invariants
-        if self.luka_kv is not None:
+        # Verify invariants (only in debug mode)
+        if self.luka_kv is not None and not self.luka_kv.production_mode:
             self.luka_kv.verify_invariants(self.layer_idx)
-            
+
         return attn_output, attn_weights
 
 
@@ -250,9 +313,21 @@ class LukaQwen3Model(modeling_qwen3.Qwen3Model):
             self.luka_kv_controller.segmenter = _kv_params_override["segmenter"]
         if "compressor" in _kv_params_override:
             self.luka_kv_controller.compressor = _kv_params_override["compressor"]
+        if "refinement_rule" in _kv_params_override:
+            self.luka_kv_controller.refinement_rule = _kv_params_override["refinement_rule"]
         if "segment_interval" in _kv_params_override:
             self.luka_kv_controller.segment_interval = _kv_params_override["segment_interval"]
-            
+        if "create_pages_in_generation" in _kv_params_override:
+            self.luka_kv_controller.create_pages_in_generation = _kv_params_override["create_pages_in_generation"]
+        if "use_log_bias" in _kv_params_override:
+            self.luka_kv_controller.use_log_bias = _kv_params_override["use_log_bias"]
+        if "log_bias_mode" in _kv_params_override:
+            self.luka_kv_controller.log_bias_mode = _kv_params_override["log_bias_mode"]
+        if "production_mode" in _kv_params_override:
+            self.luka_kv_controller.production_mode = _kv_params_override["production_mode"]
+        if "async_pages" in _kv_params_override:
+            self.luka_kv_controller.async_pages = _kv_params_override["async_pages"]
+
         for layer in self.layers:
             if hasattr(layer, "self_attn"):
                 layer.self_attn.luka_kv = self.luka_kv_controller
@@ -265,6 +340,10 @@ class LukaQwen3ForCausalLM(modeling_qwen3.Qwen3ForCausalLM):
     This allows loading pretrained checkpoints while ignoring LuKA-specific
     parameters that don't exist in the base model.
     """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.print_stats_after_generate = _kv_params_override.get("print_stats_after_generate", False)
 
     def _load_from_state_dict(
         self,
@@ -300,6 +379,38 @@ class LukaQwen3ForCausalLM(modeling_qwen3.Qwen3ForCausalLM):
             k for k in missing_keys
             if not ("luka_cache" in k)
         ]
+
+    def generate(self, *args, **kwargs):
+        """Override generate to optionally print refinement stats after completion."""
+        # Reset stats before generation
+        if hasattr(self.model, 'luka_kv_controller'):
+            self.model.luka_kv_controller.reset_refinement_stats()
+
+        # Run generation
+        output = super().generate(*args, **kwargs)
+
+        # Print stats if enabled
+        if self.print_stats_after_generate and hasattr(self.model, 'luka_kv_controller'):
+            self._print_luka_stats()
+
+        return output
+
+    def _print_luka_stats(self):
+        """Print LuKA refinement statistics."""
+        controller = self.model.luka_kv_controller
+        stats = controller.get_refinement_stats()
+
+        print("\n" + "=" * 60)
+        print("LuKA Refinement Statistics")
+        print("=" * 60)
+        print(f"  Layers:                   {stats['num_layers']}")
+        print(f"  Pages (per layer avg):    {stats['avg_pages_per_layer']:.1f}")
+        print(f"  Summary tokens (per layer): {stats['avg_summaries_per_layer']:.1f}")
+        print(f"  Queries processed:        {stats['avg_queries_per_layer']:.0f}")
+        print(f"  Total refinements:        {stats['total_refinements_made']}")
+        print(f"  Refinement rate:          {stats['refinement_rate']:.4f} ({stats['refinement_rate']*100:.2f}%)")
+        print(f"  Refinements per query:    {stats['refinements_per_query']:.2f}")
+        print("=" * 60 + "\n")
 
 
 def initialize_luka_hook():

@@ -1,16 +1,56 @@
 """
 Test script for LuKA with HuggingFace Transformers (new controller path).
-Compares topdown attention vs lined attention results.
+Simple script to test boundary detection during generation.
+
+Usage:
+    python scripts/run_batch.py --compressor attention_weighted --log-bias adaptive_k
+    python scripts/run_batch.py --compressor mean --log-bias adaptive_k
+    python scripts/run_batch.py --compressor mean --log-bias fixed_n
 """
 
+import argparse
 import torch
 from transformers import AutoTokenizer
 from modeling.qwen.luka_qwen3 import load_luka_model, set_luka_kv_params
 from artifacts.prompts.prompt_loader import load_prompt
 
+parser = argparse.ArgumentParser(description="Test LuKA with different compressors")
+parser.add_argument("--compressor", type=str, default="attention_weighted",
+                    choices=["attention_weighted", "mean"],
+                    help="Compressor type (default: attention_weighted)")
+parser.add_argument("--log-bias", type=str, default="adaptive_k",
+                    choices=["none", "fixed_n", "adaptive_k"],
+                    help="Log bias mode (default: adaptive_k)")
+parser.add_argument("--max-tokens", type=int, default=256,
+                    help="Max new tokens to generate (default: 256)")
+args = parser.parse_args()
+
 # Configuration
-model_name = "Qwen/Qwen3-1.7B-Base"
+model_name = "Qwen/Qwen3-8B"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Compressor: {args.compressor}")
+print(f"Log bias mode: {args.log_bias}")
+
+# Active config (from CLI args)
+compressor_kwargs = {"temperature": 7.0} if args.compressor == "attention_weighted" else {}
+set_luka_kv_params(
+    compressor=args.compressor,
+    compressor_kwargs=compressor_kwargs,
+    segmenter="dummy",
+    refinement_rule="top_k",
+    refinement_rule_kwargs={"k": 3},
+    log_bias_mode=args.log_bias,
+    segment_interval=16,
+)
+
+# Load model and tokenizer
+model = load_luka_model(
+    model_name,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    device_map="auto" if device == "cuda" else None,
+)
+tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
 
 # Load prompts (batch)
 prompts = [
@@ -19,112 +59,90 @@ prompts = [
 ]
 
 # Tokenize with padding for batching
-tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
 tokenizer.pad_token = tokenizer.eos_token
+inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+if device == "cuda":
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-def run_generation(mode_name, use_lined_attention=False, lined_layers=None):
-    """Run generation with specified attention mode."""
-    print(f"\n{'='*80}")
-    print(f"Running with {mode_name.upper()} ATTENTION")
-    print(f"{'='*80}\n")
-    
-    # Set LuKA params
-    set_luka_kv_params(
-        compressor="mean",
-        segmenter="dummy",
-        refine_threshold=1,
-        segment_interval=16,
-    )
-    
-    # Load model
-    model = load_luka_model(
-        model_name,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map="auto" if device == "cuda" else None,
-    )
-    
-    # Configure attention mode
-    if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
-        controller = model.model.luka_kv_controller
-        controller.use_lined_attention = use_lined_attention
-        if lined_layers is not None:
-            # Explicitly provided layers
-            controller.lined_layers = set(lined_layers)
-        else:
-            if use_lined_attention:
-                # Default: use all layers for lined attention
-                controller.lined_layers = set(range(controller.num_layers))
-            else:
-                controller.lined_layers = set()
-        
-        print(f"Configuration:")
-        print(f"  use_lined_attention: {controller.use_lined_attention}")
-        print(f"  lined_layers: {controller.lined_layers}")
-        print(f"  grid_top_k: {controller.grid_top_k}")
-        print(f"  grid_update_interval: {controller.grid_update_interval}")
-        print(f"  grid_decay: {controller.grid_decay}\n")
-    
-    # Prepare inputs
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
-    if device == "cuda":
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-    
-    # Generate
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=256,
-        temperature=0.7,
-        top_p=0.9,
-        do_sample=True,
-    )
-    
-    # Decode and print results
-    results = []
-    for i, (prompt, output) in enumerate(zip(prompts, outputs)):
-        generated_text = tokenizer.decode(output, skip_special_tokens=True)
-        new_text = generated_text[len(prompt):]
-        results.append((prompt, new_text))
-        
-        print(f"\n{'='*80}")
-        print(f"Prompt {i}:")
-        print(f"{'='*80}")
-        print(prompt)
-        print(f"{'='*80}\n")
-        print(f"Generated output ({mode_name}):")
-        print(new_text)
-        print(f"{'='*80}")
-    
-    # Print LuKA debug summaries
-    if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
-        controller = model.model.luka_kv_controller
-        print(f"\n=== {mode_name.upper()} ATTENTION - Layer Summaries ===")
-        for layer_idx in range(controller.num_layers):
-            print("------------------------------")
-            controller.print_layer_summary(layer_idx)
-    
-    return results
+# Generate
+outputs = model.generate(
+    **inputs,
+    max_new_tokens=args.max_tokens,
+    temperature=0.7,
+    top_p=0.9,
+    do_sample=True,
+)
 
-# Run with TOP-DOWN attention (all layers)
-topdown_results = run_generation("top-down", use_lined_attention=False)
+# Decode and print each result
+for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+    generated_text = tokenizer.decode(output, skip_special_tokens=True)
+    new_text = generated_text[len(prompt):]
 
-# Run with LINED attention (all layers)
-lined_results = run_generation("lined", use_lined_attention=True, lined_layers=None)
+    print("\n" + "=" * 80)
+    print(f"Prompt {i}:")
+    print("=" * 80)
+    print(prompt)
+    print("=" * 80 + "\n")
 
-# Run with MIXED attention (early 0-5, late 23-27, middle 6-22 top-down)
-# Explicitly set the mixed layers
-mixed_layers = set(range(0, 6)) | set(range(23, 28))  # {0,1,2,3,4,5, 23,24,25,26,27}
-mixed_results = run_generation("mixed", use_lined_attention=True, lined_layers=mixed_layers)
+    print("Generated output:")
+    print(new_text)
+    print("\n" + "=" * 80)
 
-# Compare results
-print(f"\n{'='*80}")
-print("COMPARISON SUMMARY")
-print(f"{'='*80}\n")
+# Print LuKA refinement statistics
+if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
+    controller = model.model.luka_kv_controller
+    stats = controller.get_refinement_stats()
 
-for i, (prompt, _) in enumerate(zip(prompts, topdown_results)):
-    print(f"\nPrompt {i}:")
-    print(f"{'-'*80}")
-    print(f"Prompt: {prompt[:100]}...")
-    print(f"\nTopdown output: {topdown_results[i][1][:200]}...")
-    print(f"\nLined output:   {lined_results[i][1][:200]}...")
-    print(f"\nMixed output:   {mixed_results[i][1][:200]}...")
-    print(f"{'-'*80}")
+    print("\n" + "=" * 60)
+    print("LuKA Refinement Statistics")
+    print("=" * 60)
+    print(f"  Refinement rule:          {controller.refinement_rule}")
+    print(f"  Layers:                   {stats['num_layers']}")
+    print(f"  Pages (per layer avg):    {stats['avg_pages_per_layer']:.1f}")
+    print(f"  Summary tokens (per layer): {stats['avg_summaries_per_layer']:.1f}")
+    print(f"  Queries processed:        {stats['avg_queries_per_layer']:.0f}")
+    print(f"  Total refinements:        {stats['total_refinements_made']}")
+    print(f"  Refinement rate:          {stats['refinement_rate']:.4f} ({stats['refinement_rate']*100:.2f}%)")
+    print(f"  Refinements per query:    {stats['refinements_per_query']:.2f}")
+    print("=" * 60 + "\n")
+
+    # Print log(k_eff) entropy statistics per layer
+    print("=" * 60)
+    print("Log Effective Support (Entropy) Statistics")
+    print("=" * 60)
+    print(f"  {'Layer':<8} {'Pages':<8} {'Mean':<10} {'Min':<10} {'Max':<10} {'Std':<10}")
+    print("-" * 60)
+
+    all_log_k = []
+    for layer_idx, layer_cache in enumerate(controller.summary_cache):
+        if layer_cache is not None and layer_cache.log_effective_support is not None:
+            log_k = layer_cache.log_effective_support
+            # Only consider non-zero entries (actual pages)
+            num_pages = layer_cache.page_lens.sum().item()
+            if num_pages > 0:
+                # Flatten and get valid entries
+                valid_log_k = []
+                for b in range(log_k.shape[0]):
+                    n_pages = layer_cache.page_lens[b].item()
+                    if n_pages > 0:
+                        valid_log_k.append(log_k[b, :n_pages])
+                if valid_log_k:
+                    valid_log_k = torch.cat(valid_log_k)
+                    all_log_k.append(valid_log_k)
+                    mean_val = valid_log_k.mean().item()
+                    min_val = valid_log_k.min().item()
+                    max_val = valid_log_k.max().item()
+                    std_val = valid_log_k.std().item() if len(valid_log_k) > 1 else 0.0
+                    print(f"  {layer_idx:<8} {int(num_pages):<8} {mean_val:<10.3f} {min_val:<10.3f} {max_val:<10.3f} {std_val:<10.3f}")
+
+    if all_log_k:
+        all_log_k = torch.cat(all_log_k)
+        print("-" * 60)
+        print(f"  {'TOTAL':<8} {len(all_log_k):<8} {all_log_k.mean().item():<10.3f} {all_log_k.min().item():<10.3f} {all_log_k.max().item():<10.3f} {all_log_k.std().item():<10.3f}")
+
+        # Also show what this means in terms of k_eff = exp(log_k)
+        k_eff = all_log_k.exp()
+        print("\n  Effective support k_eff = exp(entropy):")
+        print(f"    Mean: {k_eff.mean().item():.2f}, Min: {k_eff.min().item():.2f}, Max: {k_eff.max().item():.2f}")
+        print(f"    (For reference: page_size=16 → uniform would give k_eff=16)")
+    print("=" * 60 + "\n")
