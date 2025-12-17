@@ -9,7 +9,7 @@ Provides a clean interface for swapping between different model backends:
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
 
@@ -56,6 +56,22 @@ class ModelInterface(ABC):
         Only needed for stateful models.
         """
         pass
+
+    def batch_generate(
+        self, prompts: List[str], config: Optional[GenerationConfig] = None
+    ) -> List[str]:
+        """
+        Generate text for multiple prompts in a batch.
+        Default implementation falls back to sequential generation.
+
+        Args:
+            prompts: List of input prompts
+            config: Generation configuration
+
+        Returns:
+            List of generated texts
+        """
+        return [self.generate(p, config) for p in prompts]
 
 
 class BaselineModelInterface(ModelInterface):

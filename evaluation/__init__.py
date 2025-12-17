@@ -13,7 +13,7 @@ from evaluation.model_interface import (
     LuKAModelInterface,
     GenerationConfig,
 )
-from evaluation.evaluator import QAEvaluator, EvaluationResult
+from evaluation.evaluator import QAEvaluator, EvaluationResult, PerformanceStats
 from evaluation.model_implementations import (
     HuggingFaceModel,
     APIModel,
@@ -40,6 +40,7 @@ __all__ = [
     # Evaluator
     'QAEvaluator',
     'EvaluationResult',
+    'PerformanceStats',
     # Model implementations
     'HuggingFaceModel',
     'APIModel',

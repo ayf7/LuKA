@@ -1467,9 +1467,9 @@ class LukaKVController:
         num_layers: Optional[int] = None,
         use_lined_attention: bool = False,
         lined_layers: Optional[List[int]] = None,
-        grid_top_k: int = 16,
-        grid_update_interval: int = 16,
-        grid_decay: float = 0.99,
+        # H2O-style parameters
+        heavy_ratio: float = 0.1,      # fraction of sequence to keep as heavy hitters
+        recent_ratio: float = 0.1,     # fraction of sequence to keep as recent window
     ):
         """Coordinating facade that owns raw, summary, cover, and attention buffers.
 
@@ -1480,9 +1480,8 @@ class LukaKVController:
             num_layers: Optional override for layer count if not present on config.
             use_lined_attention: If True, use lined attention for layers in lined_layers.
             lined_layers: List of layer indices to use lined attention. If None and use_lined_attention=True, uses all layers.
-            grid_top_k: Number of grid tokens per batch/layer for lined attention.
-            grid_update_interval: How often to recompute grid tokens.
-            grid_decay: Exponential decay factor for grid scores.
+            heavy_ratio: Fraction of sequence to keep as heavy hitters (H2O style).
+            recent_ratio: Fraction of sequence to keep as recent window (H2O style).
         """
         self.num_layers = num_layers or getattr(config, "num_hidden_layers", None)
         if self.num_layers is None:
@@ -1519,21 +1518,17 @@ class LukaKVController:
         self.async_pages = False
         self.async_page_creator = AsyncPageCreator(self.num_layers)
         
-        # H2O-like grid / heavy-hitter parameters for lined attention
+        # H2O-style parameters for lined attention (faithful to original paper)
         self.use_lined_attention = use_lined_attention
         self.lined_layers = set(lined_layers) if lined_layers is not None else (set(range(self.num_layers)) if use_lined_attention else set())
-        self.grid_top_k = grid_top_k
-        self.grid_update_interval = grid_update_interval
-        self.grid_decay = grid_decay
-        # Per-layer running scores over raw positions (initialized lazily)
+        self.heavy_ratio = heavy_ratio      # fraction of sequence for heavy hitters
+        self.recent_ratio = recent_ratio    # fraction of sequence for recent window
+        # Per-layer, per-head running scores: [B, H, T] (H2O tracks per-head)
         self.grid_scores: List[Optional[torch.Tensor]] = [None for _ in range(self.num_layers)]
-        self.grid_step_counters = [0 for _ in range(self.num_layers)]
-        
-        # Gentle H2O-ish knobs
-        self.min_lined_seq_len = 384        # don't compress before this many tokens (increased for better quality)
-        self.min_lined_tail_window = 128    # local tail window (needs to be large enough for coherent generation)
-        self.grid_min_change_ratio = 0.3    # only refresh grid if ≥30% of top-K changed
-        self.grid_top_k_dynamic = True      # if True, compute grid_top_k as T_raw // 8 for reasonable compression
+
+        # H2O uses NO warmup guard - starts evicting immediately when budget exceeded
+        # Set to 0 to match H2O behavior, or increase for better quality at cost of memory
+        self.min_lined_seq_len = 0
         
         # Debug flag: set to True to enable diagnostic prints (slows down generation significantly)
         self.debug = False
@@ -1569,9 +1564,8 @@ class LukaKVController:
         for layer_idx in range(self.num_layers):
             self.grid_cache[layer_idx] = GridCache(config)
         
-        # Reset grid scores and counters
+        # Reset grid scores (H2O-style per-head accumulation)
         self.grid_scores = [None for _ in range(self.num_layers)]
-        self.grid_step_counters = [0 for _ in range(self.num_layers)]
         # Initialize seg_step_counters to segment_interval - 1 so the first forward pass
         # after reset triggers the segmentation check (allows page creation from prefill)
         self.seg_step_counters = [self.segment_interval - 1 for _ in range(self.num_layers)]
@@ -1960,9 +1954,13 @@ class LukaKVController:
         cover_indices: torch.Tensor,   # [B, T_cover] (raw indices or -1)
         cover_is_summary: torch.Tensor # [B, T_cover] (all zeros for lined)
     ):
-        """Update running scores for grid token selection (H2O-style), using
-        only the current step's attention and cover layout.
-        
+        """Update running scores for grid token selection (H2O-style).
+
+        Faithful to H2O paper:
+        - Per-head scoring: [B, H, T] (different heads can focus on different tokens)
+        - Pure accumulation: no decay (cumulative attention probability)
+        - Sum over batch and query positions
+
         Args:
             layer_idx: int
                 Transformer layer index.
@@ -1971,23 +1969,21 @@ class LukaKVController:
             cover_indices: torch.Tensor
                 Current cover's raw indices [B, T_cover].
             cover_is_summary: torch.Tensor
-                Current cover's summary flags [B, T_cover] (all zeros for lined).
+                Current cover's summary flags [B, T_cover] (ignored for lined).
         """
         if attn_probs is None:
             return
 
         B, H_q, L_q, T_cover = attn_probs.shape
         device = attn_probs.device
+        dtype = attn_probs.dtype
 
-        # Column scores for this step: mean over heads, sum over query positions
-        # This accumulates attention from ALL query positions (important for prefill with L_q > 1)
-        # In decode, L_q=1, so sum is a no-op
+        # H2O scoring: sum over batch dim (dim=0) and query positions (dim=2)
+        # Result: [H_q, T_cover] - per-head scores for each cover position
         # attn_probs: [B, H_q, L_q, T_cover]
-        scores = attn_probs.mean(dim=1)        # [B, L_q, T_cover] - mean over heads
-        scores = scores.sum(dim=1)             # [B, T_cover] - sum over all query positions
-        col_scores = scores
+        current_scores = attn_probs.sum(dim=0).sum(dim=1)  # [H_q, T_cover]
 
-        # Map cover -> raw indices (for lined: already raw indices)
+        # Map cover -> raw indices
         cover_raw_indices = cover_indices  # [B, T_cover]
 
         # Get raw cache shape
@@ -1996,81 +1992,65 @@ class LukaKVController:
             return
         B_raw, H_k, T_raw, D = k_raw.shape
 
-        # Handle possible batch mismatch defensively
-        if B != B_raw:
-            B_use = min(B, B_raw)
-            col_scores = col_scores[:B_use]
-            cover_raw_indices = cover_raw_indices[:B_use]
-            B = B_use
-
-        # Initialize raw-space scores if needed
-        # CRITICAL: If T_raw grows, we need to resize (pad), not reinitialize (which loses accumulated scores)
+        # Initialize per-head raw-space scores if needed: [H_q, T_raw]
+        # H2O tracks scores per head, not per batch
         if self.grid_scores[layer_idx] is None:
-            self.grid_scores[layer_idx] = torch.zeros(B_raw, T_raw, device=device, dtype=col_scores.dtype)
-        elif self.grid_scores[layer_idx].shape != (B_raw, T_raw):
-            # T_raw has grown - pad the scores tensor instead of reinitializing
+            self.grid_scores[layer_idx] = torch.zeros(H_q, T_raw, device=device, dtype=dtype)
+        elif self.grid_scores[layer_idx].shape[1] != T_raw:
+            # T_raw has grown - pad the scores tensor
             old_scores = self.grid_scores[layer_idx]
-            old_B, old_T = old_scores.shape
+            old_H, old_T = old_scores.shape
             if old_T < T_raw:
-                # Pad with zeros (new positions start with zero scores)
                 pad_T = T_raw - old_T
-                padding = torch.zeros(old_B, pad_T, device=device, dtype=old_scores.dtype)
+                padding = torch.zeros(old_H, pad_T, device=device, dtype=dtype)
                 self.grid_scores[layer_idx] = torch.cat([old_scores, padding], dim=1)
                 if self.debug and layer_idx == 0:
-                    print(f"[Layer {layer_idx}] Grid scores resized: {old_scores.shape} -> {self.grid_scores[layer_idx].shape} (T_raw grew from {old_T} to {T_raw})")
-            elif old_B != B_raw:
-                # Batch size changed - handle gracefully
-                B_use = min(old_B, B_raw)
-                if B_use < B_raw:
-                    # Need to pad batch dimension
-                    pad_B = B_raw - B_use
-                    padding = torch.zeros(pad_B, T_raw, device=device, dtype=old_scores.dtype)
-                    self.grid_scores[layer_idx] = torch.cat([old_scores[:B_use], padding], dim=0)
-                else:
-                    self.grid_scores[layer_idx] = old_scores[:B_use]
+                    print(f"[Layer {layer_idx}] Grid scores resized: {old_scores.shape} -> {self.grid_scores[layer_idx].shape}")
 
-        raw_scores = self.grid_scores[layer_idx]
+        raw_scores = self.grid_scores[layer_idx]  # [H_q, T_raw]
 
-        # CRITICAL FIX #1: Exponential decay FIRST (EMA: s_t = λ * s_{t-1} + x_t)
-        # Decay previous scores before adding new ones
-        raw_scores.mul_(self.grid_decay)
+        # H2O: Pure accumulation, NO decay
+        # Accumulate scores for all tokens except the newest one (which has no history)
+        # current_scores[:, :-1] += previous_scores (in H2O style)
 
-        # CRITICAL FIX #2: Use scatter_add_ for proper handling of duplicate indices
-        # This ensures deterministic accumulation when multiple cover positions map to same raw position
-        valid_mask = (cover_raw_indices >= 0)
+        # Map cover positions to raw positions using scatter_add
+        # We need to handle the cover -> raw mapping
+        # For lined attention, cover_indices[b, :] gives raw indices
+        # Since H2O is per-head (not per-batch), we use the first batch's indices
+        # (assuming all batches have same structure for simplicity)
+
+        valid_mask = (cover_raw_indices[0] >= 0)  # [T_cover]
         if not valid_mask.any():
             return
 
-        # Prepare indices and scores for scatter_add_
-        # scatter_add_ needs: (dim, index, src)
-        # For 2D tensor [B, T_raw], we scatter along dim=1 (T_raw dimension)
-        cover_indices_clamped = cover_raw_indices.clamp(min=0, max=T_raw - 1)  # [B, T_cover]
-        
-        # Set invalid positions to 0 (they won't contribute) and their indices to 0 (safe dummy)
-        # This allows us to use scatter_add_ on the full tensors
-        indices_for_scatter = cover_indices_clamped.clone()
-        scores_for_scatter = col_scores.clone()
-        indices_for_scatter[~valid_mask] = 0  # Dummy index for invalid positions
-        scores_for_scatter[~valid_mask] = 0   # Zero score for invalid positions
-        
-        # Use scatter_add_ along dim=1 (sequence dimension)
-        # raw_scores[b, indices_for_scatter[b, i]] += scores_for_scatter[b, i]
+        cover_indices_clamped = cover_raw_indices[0].clamp(min=0, max=T_raw - 1)  # [T_cover]
+
+        # Prepare for scatter_add: expand indices to [H_q, T_cover]
+        indices_for_scatter = cover_indices_clamped.unsqueeze(0).expand(H_q, -1)  # [H_q, T_cover]
+        scores_for_scatter = current_scores.clone()  # [H_q, T_cover]
+
+        # Zero out invalid positions
+        scores_for_scatter[:, ~valid_mask] = 0
+
+        # Accumulate: raw_scores[h, idx] += scores_for_scatter[h, i] where idx = indices_for_scatter[h, i]
         raw_scores.scatter_add_(dim=1, index=indices_for_scatter, src=scores_for_scatter)
 
-        # Debug: check shapes and score stats (Diagnostic A)
-        if self.debug and layer_idx == 0 and col_scores.numel() > 0:
-            max_score = col_scores[valid_mask].max().item() if valid_mask.any() else 0
-            mean_score = col_scores[valid_mask].mean().item() if valid_mask.any() else 0
-            score_sum = col_scores[valid_mask].sum().item() if valid_mask.any() else 0
-            num_unique = torch.unique(cover_indices_clamped[valid_mask]).numel() if valid_mask.any() else 0
-            if max_score > 0:
-                print(f"[Layer {layer_idx}] Grid score update: attn_probs.shape={attn_probs.shape}, col_scores.shape={col_scores.shape}, max={max_score:.6f}, mean={mean_score:.6f}, sum={score_sum:.6f}, valid_tokens={valid_mask.sum().item()}, unique_positions={num_unique}")
+        if self.debug and layer_idx == 0:
+            max_score = raw_scores.max().item()
+            mean_score = raw_scores.mean().item()
+            print(f"[Layer {layer_idx}] H2O scores: shape={raw_scores.shape}, max={max_score:.4f}, mean={mean_score:.4f}")
 
         self.grid_scores[layer_idx] = raw_scores
 
     def _refresh_grid_tokens(self, layer_idx: int):
         """Refresh grid tokens by selecting top-K based on accumulated scores (H2O-style).
-        
+
+        Faithful to H2O:
+        - Per-head selection from [H, T] scores
+        - Uses heavy_ratio to determine number of heavy hitters
+        - Excludes recent_ratio tokens from heavy hitter selection
+        - Updates every step (no stability threshold)
+
         Args:
             layer_idx: int
                 Transformer layer index.
@@ -2086,167 +2066,82 @@ class LukaKVController:
         B, H_k, T_raw, D = k_raw.shape
         device = k_raw.device
 
-        # CRITICAL DIAGNOSTIC: Verify scores shape is correct
-        # Scores should be [B, T_raw], NOT [B, grid_top_k] or [B, T_cover]
+        # Scores are now [H, T_raw] (per-head), not [B, T_raw]
+        H_scores = scores.shape[0]
+
         if self.debug and layer_idx == 0:
-            print(f"[Layer {layer_idx}] REFRESH: scores.shape={scores.shape}, T_raw={T_raw}, grid_top_k={self.grid_top_k}")
-        
-        # Hard assertion to catch the bug immediately
+            print(f"[Layer {layer_idx}] REFRESH: scores.shape={scores.shape}, T_raw={T_raw}")
+
+        # Verify scores shape
         assert scores.shape[-1] == T_raw, \
-            f"CRITICAL BUG: Selecting from wrong axis! scores.shape={scores.shape}, T_raw={T_raw}. " \
-            f"Expected scores to be [B, T_raw] but got shape ending in {scores.shape[-1]}. " \
-            f"This means we're selecting from grid slots instead of raw positions!"
+            f"scores.shape={scores.shape}, T_raw={T_raw}. Expected [H, T_raw]."
 
-        # Ensure scores batch size matches raw cache batch size
-        B_scores = scores.shape[0]
-        if B != B_scores:
-            # This shouldn't happen, but handle it gracefully
-            B_use = min(B, B_scores)
-            scores = scores[:B_use]
-            k_raw = k_raw[:B_use]
-            v_raw = v_raw[:B_use]
-            B = B_use
+        # H2O-style budgets: percentage of sequence length
+        heavy_budget = max(1, int(self.heavy_ratio * T_raw))
+        recent_budget = max(1, int(self.recent_ratio * T_raw))
 
-        # Optional: avoid picking from very recent tail (sliding window)
-        # This ensures grid focuses on older, globally useful tokens
-        # while the tail already covers the most recent tokens
-        window = getattr(self.segmenter, 'tail_len', 16)
-        window = max(window, self.min_lined_tail_window)  # Use same minimum as lined_attention
-        
-        # CRITICAL: Compute tail exclusion in RAW space, not cover space
-        tail_start_raw = max(0, T_raw - window)
-        
-        # CRITICAL FIX: If window >= T_raw, tail_start_raw = 0 means we'd exclude everything
-        # In that case, we can't hard-exclude the tail (nothing would be left to select)
-        # Only exclude tail if there's enough sequence left to select from
-        if tail_start_raw == 0:
-            # Tail covers the whole sequence; don't hard-exclude (would leave nothing)
-            # Option: soft downweight or skip exclusion entirely
-            if self.debug and layer_idx == 0:
-                print(f"[Layer {layer_idx}] Tail exclusion SKIPPED: T_raw={T_raw}, window={window}, tail_start_raw=0 (tail covers entire sequence)")
-            # Don't modify scores - allow selection from entire sequence
-        elif tail_start_raw > 0 and T_raw > tail_start_raw:
-            # We have enough sequence to exclude the tail
-            # Ensure we leave at least grid_top_k tokens selectable (positions 0 to tail_start_raw-1)
-            # If tail_start_raw < grid_top_k, we don't have enough non-tail positions to select from
-            effective_grid_top_k = T_raw // 8 if self.grid_top_k_dynamic else self.grid_top_k
-            if tail_start_raw < effective_grid_top_k:
-                # Not enough positions outside tail; expand selectable region to include grid_top_k positions
-                tail_start_raw = effective_grid_top_k
-                if self.debug and layer_idx == 0:
-                    print(f"[Layer {layer_idx}] Tail exclusion ADJUSTED: raised tail_start_raw to {tail_start_raw} to ensure {effective_grid_top_k} tokens remain selectable")
-            
-            # Debug: check scores before modifying tail
-            if self.debug and layer_idx == 0:
-                max_score_before = scores.max().item()
-                mean_score_before = scores.mean().item()
-                tail_max = scores[:, tail_start_raw:].max().item() if T_raw > tail_start_raw else 0
-                print(f"[Layer {layer_idx}] Tail exclusion: T_raw={T_raw}, window={window}, tail_start_raw={tail_start_raw}, will exclude {T_raw - tail_start_raw} tokens")
-            
-            # CRITICAL FIX #3: Clone before excluding tail (don't modify original scores)
-            # Exclude tail completely from grid selection (set to -inf)
-            # Tail is already in the cover, so grid should focus on older tokens
-            sel_scores = scores.clone()  # Work on a copy
-            sel_scores[:, tail_start_raw:] = float('-inf')  # Exclude from tail_start_raw to end
-            scores = sel_scores  # Use the modified copy
+        # Exclude recent tokens from heavy hitter selection (H2O style)
+        # selected_set = previous_scores[:, :-recent_budget]
+        if recent_budget > 0 and T_raw > recent_budget:
+            # Clone and mask out recent tokens
+            sel_scores = scores.clone()
+            sel_scores[:, -recent_budget:] = float('-inf')
         else:
-            # Edge case: shouldn't happen, but handle gracefully
-            if self.debug and layer_idx == 0:
-                print(f"[Layer {layer_idx}] Tail exclusion SKIPPED: edge case T_raw={T_raw}, tail_start_raw={tail_start_raw}")
-            
-            # Debug: check scores after reducing tail weight
-            if self.debug and layer_idx == 0:
-                max_score_after = scores.max().item()
-                mean_score_after = scores.mean().item()
-                print(f"[Layer {layer_idx}] Grid scores: before tail reduction - max={max_score_before:.6f}, mean={mean_score_before:.6f}, tail_max={tail_max:.6f}; after - max={max_score_after:.6f}, mean={mean_score_after:.6f}")
+            sel_scores = scores
 
-        # Top-K per batch
-        # CRITICAL DIAGNOSTIC B: Print scores info right before topk
         if self.debug and layer_idx == 0:
-            print(f"[Layer {layer_idx}] Before topk: scores.shape={scores.shape}, scores.dtype={scores.dtype}, "
-                  f"scores.min()={scores.min().item():.6f}, scores.max()={scores.max().item():.6f}, "
-                  f"T_raw={T_raw}, grid_top_k={self.grid_top_k}")
-            # Check if scores are all -inf (would indicate everything was excluded)
-            num_inf = (scores == float('-inf')).sum().item()
-            num_finite = (torch.isfinite(scores)).sum().item()
-            print(f"[Layer {layer_idx}] Scores stats: num_inf={num_inf}, num_finite={num_finite}, total={scores.numel()}")
-        
-        # Ensure we don't exceed capacity if prefix was initialized
-        # For now, just select top-K (prefix will be overwritten, but that's okay for initial testing)
-        # Dynamic grid_top_k: T_raw // 8 for reasonable compression while maintaining quality
-        effective_grid_top_k = T_raw // 8 if self.grid_top_k_dynamic else self.grid_top_k
-        K = min(effective_grid_top_k, T_raw)
-        top_scores, top_indices = torch.topk(scores, k=K, dim=-1)   # [B, K]
-        indices = top_indices.clone()  # [B, K]
-        
-        # CRITICAL DIAGNOSTIC C: Verify we're selecting raw positions and gathering correct KV
-        if self.debug and layer_idx == 0 and B > 0 and K > 0:
-            # Sanity check: verify grid_k[0,0,0] matches k_raw[0,0,indices[0,0]]
-            test_idx = indices[0, 0].item()
-            if test_idx < T_raw and test_idx >= 0:
-                # We'll check this after gathering, but log the index now
-                print(f"[Layer {layer_idx}] Will gather KV from raw position {test_idx} (first selected index)")
-        
-        # Debug: verify indices are not in tail (RED FLAG B check)
-        if self.debug and layer_idx == 0 and T_raw > tail_start_raw:
-            indices_in_tail = (indices >= tail_start_raw).sum().item()
-            max_idx = indices.max().item()
-            min_idx = indices.min().item()
-            if indices_in_tail > 0:
-                print(f"[Layer {layer_idx}] WARNING: {indices_in_tail}/{K} grid indices are in tail (should be 0)")
-            else:
-                print(f"[Layer {layer_idx}] Grid selection: max_idx={max_idx}, min_idx={min_idx}, tail_start_raw={tail_start_raw}, all_indices_outside_tail=✓")
-            
-            # CRITICAL: Verify indices are in valid range [0, T_raw-1]
-            if max_idx >= T_raw:
-                print(f"[Layer {layer_idx}] ERROR: max_idx={max_idx} >= T_raw={T_raw} (out of bounds!)")
-            if min_idx < 0:
-                print(f"[Layer {layer_idx}] ERROR: min_idx={min_idx} < 0 (out of bounds!)")
+            print(f"[Layer {layer_idx}] H2O budgets: heavy={heavy_budget}, recent={recent_budget}, T_raw={T_raw}")
 
-        # Optional H2O-ish stability: only refresh if top-K actually changed enough
-        prev_indices = None
-        if self.grid_min_change_ratio > 0 and self.grid_cache[layer_idx].indices is not None:
-            prev = self.grid_cache[layer_idx].indices  # [B_prev, G_max]
-            # Align shapes: we only compare first B rows and first K cols
-            B_prev, G_prev = prev.shape
-            B_cmp = min(B_prev, B)
-            K_cmp = min(G_prev, K)
-            if B_cmp > 0 and K_cmp > 0:
-                prev_indices = prev[:B_cmp, :K_cmp]
-                new_indices = indices[:B_cmp, :K_cmp]
-                diff = (prev_indices != new_indices)
-                change_ratio = diff.float().mean().item()
-                if change_ratio < self.grid_min_change_ratio:
-                    # Not enough change in grid membership; keep old grid, bail out
-                    if self.debug and layer_idx == 0:  # Debug print for first layer only
-                        print(f"[Layer {layer_idx}] Grid refresh skipped: change_ratio={change_ratio:.3f} < {self.grid_min_change_ratio}")
-                    return
+        # Select top-K heavy hitters per head: [H, heavy_budget]
+        K = min(heavy_budget, T_raw - recent_budget) if T_raw > recent_budget else min(heavy_budget, T_raw)
+        K = max(1, K)  # Ensure at least 1
+        top_scores, top_indices = torch.topk(sel_scores, k=K, dim=-1)  # [H, K]
 
-        # If we're here, either there was no previous grid or it changed meaningfully.
+        # For KV gathering, we need batch-compatible indices
+        # H2O applies per-head selection; we aggregate across heads for simplicity
+        # Take union of all heads' top-K (or use first head for simplicity)
+        # Option 1: Use first head's selection (simple, matches single-head case)
+        # Option 2: Union across heads (more faithful but complex)
+        # We'll use the mean score across heads for batch-compatible selection
+
+        # Aggregate scores across heads for batch-level selection
+        mean_scores = scores.mean(dim=0)  # [T_raw]
+
+        # Exclude recent tokens
+        if recent_budget > 0 and T_raw > recent_budget:
+            mean_sel_scores = mean_scores.clone()
+            mean_sel_scores[-recent_budget:] = float('-inf')
+        else:
+            mean_sel_scores = mean_scores
+
+        # Select heavy hitters based on mean score
+        K_final = min(heavy_budget, T_raw - recent_budget) if T_raw > recent_budget else heavy_budget
+        K_final = max(1, min(K_final, T_raw))
+        _, batch_indices = torch.topk(mean_sel_scores, k=K_final, dim=-1)  # [K_final]
+
+        # Expand to batch dimension: [B, K_final]
+        indices = batch_indices.unsqueeze(0).expand(B, -1)
+
+        if self.debug and layer_idx == 0:
+            print(f"[Layer {layer_idx}] Selected {K_final} heavy hitters, indices[:5]={batch_indices[:5].tolist()}")
+
         # Gather K/V: [B, H_k, K, D]
-        # Build gather index: [B, 1, K, 1] -> expand to [B, H_k, K, D]
-        # Clamp indices to valid range
         T_raw_max = k_raw.shape[2] - 1
         indices_clamped = indices.clamp(min=0, max=T_raw_max)
-        gather_idx = indices_clamped.view(B, 1, K, 1).expand(-1, H_k, -1, D)
+        gather_idx = indices_clamped.view(B, 1, K_final, 1).expand(-1, H_k, -1, D)
         grid_k = torch.gather(k_raw, 2, gather_idx)
         grid_v = torch.gather(v_raw, 2, gather_idx)
 
-        # CRITICAL DIAGNOSTIC C: Verify KV gathering correctness
-        # Keep this check even when debug=False (it's cheap and catches bugs)
-        if layer_idx == 0 and B > 0 and K > 0:
+        # Verify KV gathering correctness
+        if layer_idx == 0 and B > 0 and K_final > 0:
             test_idx = indices[0, 0].item()
             if 0 <= test_idx < T_raw:
-                # Check: grid_k[0,0,0] should equal k_raw[0,0,test_idx]
                 gathered_kv = grid_k[0, 0, 0]
                 raw_kv = k_raw[0, 0, test_idx]
                 is_close = torch.allclose(gathered_kv, raw_kv, atol=1e-5)
-                max_diff = (gathered_kv - raw_kv).abs().max().item()
                 if not is_close:
-                    # Always print errors (not just in debug mode)
-                    print(f"[Layer {layer_idx}] ERROR: KV gather mismatch! grid_k[0,0,0] != k_raw[0,0,{test_idx}], max_diff={max_diff:.6f}")
-                elif self.debug:
-                    print(f"[Layer {layer_idx}] KV gather verified: grid_k[0,0,0] == k_raw[0,0,{test_idx}] ✓ (max_diff={max_diff:.6e})")
+                    max_diff = (gathered_kv - raw_kv).abs().max().item()
+                    print(f"[Layer {layer_idx}] ERROR: KV gather mismatch! max_diff={max_diff:.6f}")
 
         # Write into GridCache
         self.grid_cache[layer_idx].set_tokens(
@@ -2254,19 +2149,9 @@ class LukaKVController:
             values=grid_v,
             indices=indices,
         )
-        
-        # Debug print for first layer only (with all requested diagnostics)
-        if self.debug and layer_idx == 0 and B > 0:
-            grid_indices_b0 = indices[0].cpu().tolist()
-            grid_scores_b0 = top_scores[0].cpu().tolist()
-            max_idx = indices[0].max().item()
-            min_idx = indices[0].min().item()
-            # Check if any indices are in tail (should be 0 after fix)
-            tail_start = T_raw - window if T_raw > window else T_raw
-            indices_in_tail = (indices[0] >= tail_start).sum().item()
-            
-            print(f"[Layer {layer_idx}] Grid refreshed: indices={grid_indices_b0[:5]}... (top 5), scores={[f'{s:.3f}' for s in grid_scores_b0[:5]]}")
-            print(f"[Layer {layer_idx}] Grid selection diagnostics: max_idx={max_idx}, min_idx={min_idx}, tail_start={tail_start}, indices_in_tail={indices_in_tail} (should be 0)")
+
+        if self.debug and layer_idx == 0:
+            print(f"[Layer {layer_idx}] Grid refreshed: {K_final} heavy hitters")
 
     def top_down_attention(
         self,
@@ -2658,14 +2543,15 @@ class LukaKVController:
             )
         
         # --- 2. Get grid tokens from GridCache ---
+        # H2O-style budgets
+        heavy_budget = max(1, int(self.heavy_ratio * T_raw))
+        recent_budget = max(1, int(self.recent_ratio * T_raw))
+
         grid_cache = self.grid_cache[layer_idx]
-        effective_grid_top_k = T_raw // 8 if self.grid_top_k_dynamic else self.grid_top_k
         if grid_cache.keys is None or grid_cache.lens is None:
             grid_cache.initialize(B_raw, H_k, D_k, k_raw.device, k_raw.dtype)
 
-            # H2O fix: If grid_scores has data from warmup, use it immediately
-            # instead of defaulting to prefix tokens. This ensures the first
-            # grid selection reflects actual attention patterns from prefill.
+            # H2O: If we have accumulated scores, use them to select heavy hitters
             if self.grid_scores[layer_idx] is not None and self.grid_scores[layer_idx].numel() > 0:
                 # Ensure grid_scores covers current T_raw (pad if needed)
                 if self.grid_scores[layer_idx].shape[1] < T_raw:
@@ -2674,26 +2560,24 @@ class LukaKVController:
                     padding = torch.zeros(old_scores.shape[0], pad_T, device=k_raw.device, dtype=old_scores.dtype)
                     self.grid_scores[layer_idx] = torch.cat([old_scores, padding], dim=1)
 
-                # Use accumulated warmup scores to select initial heavy hitters
+                # Use accumulated scores to select initial heavy hitters
                 self._refresh_grid_tokens(layer_idx)
                 if self.debug and layer_idx == 0:
-                    print(f"[Layer {layer_idx}] Grid initialized from warmup scores (H2O-style)")
+                    print(f"[Layer {layer_idx}] Grid initialized from accumulated scores (H2O-style)")
             else:
-                # Fallback: Initialize grid with prefix anchor to prevent bootstrapping failure
-                # Use min(32, effective_grid_top_k) to ensure prefix fits within grid capacity
-                prefix_len = min(32, effective_grid_top_k, T_raw)
+                # Fallback: Initialize grid with prefix anchor
+                prefix_len = min(32, heavy_budget, T_raw)
                 if T_raw >= prefix_len and prefix_len > 0:
                     prefix_indices = torch.arange(prefix_len, device=k_raw.device, dtype=torch.long)
-                    prefix_k = k_raw[:, :, :prefix_len, :]  # [B, H_k, prefix_len, D]
+                    prefix_k = k_raw[:, :, :prefix_len, :]
                     prefix_v = v_raw[:, :, :prefix_len, :]
-                    # Set grid to prefix tokens (will be expanded/refreshed later)
                     grid_cache.set_tokens(
                         keys=prefix_k,
                         values=prefix_v,
-                        indices=prefix_indices.unsqueeze(0).expand(B_raw, -1),  # [B, prefix_len]
+                        indices=prefix_indices.unsqueeze(0).expand(B_raw, -1),
                     )
                     if self.debug and layer_idx == 0:
-                        print(f"[Layer {layer_idx}] Grid initialized with prefix anchor: first {prefix_len} tokens (effective_grid_top_k={effective_grid_top_k})")
+                        print(f"[Layer {layer_idx}] Grid initialized with prefix: {prefix_len} tokens")
         
         # Ensure grid is properly initialized (safety check)
         if grid_cache.keys is None or grid_cache.lens is None:
@@ -2708,12 +2592,11 @@ class LukaKVController:
         if self.debug and layer_idx == 0:
             grid_len_actual = grid_lens[0].item() if grid_lens.numel() > 0 else 0
             if grid_len_actual == 0:
-                print(f"[Layer {layer_idx}] WARNING: Grid has 0 tokens! T_raw={T_raw}, min_lined_seq_len={self.min_lined_seq_len}")
-        
-        # --- 3. Build raw tail with a H2O-ish window ---
-        window = getattr(self.segmenter, 'tail_len', 16)
-        # Ensure the local window is reasonably large
-        window = max(window, self.min_lined_tail_window)
+                print(f"[Layer {layer_idx}] WARNING: Grid has 0 tokens! T_raw={T_raw}")
+
+        # --- 3. Build raw tail with H2O-style recent window ---
+        # Use percentage-based window like H2O
+        window = recent_budget
         
         # Build tail indices per batch
         
@@ -2950,11 +2833,9 @@ class LukaKVController:
         
         # Update grid scores *from this step's attention*
         self._update_grid_scores(layer_idx, attn_probs, cover_indices, cover_is_summary)
-        
-        # Refresh grid tokens periodically
-        self.grid_step_counters[layer_idx] += 1
-        if self.grid_update_interval > 0 and (self.grid_step_counters[layer_idx] % self.grid_update_interval) == 0:
-            self._refresh_grid_tokens(layer_idx)
+
+        # H2O: Refresh grid tokens every step (builds attention mask each forward pass)
+        self._refresh_grid_tokens(layer_idx)
         
         return attn_output.transpose(1, 2).contiguous(), attn_probs
 

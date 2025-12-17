@@ -128,7 +128,8 @@ if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
                         valid_log_k.append(log_k[b, :n_pages])
                 if valid_log_k:
                     valid_log_k = torch.cat(valid_log_k)
-                    all_log_k.append(valid_log_k)
+                    # Move to CPU for aggregation across devices
+                    all_log_k.append(valid_log_k.cpu())
                     mean_val = valid_log_k.mean().item()
                     min_val = valid_log_k.min().item()
                     max_val = valid_log_k.max().item()
@@ -136,7 +137,7 @@ if hasattr(model, "model") and hasattr(model.model, "luka_kv_controller"):
                     print(f"  {layer_idx:<8} {int(num_pages):<8} {mean_val:<10.3f} {min_val:<10.3f} {max_val:<10.3f} {std_val:<10.3f}")
 
     if all_log_k:
-        all_log_k = torch.cat(all_log_k)
+        all_log_k = torch.cat(all_log_k)  # All on CPU now
         print("-" * 60)
         print(f"  {'TOTAL':<8} {len(all_log_k):<8} {all_log_k.mean().item():<10.3f} {all_log_k.min().item():<10.3f} {all_log_k.max().item():<10.3f} {all_log_k.std().item():<10.3f}")
 

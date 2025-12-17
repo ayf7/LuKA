@@ -107,8 +107,17 @@ def load_model(args):
             "refinement_rule": args.refinement_rule,
             "refinement_rule_kwargs": {"k": args.refinement_k},
             "log_bias_mode": args.log_bias,
+            # H2O-style parameters
+            "heavy_ratio": args.heavy_ratio,
+            "recent_ratio": args.recent_ratio,
         }
-        print(f"LuKA Config: {luka_config}")
+        print(f"LuKA Config:")
+        print(f"  Compressor: {args.compressor}")
+        print(f"  Segmenter: {args.segmenter} (min_chunk=8, tail_len=128, max_pages=256)")
+        print(f"  Segment Interval: {args.segment_interval}")
+        print(f"  Refinement: {args.refinement_rule}" + (f" (k={args.refinement_k})" if args.refinement_rule != "none" else ""))
+        print(f"  Log Bias: {args.log_bias}")
+        print(f"  H2O (lined): heavy_ratio={args.heavy_ratio}, recent_ratio={args.recent_ratio}")
         print(f"{'='*60}\n")
 
         lined_layers = None
@@ -262,9 +271,10 @@ def run_evaluation(args):
     if args.output:
         output_path = Path(args.output)
     else:
-        model_tag = args.model.replace('/', '_')
-        attn_tag = f"_{args.attention}" if args.model_type == "luka" else ""
-        output_path = Path(f"results_{args.model_type}_{model_tag}{attn_tag}_{args.dataset}.json")
+        attn_tag = args.attention if args.model_type == "luka" else "baseline"
+        results_dir = Path(__file__).parent / "results"
+        results_dir.mkdir(exist_ok=True)
+        output_path = results_dir / f"eval_{attn_tag}_{args.dataset}.json"
 
     all_results = []
 
@@ -281,6 +291,18 @@ def run_evaluation(args):
         print("=" * 60)
         result = evaluator.evaluate_sequential_multi_answer(model=model, config=gen_config, num_examples=args.max_examples)
         all_results.append(('sequential', result))
+
+    if args.eval_mode == "batched":
+        print("\n" + "=" * 60)
+        print("RUNNING BATCHED EVALUATION")
+        print("=" * 60)
+        result = evaluator.evaluate_batched(
+            model=model,
+            config=gen_config,
+            num_examples=args.max_examples,
+            batch_size=args.batch_size,
+        )
+        all_results.append(('batched', result))
 
     for mode, result in all_results:
         output_data = result.to_dict()
@@ -315,6 +337,13 @@ def run_evaluation(args):
         if result.compression_stats:
             ratios = [s.get('compression_ratio', 1.0) for s in result.compression_stats]
             print(f"  Avg Compression: {np.mean(ratios):.2f}x")
+        if result.performance_stats:
+            ps = result.performance_stats
+            print(f"  Performance:")
+            print(f"    Total tokens generated: {ps.total_tokens_generated}")
+            print(f"    Decode throughput: {ps.decode_throughput_tps:.1f} tokens/sec")
+            print(f"    Decode latency: {ps.decode_latency_ms_per_token:.2f} ms/token")
+            print(f"    Peak memory (allocated): {ps.peak_memory_allocated_mb:.1f} MB")
     print(f"\nResults saved to: {output_path}")
 
 
@@ -339,10 +368,13 @@ def main():
     parser.add_argument("--lined-layers", type=str, default=None, help="Comma-separated layer indices")
     parser.add_argument("--compressor", type=str, default="attention_weighted", choices=["mean", "attention_weighted"])
     parser.add_argument("--segmenter", type=str, default="dummy")
-    parser.add_argument("--segment-interval", type=int, default=16)
+    parser.add_argument("--segment-interval", type=int, default=1)
     parser.add_argument("--refinement-rule", type=str, default="top_k", choices=["none", "threshold", "top_k", "top_p", "top_frac"])
     parser.add_argument("--refinement-k", type=int, default=3, help="K for top_k refinement rule")
     parser.add_argument("--log-bias", type=str, default="adaptive_k", choices=["none", "fixed_n", "adaptive_k"])
+    # H2O-style parameters (for lined attention)
+    parser.add_argument("--heavy-ratio", type=float, default=0.1, help="Fraction of tokens to keep as heavy hitters (H2O)")
+    parser.add_argument("--recent-ratio", type=float, default=0.1, help="Fraction of tokens to keep as recent window (H2O)")
 
     # API-specific
     parser.add_argument("--api-type", type=str, choices=["openai", "dashscope"])
@@ -354,7 +386,8 @@ def main():
     parser.add_argument("--max-examples", type=int, default=None)
 
     # Evaluation
-    parser.add_argument("--eval-mode", type=str, default="simple", choices=["simple", "sequential", "both"])
+    parser.add_argument("--eval-mode", type=str, default="simple", choices=["simple", "sequential", "batched", "both"])
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for batched eval mode")
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)

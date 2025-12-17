@@ -8,7 +8,9 @@ Provides concrete implementations of ModelInterface for:
 """
 
 import torch
-from typing import Optional, Dict, Any
+import transformers
+transformers.logging.set_verbosity_error()
+from typing import Optional, Dict, Any, List
 from evaluation.model_interface import (
     ModelInterface,
     BaselineModelInterface,
@@ -85,6 +87,43 @@ class HuggingFaceModel(BaselineModelInterface):
         # For stateless models, this is a no-op
         # KV cache is automatically cleared between generate() calls
         pass
+
+    def batch_generate(
+        self, prompts: List[str], config: Optional[GenerationConfig] = None
+    ) -> List[str]:
+        """Generate text for multiple prompts in a batch."""
+        if config is None:
+            config = GenerationConfig()
+
+        # Tokenize all prompts with padding
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096,
+        ).to(self.model.device)
+
+        # Generate
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature if config.do_sample else 1.0,
+                top_p=config.top_p,
+                do_sample=config.do_sample,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            )
+
+        # Decode each output, excluding the prompt
+        results = []
+        for i, output in enumerate(outputs):
+            prompt_len = inputs['attention_mask'][i].sum().item()
+            generated_tokens = output[prompt_len:]
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            results.append(text.strip())
+
+        return results
 
 
 class APIModel(BaselineModelInterface):
@@ -224,12 +263,15 @@ class LuKAQwenModel(LuKAModelInterface):
             compressor_kwargs = {"temperature": 7.0} if compressor == "attention_weighted" else {}
 
             kv_params = {
+                "use_exact_attention": False,  # Enable LuKA compression
+                "create_pages_in_generation": True,
                 "compressor": compressor,
                 "compressor_kwargs": compressor_kwargs,
                 "segmenter": self.luka_config.get("segmenter", "dummy"),
+                "segmenter_kwargs": {"max_pages": 256, "min_chunk": 8, "tail_len": 128},
                 "segment_interval": self.luka_config.get("segment_interval", 16),
                 "refinement_rule": self.luka_config.get("refinement_rule", "top_k"),
-                "refinement_rule_kwargs": self.luka_config.get("refinement_rule_kwargs", {"k": 3}),
+                "refinement_rule_kwargs": self.luka_config.get("refinement_rule_kwargs", {"k": 3}) if self.luka_config.get("refinement_rule", "top_k") != "none" else {},
                 "log_bias_mode": self.luka_config.get("log_bias_mode", "adaptive_k"),
                 "production_mode": True,
             }
@@ -277,12 +319,18 @@ class LuKAQwenModel(LuKAModelInterface):
         controller = self.model.model.luka_kv_controller
         num_layers = controller.num_layers
 
+        # H2O-style parameters (can be overridden via luka_config)
+        heavy_ratio = self.luka_config.get("heavy_ratio", 0.1)
+        recent_ratio = self.luka_config.get("recent_ratio", 0.1)
+
         if self.attention_mode == "top_down":
             controller.use_lined_attention = False
             controller.lined_layers = set()
 
         elif self.attention_mode == "lined":
             controller.use_lined_attention = True
+            controller.heavy_ratio = heavy_ratio
+            controller.recent_ratio = recent_ratio
             if self.lined_layers is not None:
                 controller.lined_layers = set(self.lined_layers)
             else:
@@ -290,6 +338,8 @@ class LuKAQwenModel(LuKAModelInterface):
 
         elif self.attention_mode == "mix":
             controller.use_lined_attention = True
+            controller.heavy_ratio = heavy_ratio
+            controller.recent_ratio = recent_ratio
             if self.lined_layers is not None:
                 controller.lined_layers = set(self.lined_layers)
             else:
@@ -443,3 +493,56 @@ class LuKAQwenModel(LuKAModelInterface):
                 controller.reset()  # Full reset of all cache state
             except Exception:
                 pass
+
+    def batch_generate(
+        self, prompts: List[str], config: Optional[GenerationConfig] = None
+    ) -> List[str]:
+        """Generate text for multiple prompts in a batch with LuKA compression."""
+        if config is None:
+            config = GenerationConfig()
+
+        # Build prompts with chat template if available
+        formatted_prompts = []
+        for prompt in prompts:
+            if hasattr(self.tokenizer, 'apply_chat_template') and self.tokenizer.chat_template:
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant that answers questions based on the given context. Answer in a few words or a short phrase. Do not include explanations."},
+                    {"role": "user", "content": prompt}
+                ]
+                formatted = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                formatted = prompt
+            formatted_prompts.append(formatted)
+
+        # Tokenize with left padding for batched generation
+        inputs = self.tokenizer(
+            formatted_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096,
+        ).to(self.model.device)
+
+        # Generate with LuKA compression active
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature if config.do_sample else 1.0,
+                top_p=config.top_p,
+                do_sample=config.do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+        # Decode each output, excluding the prompt
+        results = []
+        for i, output in enumerate(outputs):
+            # Find where actual tokens start (skip padding)
+            prompt_len = inputs['attention_mask'][i].sum().item()
+            generated_tokens = output[prompt_len:]
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            results.append(text.strip())
+
+        return results

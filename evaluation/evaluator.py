@@ -7,12 +7,33 @@ Runs two evaluation modes:
 """
 
 import json
+import time
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from tqdm import tqdm
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+
+import torch
 
 from evaluation.model_interface import ModelInterface, GenerationConfig, LuKAModelInterface
+
+
+@dataclass
+class PerformanceStats:
+    """Performance statistics from evaluation."""
+    total_generations: int = 0
+    total_tokens_generated: int = 0
+    total_decode_time_sec: float = 0.0
+    # Throughput: tokens per second
+    decode_throughput_tps: float = 0.0
+    # Latency: milliseconds per token
+    decode_latency_ms_per_token: float = 0.0
+    # Memory
+    peak_memory_mb: float = 0.0
+    peak_memory_allocated_mb: float = 0.0
+
+    def to_dict(self):
+        return asdict(self)
 
 
 @dataclass
@@ -24,10 +45,14 @@ class EvaluationResult:
     num_examples: int
     predictions: List[Dict]  # List of {example_id, questions, answers}
     compression_stats: Optional[List[Dict]] = None  # Only for LuKA models
+    performance_stats: Optional[PerformanceStats] = None
 
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        d = asdict(self)
+        if self.performance_stats:
+            d['performance_stats'] = self.performance_stats.to_dict()
+        return d
 
 
 class QAEvaluator:
@@ -78,6 +103,15 @@ class QAEvaluator:
         predictions = []
         compression_stats = [] if isinstance(model, LuKAModelInterface) else None
 
+        # Performance tracking
+        generation_times = []
+        tokens_generated = []
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        # Get tokenizer for counting output tokens
+        tokenizer = getattr(model, 'tokenizer', None)
+
         print(f"\n{'='*60}")
         print(f"Running Simple Q&A Evaluation")
         print(f"Model: {model.get_model_info()['name']}")
@@ -100,8 +134,19 @@ class QAEvaluator:
                 # Reset model state for each question
                 model.reset()
 
-                # Generate answer
+                # Generate answer with timing
+                start_time = time.perf_counter()
                 answer = model.generate(full_prompt, config)
+                end_time = time.perf_counter()
+                generation_times.append(end_time - start_time)
+
+                # Count tokens in generated output
+                if tokenizer is not None:
+                    num_tokens = len(tokenizer.encode(answer, add_special_tokens=False))
+                else:
+                    num_tokens = len(answer.split())  # Fallback: word count
+                tokens_generated.append(num_tokens)
+
                 answers.append(answer.strip())
 
             predictions.append({
@@ -117,13 +162,40 @@ class QAEvaluator:
                     **model.get_compression_stats()
                 })
 
+        # Compute performance stats
+        total_generations = len(generation_times)
+        total_tokens = sum(tokens_generated)
+        total_time = sum(generation_times)
+
+        # Throughput: tokens per second
+        throughput = total_tokens / total_time if total_time > 0 else 0.0
+        # Latency: ms per token
+        latency_ms = (total_time * 1000) / total_tokens if total_tokens > 0 else 0.0
+
+        peak_memory_mb = 0.0
+        peak_allocated_mb = 0.0
+        if torch.cuda.is_available():
+            peak_memory_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+            peak_allocated_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+        perf_stats = PerformanceStats(
+            total_generations=total_generations,
+            total_tokens_generated=total_tokens,
+            total_decode_time_sec=total_time,
+            decode_throughput_tps=throughput,
+            decode_latency_ms_per_token=latency_ms,
+            peak_memory_mb=peak_memory_mb,
+            peak_memory_allocated_mb=peak_allocated_mb,
+        )
+
         result = EvaluationResult(
             model_name=model.get_model_info()['name'],
             eval_mode='simple',
             dataset_name=self.dataset_name,
             num_examples=len(examples_to_eval),
             predictions=predictions,
-            compression_stats=compression_stats
+            compression_stats=compression_stats,
+            performance_stats=perf_stats,
         )
 
         return result
@@ -158,6 +230,15 @@ class QAEvaluator:
         examples_to_eval = self.dataset[:num_examples] if num_examples else self.dataset
         predictions = []
         compression_stats = [] if isinstance(model, LuKAModelInterface) else None
+
+        # Performance tracking
+        generation_times = []
+        tokens_generated = []
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        # Get tokenizer for counting output tokens
+        tokenizer = getattr(model, 'tokenizer', None)
 
         print(f"\n{'='*60}")
         print(f"Running Sequential Multi-Answer Evaluation")
@@ -200,8 +281,19 @@ class QAEvaluator:
                     # Subsequent questions: accumulated context + new segment + question
                     prompt = f"{accumulated_context}\n\n{segment_text}\n\nQuestion: {question}\nAnswer:"
 
-                # Generate answer
+                # Generate answer with timing
+                start_time = time.perf_counter()
                 answer = model.generate(prompt, config)
+                end_time = time.perf_counter()
+                generation_times.append(end_time - start_time)
+
+                # Count tokens in generated output
+                if tokenizer is not None:
+                    num_tokens = len(tokenizer.encode(answer, add_special_tokens=False))
+                else:
+                    num_tokens = len(answer.split())  # Fallback: word count
+                tokens_generated.append(num_tokens)
+
                 answer = answer.strip()
                 answers.append(answer)
 
@@ -221,13 +313,176 @@ class QAEvaluator:
                     **model.get_compression_stats()
                 })
 
+        # Compute performance stats
+        total_generations = len(generation_times)
+        total_tokens = sum(tokens_generated)
+        total_time = sum(generation_times)
+
+        # Throughput: tokens per second
+        throughput = total_tokens / total_time if total_time > 0 else 0.0
+        # Latency: ms per token
+        latency_ms = (total_time * 1000) / total_tokens if total_tokens > 0 else 0.0
+
+        peak_memory_mb = 0.0
+        peak_allocated_mb = 0.0
+        if torch.cuda.is_available():
+            peak_memory_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+            peak_allocated_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+        perf_stats = PerformanceStats(
+            total_generations=total_generations,
+            total_tokens_generated=total_tokens,
+            total_decode_time_sec=total_time,
+            decode_throughput_tps=throughput,
+            decode_latency_ms_per_token=latency_ms,
+            peak_memory_mb=peak_memory_mb,
+            peak_memory_allocated_mb=peak_allocated_mb,
+        )
+
         result = EvaluationResult(
             model_name=model.get_model_info()['name'],
             eval_mode='sequential',
             dataset_name=self.dataset_name,
             num_examples=len(examples_to_eval),
             predictions=predictions,
-            compression_stats=compression_stats
+            compression_stats=compression_stats,
+            performance_stats=perf_stats
+        )
+
+        return result
+
+    def evaluate_batched(
+        self,
+        model: ModelInterface,
+        config: Optional[GenerationConfig] = None,
+        num_examples: Optional[int] = None,
+        batch_size: int = 8,
+    ) -> EvaluationResult:
+        """
+        Batched evaluation: all questions across all examples, processed in batches.
+
+        Args:
+            model: Model implementing ModelInterface
+            config: Generation configuration
+            num_examples: Number of examples to evaluate (all if None)
+            batch_size: Number of prompts per batch
+
+        Returns:
+            EvaluationResult with predictions
+        """
+        if config is None:
+            config = GenerationConfig(max_new_tokens=100)
+
+        examples_to_eval = self.dataset[:num_examples] if num_examples else self.dataset
+
+        # Performance tracking
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        # Get tokenizer for counting output tokens
+        tokenizer = getattr(model, 'tokenizer', None)
+
+        # Build all prompts upfront - ALL questions from ALL examples
+        all_prompts = []
+        prompt_metadata = []  # Track (example_idx, question_idx) for each prompt
+
+        for ex_idx, example in enumerate(examples_to_eval):
+            prompt = example['prompt']
+            questions = example['questions']
+
+            for q_idx, q_data in enumerate(questions):
+                question = q_data['question']
+                full_prompt = f"{prompt}\n\nQuestion: {question}\nAnswer:"
+                all_prompts.append(full_prompt)
+                prompt_metadata.append((ex_idx, q_idx, example['example_id'], question))
+
+        total_questions = len(all_prompts)
+        print(f"\n{'='*60}")
+        print(f"Running Batched Evaluation")
+        print(f"Model: {model.get_model_info()['name']}")
+        print(f"Examples: {len(examples_to_eval)}")
+        print(f"Total questions: {total_questions}")
+        print(f"Batch size: {batch_size}")
+        print(f"{'='*60}\n")
+
+        # Process in batches
+        all_answers = []
+        total_tokens = 0
+        total_time = 0.0
+
+        num_batches = (len(all_prompts) + batch_size - 1) // batch_size
+
+        for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(all_prompts))
+            batch_prompts = all_prompts[start_idx:end_idx]
+
+            # Reset model state before each batch
+            model.reset()
+
+            # Generate with timing
+            start_time = time.perf_counter()
+            batch_answers = model.batch_generate(batch_prompts, config)
+            end_time = time.perf_counter()
+            total_time += end_time - start_time
+
+            # Count tokens
+            for answer in batch_answers:
+                if tokenizer is not None:
+                    total_tokens += len(tokenizer.encode(answer, add_special_tokens=False))
+                else:
+                    total_tokens += len(answer.split())
+
+            all_answers.extend(batch_answers)
+
+        # Group answers back by example
+        example_answers: Dict[str, Dict] = {}
+        for (ex_idx, q_idx, example_id, question), answer in zip(prompt_metadata, all_answers):
+            if example_id not in example_answers:
+                example_answers[example_id] = {'questions': [], 'answers': []}
+            example_answers[example_id]['questions'].append(question)
+            example_answers[example_id]['answers'].append(answer.strip())
+
+        # Build predictions in original order
+        predictions = []
+        for example in examples_to_eval:
+            example_id = example['example_id']
+            if example_id in example_answers:
+                predictions.append({
+                    'example_id': example_id,
+                    'questions': example_answers[example_id]['questions'],
+                    'answers': example_answers[example_id]['answers'],
+                })
+
+        # Compute performance stats
+        throughput = total_tokens / total_time if total_time > 0 else 0.0
+        latency_ms = (total_time * 1000) / total_tokens if total_tokens > 0 else 0.0
+
+        peak_memory_mb = 0.0
+        peak_allocated_mb = 0.0
+        if torch.cuda.is_available():
+            peak_memory_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+            peak_allocated_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+        perf_stats = PerformanceStats(
+            total_generations=len(all_prompts),
+            total_tokens_generated=total_tokens,
+            total_decode_time_sec=total_time,
+            decode_throughput_tps=throughput,
+            decode_latency_ms_per_token=latency_ms,
+            peak_memory_mb=peak_memory_mb,
+            peak_memory_allocated_mb=peak_allocated_mb,
+        )
+
+        # No compression stats for batched mode (would need per-example tracking)
+        result = EvaluationResult(
+            model_name=model.get_model_info()['name'],
+            eval_mode='batched',
+            dataset_name=self.dataset_name,
+            num_examples=len(examples_to_eval),
+            predictions=predictions,
+            compression_stats=None,
+            performance_stats=perf_stats,
         )
 
         return result
