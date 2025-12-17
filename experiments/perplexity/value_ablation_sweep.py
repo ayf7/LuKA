@@ -154,7 +154,7 @@ def run(
         # Get baseline perplexity
         if need_baseline:
             print("\nRunning baseline (raw attention)...")
-            base_ppl, _, base_tps = get_baseline_perplexity(rollout_ids, prompt_len, device, model_name)
+            base_ppl, _, _, base_tps = get_baseline_perplexity(rollout_ids, prompt_len, device, model_name)
             print(f"Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
         else:
             base_ppl = existing_base_ppl

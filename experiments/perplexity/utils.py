@@ -51,10 +51,10 @@ def load_eval_text(dataset_name: str = "wikitext", max_tokens: int = 2048, token
                 break
 
     elif dataset_name == "pg19":
-        # PG-19: Long books from Project Gutenberg
-        dataset = load_dataset("pg19", split="test")
+        # PG-19: Long books from Project Gutenberg (use streaming to avoid downloading 7GB)
+        dataset = load_dataset("emozilla/pg19", split="test", streaming=True)
         # Take first book, it's usually long enough
-        text = dataset[0]["text"]
+        text = next(iter(dataset))["text"]
 
     elif dataset_name == "c4":
         # C4 validation set
@@ -318,7 +318,7 @@ def generate_baseline_rollout(
         default_tail_len=16,
         min_compress_chunk=16,
         max_pages=15,
-        refine_threshold=-1,  # Negative = exact raw attention path
+        use_exact_attention=True,  # Bypass cover view, use raw attention
         compressor="mean",
         segmenter="dummy",
         create_pages_in_generation=False,
@@ -417,22 +417,33 @@ def prefill_then_decode_perplexity(model, rollout_ids: torch.Tensor, prompt_len:
     # If we detected NaN/Inf during forward pass, return inf perplexity
     if has_nan or nll_tensor.isnan().any() or nll_tensor.isinf().any():
         print("  [WARNING: NaN/Inf detected in logits, returning inf perplexity]")
-        return float('inf'), [float('inf')] * total_tokens, tps
+        return float('inf'), [float('inf')] * total_tokens, [float('inf')] * total_tokens, tps
 
     total_tokens_tensor = torch.tensor([[total_tokens]], device=device, dtype=nll_tensor.dtype)
     total_nll = nll_tensor.sum(dim=1, keepdim=True) / total_tokens_tensor
     ppl = torch.exp(total_nll)[0, 0].item()
 
+    # Running average perplexity curve
     cumsum = nll_tensor.cumsum(dim=1)
     counts = torch.arange(1, total_tokens + 1, device=device).unsqueeze(0)
     avg_nll = cumsum / counts
-    curve = torch.exp(avg_nll)[0].tolist()
+    avg_curve = torch.exp(avg_nll)[0].tolist()
 
-    return ppl, curve, tps
+    # Per-token (instantaneous) perplexity curve
+    token_curve = torch.exp(nll_tensor)[0].tolist()
+
+    return ppl, avg_curve, token_curve, tps
 
 
 def get_baseline_perplexity(rollout_ids: torch.Tensor, prompt_len: int, device: str, model_name: str = None):
-    """Run baseline (raw attention, no compression) perplexity evaluation."""
+    """Run baseline (raw attention, no compression) perplexity evaluation.
+
+    Returns:
+        ppl: float - overall perplexity
+        avg_curve: list[float] - running average perplexity at each token
+        token_curve: list[float] - per-token instantaneous perplexity
+        tps: float - tokens per second
+    """
     if model_name is None:
         model_name = MODEL_NAME
 
@@ -440,11 +451,11 @@ def get_baseline_perplexity(rollout_ids: torch.Tensor, prompt_len: int, device: 
         default_tail_len=16,
         min_compress_chunk=16,
         max_pages=15,
-        refine_threshold=-1,  # Negative = exact raw attention path
+        use_exact_attention=True,  # Bypass cover view, use raw attention
         compressor="mean",
         segmenter="dummy",
         create_pages_in_generation=False,
-        production_mode=True
+        production_mode=True,
     )
 
     model = load_luka_model(
@@ -455,12 +466,12 @@ def get_baseline_perplexity(rollout_ids: torch.Tensor, prompt_len: int, device: 
     model.eval()
 
     with torch.no_grad():
-        ppl, curve, tps = prefill_then_decode_perplexity(model, rollout_ids, prompt_len)
+        ppl, avg_curve, token_curve, tps = prefill_then_decode_perplexity(model, rollout_ids, prompt_len)
 
     del model
     torch.cuda.empty_cache()
 
-    return ppl, curve, tps
+    return ppl, avg_curve, token_curve, tps
 
 
 def get_stats_from_model(model):
@@ -552,7 +563,7 @@ def run_single_config(
     model.eval()
 
     with torch.no_grad():
-        ppl, curve, tps = prefill_then_decode_perplexity(model, rollout_ids, prompt_len)
+        ppl, avg_curve, token_curve, tps = prefill_then_decode_perplexity(model, rollout_ids, prompt_len)
 
     summary_frac, stats = get_stats_from_model(model)
 
@@ -561,7 +572,9 @@ def run_single_config(
 
     return {
         "perplexity": ppl,
-        "curve": curve,
+        "curve": avg_curve,           # Backwards compat alias
+        "avg_curve": avg_curve,
+        "token_curve": token_curve,
         "tokens_per_sec": tps,
         "summary_frac": summary_frac,
         "pages": stats.get("avg_pages_per_layer", 0),

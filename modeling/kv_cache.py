@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from modeling.segmenter import Segmenter, DummySegmenter
-from modeling.compressor import Compressor, MeanCompressor
+from modeling.compressor import Compressor, MeanCompressor, AttentionWeightedCompressor
 from modeling.refinement import RefinementRule, FixedThresholdRule, NoRefinementRule, get_refinement_rule
 from transformers.cache_utils import Cache, DynamicCache
 from transformers import PretrainedConfig
@@ -1499,14 +1499,14 @@ class LukaKVController:
         # Initialize segmenter, compressor, and refinement rule
         # Using defaults for now; ideally these come from config.
         self.segmenter = DummySegmenter(min_chunk=16, tail_len=16, max_pages=15)
-        self.compressor = MeanCompressor()
+        self.compressor = AttentionWeightedCompressor(temperature=1.0)
         self.refinement_rule: RefinementRule = FixedThresholdRule(threshold=0.2)
         # How often to attempt segmentation/compression (every N decode steps)
         self.segment_interval = 1
         # Whether to create pages during generation (decode) or only during prefill
         self.create_pages_in_generation = True
         # Whether to add log(N) bias to summary attention logits
-        # Set to False when using MeanCompressor (arithmetic mean != log-sum-exp assumption)
+        # Set to False for now (user requested no bias)
         self.use_log_bias = False
         # Log bias mode: "none", "fixed_n" (log(N)), or "adaptive_k" (log(k_eff) from entropy)
         self.log_bias_mode = 'none'
@@ -1966,11 +1966,12 @@ class LukaKVController:
         B, H_q, L_q, T_cover = attn_probs.shape
         device = attn_probs.device
 
-        # Column scores for this step: mean over heads, use last query position
-        # In decode, L_q=1, but this works for both prefill and decode
+        # Column scores for this step: mean over heads, sum over query positions
+        # This accumulates attention from ALL query positions (important for prefill with L_q > 1)
+        # In decode, L_q=1, so sum is a no-op
         # attn_probs: [B, H_q, L_q, T_cover]
         scores = attn_probs.mean(dim=1)        # [B, L_q, T_cover] - mean over heads
-        scores = scores[:, -1, :]              # [B, T_cover] - last query position (or only position in decode)
+        scores = scores.sum(dim=1)             # [B, T_cover] - sum over all query positions
         col_scores = scores
 
         # Map cover -> raw indices (for lined: already raw indices)
@@ -2113,13 +2114,13 @@ class LukaKVController:
             # Don't modify scores - allow selection from entire sequence
         elif tail_start_raw > 0 and T_raw > tail_start_raw:
             # We have enough sequence to exclude the tail
-            # Ensure we leave at least grid_top_k tokens selectable
-            min_selectable = max(0, T_raw - self.grid_top_k - 1)  # Leave room for grid_top_k + some buffer
-            if tail_start_raw < min_selectable:
-                # Adjust tail_start_raw to ensure we don't exclude too much
-                tail_start_raw = min_selectable
+            # Ensure we leave at least grid_top_k tokens selectable (positions 0 to tail_start_raw-1)
+            # If tail_start_raw < grid_top_k, we don't have enough non-tail positions to select from
+            if tail_start_raw < self.grid_top_k:
+                # Not enough positions outside tail; expand selectable region to include grid_top_k positions
+                tail_start_raw = self.grid_top_k
                 if self.debug and layer_idx == 0:
-                    print(f"[Layer {layer_idx}] Tail exclusion ADJUSTED: clamped tail_start_raw to {tail_start_raw} to ensure {self.grid_top_k} tokens remain selectable")
+                    print(f"[Layer {layer_idx}] Tail exclusion ADJUSTED: raised tail_start_raw to {tail_start_raw} to ensure {self.grid_top_k} tokens remain selectable")
             
             # Debug: check scores before modifying tail
             if self.debug and layer_idx == 0:
@@ -2718,12 +2719,12 @@ class LukaKVController:
             batched_tail_v.append(tail_v)
             batched_tail_lens.append(len(tail_indices))
         
-        # --- 3. Concatenate grid + tail per batch ---
+        # --- 3. Concatenate grid + tail per batch (with deduplication) ---
         batched_cover_k = []
         batched_cover_v = []
         batched_cover_indices = []
         batched_cover_lens = []
-        
+
         for b in range(B_raw):
             # Grid part
             g_len = int(grid_lens[b].item()) if b < grid_lens.shape[0] else 0
@@ -2736,11 +2737,38 @@ class LukaKVController:
                 g_v = torch.empty(H_k, 0, D_k, device=device, dtype=v_raw.dtype)
                 g_idx = torch.empty(0, dtype=torch.long, device=device)
                 g_len = 0
-            
-            # Tail part
-            tail_k = batched_tail_k[b]
-            tail_v = batched_tail_v[b]
-            tail_idx = batched_tail_indices[b]
+
+            # Tail part - filter out indices already in grid to avoid duplicates
+            tail_k_orig = batched_tail_k[b]
+            tail_v_orig = batched_tail_v[b]
+            tail_idx_orig = batched_tail_indices[b]
+
+            # Deduplicate: remove tail positions that are already in grid
+            if g_len > 0 and tail_idx_orig.numel() > 0:
+                # Create mask for tail indices NOT in grid (also keep padding indices -1)
+                # Use broadcasting: tail_idx_orig[:, None] vs g_idx[None, :]
+                in_grid = (tail_idx_orig.unsqueeze(1) == g_idx.unsqueeze(0)).any(dim=1)  # [tail_len]
+                keep_mask = ~in_grid | (tail_idx_orig < 0)  # Keep if not in grid OR is padding
+
+                if not keep_mask.all():
+                    # Filter tail to remove duplicates
+                    keep_positions = keep_mask.nonzero(as_tuple=True)[0]
+                    tail_idx = tail_idx_orig[keep_positions]
+                    # Gather KV at kept positions: tail_k_orig is [H_k, tail_len, D]
+                    tail_k = tail_k_orig[:, keep_positions, :]
+                    tail_v = tail_v_orig[:, keep_positions, :]
+
+                    if self.debug and layer_idx == 0:
+                        num_removed = (~keep_mask).sum().item()
+                        print(f"[Layer {layer_idx}] Dedup: removed {num_removed} tail tokens already in grid")
+                else:
+                    tail_k = tail_k_orig
+                    tail_v = tail_v_orig
+                    tail_idx = tail_idx_orig
+            else:
+                tail_k = tail_k_orig
+                tail_v = tail_v_orig
+                tail_idx = tail_idx_orig
             
             # CRITICAL FIX #4: Verify concat dimension is correct (unambiguous check)
             # Handle both 3D [H, S, D] and 4D [B, H, S, D] cases

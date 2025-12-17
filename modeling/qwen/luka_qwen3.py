@@ -63,12 +63,12 @@ def set_luka_kv_params(
     default_tail_len: int = 16,
     min_compress_chunk: int = 16,
     max_pages: int = 15,
-    refine_threshold: float | None = None,  # DEPRECATED: use refinement_rule instead
-    refinement_rule: object = "threshold",  # str, RefinementRule, float, or None
+    refinement_rule: object = "threshold",  # str, RefinementRule, or None
     refinement_rule_kwargs: dict | None = None,  # includes always_refine_first_n
     segment_interval: int = 1,
     create_pages_in_generation: bool = True,
-    use_log_bias: bool = False,  # DEPRECATED: use log_bias_mode instead
+    use_exact_attention: bool = False,
+    use_log_bias: bool = False,
     log_bias_mode: str | None = None,  # "none", "fixed_n", or "adaptive_k"
     print_stats_after_generate: bool = False,
     production_mode: bool = True,
@@ -84,19 +84,18 @@ def set_luka_kv_params(
         default_tail_len: Number of raw tokens to keep uncompressed at the end.
         min_compress_chunk: Minimum number of tokens per page.
         max_pages: Maximum number of summary pages to create.
-        refine_threshold: DEPRECATED. Use refinement_rule instead.
-            For backwards compatibility, if set, creates FixedThresholdRule.
         refinement_rule: Refinement rule for selecting which summaries to expand.
             Can be:
-            - str: Name from registry ("none", "threshold", "top_k", "top_p", "top_k_top_p")
+            - str: Name from registry ("none", "threshold", "top_k", "top_p", "top_frac", "top_k_top_p")
             - RefinementRule instance
-            - float: Interpreted as threshold for FixedThresholdRule
             - None: Disables refinement (NoRefinementRule)
         refinement_rule_kwargs: Kwargs for refinement rule if using string name.
             Can include always_refine_first_n for attention sinks (e.g. {"k": 3, "always_refine_first_n": 1}).
         segment_interval: How often to attempt page creation (every N decode steps).
         create_pages_in_generation: Whether to create pages during generation.
-        use_log_bias: DEPRECATED. Use log_bias_mode instead. If True, sets log_bias_mode="fixed_n".
+        use_exact_attention: If True, bypass cover view entirely and use raw attention.
+            Use this for baseline evaluation. Ignores refinement_rule and pages.
+        use_log_bias: If True, sets log_bias_mode="fixed_n" for backwards compatibility.
         log_bias_mode: Log bias mode for summary attention logits:
             - "none": No bias (default)
             - "fixed_n": log(N) where N = page length (assumes uniform attention)
@@ -121,6 +120,8 @@ def set_luka_kv_params(
         _kv_params_override["segment_interval"] = int(segment_interval)
     if create_pages_in_generation is not None:
         _kv_params_override["create_pages_in_generation"] = bool(create_pages_in_generation)
+    if use_exact_attention is not None:
+        _kv_params_override["use_exact_attention"] = bool(use_exact_attention)
     if use_log_bias is not None:
         _kv_params_override["use_log_bias"] = bool(use_log_bias)
     if log_bias_mode is not None:
@@ -135,24 +136,11 @@ def set_luka_kv_params(
         _kv_params_override["async_pages"] = bool(async_pages)
 
     # Handle refinement rule configuration
-    # Backwards compatibility: refine_threshold takes precedence if explicitly set
-    if refine_threshold is not None:
-        # Deprecated path: convert threshold to FixedThresholdRule
-        if refine_threshold < 0:
-            _kv_params_override["refinement_rule"] = NoRefinementRule()
-        else:
-            _kv_params_override["refinement_rule"] = FixedThresholdRule(threshold=float(refine_threshold))
-    elif refinement_rule is not None:
+    if refinement_rule is not None:
         if isinstance(refinement_rule, RefinementRule):
             if refinement_rule_kwargs:
                 raise ValueError("Cannot provide refinement_rule_kwargs when passing a RefinementRule instance.")
             _kv_params_override["refinement_rule"] = refinement_rule
-        elif isinstance(refinement_rule, (int, float)):
-            # Interpret as threshold
-            if refinement_rule < 0:
-                _kv_params_override["refinement_rule"] = NoRefinementRule()
-            else:
-                _kv_params_override["refinement_rule"] = FixedThresholdRule(threshold=float(refinement_rule))
         elif isinstance(refinement_rule, str):
             if refinement_rule.lower() not in REFINEMENT_RULE_REGISTRY:
                 raise ValueError(
@@ -165,7 +153,7 @@ def set_luka_kv_params(
             _kv_params_override["refinement_rule"] = NoRefinementRule()
         else:
             raise TypeError(
-                f"refinement_rule must be str, RefinementRule, float, or None, "
+                f"refinement_rule must be str, RefinementRule, or None, "
                 f"got {type(refinement_rule).__name__}"
             )
 
@@ -261,68 +249,43 @@ class LukaQwenAttention(nn.Module):
             )
 
         ####  ATTENTION
-        # Replace eager_attention_forward with top_down_attention or lined_attention
-        
+        # Choose between lined attention (H2O-style) and top-down attention (LuKA paging)
         # attn_output: [B, H_q, L, D]
-        # attn_probs: [B, H_q, L, T_raw]
-        
-        if False:
+        # attn_weights: [B, H_q, L, T_raw]
 
-            # RUN H2O algorithm
-            
-            # Eager attention (Vanilla)
-            attention_interface: Callable = eager_attention_forward
-            if self.config._attn_implementation != "eager":
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        use_lined = (
+            self.luka_kv.use_lined_attention and
+            self.layer_idx in self.luka_kv.lined_layers
+        )
 
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states, # [B, H_q, L, D]
-                key_states, # [B, H_k, L + L_past, D]
-                value_states, # [B, H_k, L + L_past, D]
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
+        if use_lined:
+            # Lined attention (H2O-style: grid tokens + raw tail)
+            attn_output, attn_weights = self.luka_kv.lined_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
                 scaling=self.scaling,
-                sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
+                num_kv_groups=self.num_key_value_groups,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
             )
-            
+            # Lined attention doesn't use paging, so skip try_new_pages
         else:
-            # Choose between lined attention and topdown attention
-            use_lined = (
-                self.luka_kv.use_lined_attention and 
-                self.layer_idx in self.luka_kv.lined_layers
+            # Top-down attention (LuKA: pages + raw tail)
+            use_exact = _kv_params_override.get("use_exact_attention", False)
+            attn_output, attn_weights = self.luka_kv.top_down_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
+                scaling=self.scaling,
+                num_kv_groups=self.num_key_value_groups,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                use_exact_attention=use_exact,
             )
-            
-            if use_lined:
-                # Lined attention (H2O-style: grid tokens + raw tail)
-                attn_output, attn_weights = self.luka_kv.lined_attention(
-                    layer_idx=self.layer_idx,
-                    query_states=query_states,
-                    scaling=self.scaling,
-                    num_kv_groups=self.num_key_value_groups,
-                    attention_mask=attention_mask,
-                    sliding_window=self.sliding_window,
-                )
-                # Lined attention doesn't use paging, so skip try_new_pages
-            else:
-                # Top-down attention (LuKA: pages + raw tail)
-                threshold = _kv_params_override.get("refine_threshold", 0.05)
-                attn_output, attn_weights = self.luka_kv.top_down_attention(
-                    layer_idx=self.layer_idx,
-                    query_states=query_states,
-                    scaling=self.scaling,
-                    num_kv_groups=self.num_key_value_groups,
-                    attention_mask=attention_mask,
-                    sliding_window=self.sliding_window,
-                    threshold=threshold
-                )
-                
-                # Try to create new pages (segmentation & compression)
-                # Skip if using raw attention (threshold < 0) since buffer isn't updated
-                if threshold is None or threshold >= 0:
-                    # This uses the buffer populated by top_down_attention
-                    self.luka_kv.try_new_pages(self.layer_idx)
+
+            # Try to create new pages (segmentation & compression)
+            # Skip if using exact attention (baseline mode)
+            if not use_exact and self.luka_kv.create_pages_in_generation:
+                self.luka_kv.try_new_pages(self.layer_idx)
 
         # Match HF Qwen3: reshape back to [B, L, H*D] and apply o_proj.
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

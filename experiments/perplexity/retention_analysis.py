@@ -45,7 +45,7 @@ def run(
 
     # Get baseline perplexity
     print("Running baseline (raw attention)...")
-    base_ppl, base_curve, base_tps = get_baseline_perplexity(rollout_ids, prompt_len, device)
+    base_ppl, base_curve, _, base_tps = get_baseline_perplexity(rollout_ids, prompt_len, device)
     print(f"Baseline: ppl={base_ppl:.3f}, tps={base_tps:.1f}")
 
     # Get compressor configs
