@@ -1531,8 +1531,9 @@ class LukaKVController:
         
         # Gentle H2O-ish knobs
         self.min_lined_seq_len = 384        # don't compress before this many tokens (increased for better quality)
-        self.min_lined_tail_window = 192    # minimum local tail length (increased for better context)
+        self.min_lined_tail_window = 128    # local tail window (needs to be large enough for coherent generation)
         self.grid_min_change_ratio = 0.3    # only refresh grid if ≥30% of top-K changed
+        self.grid_top_k_dynamic = True      # if True, compute grid_top_k as T_raw // 8 for reasonable compression
         
         # Debug flag: set to True to enable diagnostic prints (slows down generation significantly)
         self.debug = False
@@ -1571,8 +1572,11 @@ class LukaKVController:
         # Reset grid scores and counters
         self.grid_scores = [None for _ in range(self.num_layers)]
         self.grid_step_counters = [0 for _ in range(self.num_layers)]
-        self.seg_step_counters = [0 for _ in range(self.num_layers)]
-    
+        # Initialize seg_step_counters to segment_interval - 1 so the first forward pass
+        # after reset triggers the segmentation check (allows page creation from prefill)
+        self.seg_step_counters = [self.segment_interval - 1 for _ in range(self.num_layers)]
+        self.tokens_since_last_page = [0 for _ in range(self.num_layers)]
+
     def initialize_views(self, layer_idx: int):
         """Initialize cover view and attention buffer for a layer (e.g. after prefill)."""
         self.cover_view[layer_idx].initialize(layer_idx, self.raw_cache)
@@ -1701,25 +1705,34 @@ class LukaKVController:
                 self.tokens_since_last_page[layer_idx] = 0
                 return True
 
-        # Increment token counter (tracks tokens since last page creation)
+        # Increment counters
         self.tokens_since_last_page[layer_idx] += 1
-
-        # Throttle segmentation based on configured interval
         self.seg_step_counters[layer_idx] += 1
-        if self.segment_interval > 1 and (self.seg_step_counters[layer_idx] % self.segment_interval) != 0:
-            return False
-
-        # Fast early exit: skip segmenter if not enough tokens since last page
-        # This avoids the ~0.11ms segmenter overhead per call
-        min_chunk = getattr(self.segmenter, 'min_chunk', 16)
-        tail_len = getattr(self.segmenter, 'tail_len', 16)
-        if self.tokens_since_last_page[layer_idx] < min_chunk:
-            return False
 
         # Early exit: check cover view length before expensive operations
         cover_view = self.cover_view[layer_idx]
-        if cover_view.length < getattr(self.segmenter, '_min_tokens_needed', 32):
+        min_tokens_needed = getattr(self.segmenter, '_min_tokens_needed', 32)
+
+        if cover_view.length < min_tokens_needed:
             return False  # Not enough tokens for any pages
+
+        # Throttle segmentation based on configured interval
+        # BUT bypass throttle if we have a lot of tokens (e.g., after prefill)
+        # This ensures page creation happens immediately after prefill
+        min_chunk = getattr(self.segmenter, 'min_chunk', 16)
+        has_substantial_tokens = cover_view.length >= min_tokens_needed * 2  # e.g., 64+ tokens
+
+        if self.segment_interval > 1 and not has_substantial_tokens:
+            if (self.seg_step_counters[layer_idx] % self.segment_interval) != 0:
+                return False
+
+        # Fast early exit: skip segmenter if not enough tokens since last page
+        # This avoids the ~0.11ms segmenter overhead per call
+        # NOTE: Skip this check if we have substantial tokens (e.g., after prefill) since
+        # tokens_since_last_page only tracks forward passes, not actual tokens
+        tail_len = getattr(self.segmenter, 'tail_len', 16)
+        if not has_substantial_tokens and self.tokens_since_last_page[layer_idx] < min_chunk:
+            return False
 
         # 1. Segment - Get buffer data
         attn_weights, _, _ = self.attn_buffer[layer_idx].get_data()
@@ -2116,11 +2129,12 @@ class LukaKVController:
             # We have enough sequence to exclude the tail
             # Ensure we leave at least grid_top_k tokens selectable (positions 0 to tail_start_raw-1)
             # If tail_start_raw < grid_top_k, we don't have enough non-tail positions to select from
-            if tail_start_raw < self.grid_top_k:
+            effective_grid_top_k = T_raw // 8 if self.grid_top_k_dynamic else self.grid_top_k
+            if tail_start_raw < effective_grid_top_k:
                 # Not enough positions outside tail; expand selectable region to include grid_top_k positions
-                tail_start_raw = self.grid_top_k
+                tail_start_raw = effective_grid_top_k
                 if self.debug and layer_idx == 0:
-                    print(f"[Layer {layer_idx}] Tail exclusion ADJUSTED: raised tail_start_raw to {tail_start_raw} to ensure {self.grid_top_k} tokens remain selectable")
+                    print(f"[Layer {layer_idx}] Tail exclusion ADJUSTED: raised tail_start_raw to {tail_start_raw} to ensure {effective_grid_top_k} tokens remain selectable")
             
             # Debug: check scores before modifying tail
             if self.debug and layer_idx == 0:
@@ -2159,7 +2173,9 @@ class LukaKVController:
         
         # Ensure we don't exceed capacity if prefix was initialized
         # For now, just select top-K (prefix will be overwritten, but that's okay for initial testing)
-        K = min(self.grid_top_k, T_raw)
+        # Dynamic grid_top_k: T_raw // 8 for reasonable compression while maintaining quality
+        effective_grid_top_k = T_raw // 8 if self.grid_top_k_dynamic else self.grid_top_k
+        K = min(effective_grid_top_k, T_raw)
         top_scores, top_indices = torch.topk(scores, k=K, dim=-1)   # [B, K]
         indices = top_indices.clone()  # [B, K]
         
@@ -2304,6 +2320,12 @@ class LukaKVController:
             cover_indices_raw = torch.arange(T_raw, device=k_raw.device).unsqueeze(0).expand(B_raw, -1)
             cover_is_summary_raw = torch.zeros(B_raw, T_raw, device=k_raw.device, dtype=torch.long)
             self.attn_buffer[layer_idx].push(attn_weights, cover_indices_raw, cover_is_summary_raw)
+
+            # H2O fix: Accumulate grid scores during warmup for lined attention layers.
+            # This ensures heavy hitters are selected based on actual attention patterns
+            # from prefill, not just the arbitrary prefix tokens.
+            if self.use_lined_attention and layer_idx in self.lined_layers:
+                self._update_grid_scores(layer_idx, attn_weights, cover_indices_raw, cover_is_summary_raw)
 
             attn_output = torch.matmul(attn_weights, v_full)
             return attn_output.transpose(1, 2).contiguous(), attn_weights
@@ -2637,23 +2659,41 @@ class LukaKVController:
         
         # --- 2. Get grid tokens from GridCache ---
         grid_cache = self.grid_cache[layer_idx]
+        effective_grid_top_k = T_raw // 8 if self.grid_top_k_dynamic else self.grid_top_k
         if grid_cache.keys is None or grid_cache.lens is None:
             grid_cache.initialize(B_raw, H_k, D_k, k_raw.device, k_raw.dtype)
-            # Initialize grid with prefix anchor to prevent bootstrapping failure
-            # Use min(32, grid_top_k) to ensure prefix fits within grid capacity
-            prefix_len = min(32, self.grid_top_k, T_raw)
-            if T_raw >= prefix_len and prefix_len > 0:
-                prefix_indices = torch.arange(prefix_len, device=k_raw.device, dtype=torch.long)
-                prefix_k = k_raw[:, :, :prefix_len, :]  # [B, H_k, prefix_len, D]
-                prefix_v = v_raw[:, :, :prefix_len, :]
-                # Set grid to prefix tokens (will be expanded/refreshed later)
-                grid_cache.set_tokens(
-                    keys=prefix_k,
-                    values=prefix_v,
-                    indices=prefix_indices.unsqueeze(0).expand(B_raw, -1),  # [B, prefix_len]
-                )
+
+            # H2O fix: If grid_scores has data from warmup, use it immediately
+            # instead of defaulting to prefix tokens. This ensures the first
+            # grid selection reflects actual attention patterns from prefill.
+            if self.grid_scores[layer_idx] is not None and self.grid_scores[layer_idx].numel() > 0:
+                # Ensure grid_scores covers current T_raw (pad if needed)
+                if self.grid_scores[layer_idx].shape[1] < T_raw:
+                    old_scores = self.grid_scores[layer_idx]
+                    pad_T = T_raw - old_scores.shape[1]
+                    padding = torch.zeros(old_scores.shape[0], pad_T, device=k_raw.device, dtype=old_scores.dtype)
+                    self.grid_scores[layer_idx] = torch.cat([old_scores, padding], dim=1)
+
+                # Use accumulated warmup scores to select initial heavy hitters
+                self._refresh_grid_tokens(layer_idx)
                 if self.debug and layer_idx == 0:
-                    print(f"[Layer {layer_idx}] Grid initialized with prefix anchor: first {prefix_len} tokens (grid_top_k={self.grid_top_k})")
+                    print(f"[Layer {layer_idx}] Grid initialized from warmup scores (H2O-style)")
+            else:
+                # Fallback: Initialize grid with prefix anchor to prevent bootstrapping failure
+                # Use min(32, effective_grid_top_k) to ensure prefix fits within grid capacity
+                prefix_len = min(32, effective_grid_top_k, T_raw)
+                if T_raw >= prefix_len and prefix_len > 0:
+                    prefix_indices = torch.arange(prefix_len, device=k_raw.device, dtype=torch.long)
+                    prefix_k = k_raw[:, :, :prefix_len, :]  # [B, H_k, prefix_len, D]
+                    prefix_v = v_raw[:, :, :prefix_len, :]
+                    # Set grid to prefix tokens (will be expanded/refreshed later)
+                    grid_cache.set_tokens(
+                        keys=prefix_k,
+                        values=prefix_v,
+                        indices=prefix_indices.unsqueeze(0).expand(B_raw, -1),  # [B, prefix_len]
+                    )
+                    if self.debug and layer_idx == 0:
+                        print(f"[Layer {layer_idx}] Grid initialized with prefix anchor: first {prefix_len} tokens (effective_grid_top_k={effective_grid_top_k})")
         
         # Ensure grid is properly initialized (safety check)
         if grid_cache.keys is None or grid_cache.lens is None:
